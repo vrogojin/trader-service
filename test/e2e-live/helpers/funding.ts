@@ -1,163 +1,110 @@
 /**
- * Faucet funding helpers for live E2E tests.
+ * Testnet faucet integration — pure HTTP client, no host-manager primitives.
  *
- * Uses the real Unicity testnet faucet to fund agent wallets.
+ * The original agentic-hosting funding helper wrapped the faucet call in a
+ * host-manager-side fixture (it would `sendCommand` to the tenant to poll
+ * GET_PORTFOLIO until the balance arrived). That coupling does not belong in
+ * trader-service: the faucet is just a REST endpoint, and balance-polling is
+ * the caller's concern. So this module is reduced to a single `fundWallet`
+ * that POSTs the request and returns the tx_id.
+ *
+ * Wire shape (preserved from the original):
+ *   POST FAUCET_URL
+ *   Content-Type: application/json
+ *   { "unicityId": <addr>, "coin": <symbol>, "amount": <string> }
+ *   → { "tx_id": "<hex>", ... }
+ *
+ * Retry policy: 3× exponential backoff on 5xx. 4xx fails immediately (those
+ * indicate caller error — bad nametag, bad coin — and retrying won't help).
  */
 
-import type { LiveTestEnvironment, SpawnedAgent } from './environment.js';
-import { sendCommand } from './agent-helpers.js';
 import { FAUCET_URL } from './constants.js';
+import type { FundWallet } from './contracts.js';
 
-const FAUCET_MAX_RETRIES = 10;
-const FAUCET_INITIAL_BACKOFF_MS = 2_000;
-const FAUCET_MAX_BACKOFF_MS = 30_000;
-const PORTFOLIO_POLL_INTERVAL_MS = 3_000;
-const PORTFOLIO_POLL_TIMEOUT_MS = 120_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_ATTEMPTS = 3;
+const INITIAL_BACKOFF_MS = 1_000;
+const DEFAULT_COIN_ID = 'UCT';
+
+interface FaucetResponseBody {
+  tx_id?: unknown;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---------------------------------------------------------------------------
-// requestFaucet
-// ---------------------------------------------------------------------------
+function backoffMs(attempt: number): number {
+  // attempt is 1-indexed; first retry waits INITIAL_BACKOFF_MS, second 2x, etc.
+  return INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
+}
 
-/**
- * Request tokens from the testnet faucet.
- *
- * @param unicityId - Registered nametag (without @) of the recipient.
- * @param coin      - Faucet coin name (e.g. 'unicity', 'unicity-usd', 'ethereum').
- * @param amount    - Number of whole tokens to request.
- */
-export async function requestFaucet(
-  unicityId: string,
-  coin: string,
-  amount: number,
-): Promise<void> {
-  if (!unicityId) {
-    throw new Error('Cannot fund wallet: no nametag (unicityId) available');
-  }
+export const fundWallet: FundWallet = async (
+  walletAddress,
+  amount,
+  coinId,
+): Promise<{ tx_id: string }> => {
+  const coin = coinId ?? DEFAULT_COIN_ID;
+  // bigint isn't JSON-serializable; the original wire shape uses a string.
+  const body = JSON.stringify({
+    unicityId: walletAddress,
+    coin,
+    amount: amount.toString(),
+  });
 
   let lastError: Error | null = null;
 
-  for (let attempt = 0; attempt < FAUCET_MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let response: Response;
     try {
       response = await fetch(FAUCET_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ unicityId, coin, amount }),
-        signal: AbortSignal.timeout(30_000),
+        body,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-    } catch (err: unknown) {
-      // Network errors (DNS, connection refused, timeout)
+    } catch (err) {
+      // Network-level failure (DNS, refused, timeout) — treat like 5xx and retry.
       const msg = err instanceof Error ? err.message : String(err);
-      const backoff = Math.min(FAUCET_INITIAL_BACKOFF_MS * Math.pow(2, attempt), FAUCET_MAX_BACKOFF_MS);
-      console.log(
-        `[requestFaucet] network error (${msg}), retrying in ${backoff}ms (attempt ${attempt + 1}/${FAUCET_MAX_RETRIES})`,
-      );
       lastError = new Error(`Faucet network error: ${msg}`);
-      await sleep(backoff);
+      if (attempt === MAX_ATTEMPTS) break;
+      await sleep(backoffMs(attempt));
       continue;
     }
 
     if (response.ok) {
-      return;
+      const text = await response.text();
+      let parsed: FaucetResponseBody;
+      try {
+        parsed = JSON.parse(text) as FaucetResponseBody;
+      } catch {
+        throw new Error(
+          `Faucet returned non-JSON success body: ${text.slice(0, 200)}`,
+        );
+      }
+      const tx_id = parsed.tx_id;
+      if (typeof tx_id !== 'string' || tx_id.length === 0) {
+        throw new Error(
+          `Faucet response missing tx_id: ${text.slice(0, 200)}`,
+        );
+      }
+      return { tx_id };
     }
 
-    const body = await response.text().catch(() => '(no body)');
+    // Non-OK: read body once for the error message.
+    const errBody = await response.text().catch(() => '');
+    const status = response.status;
 
-    // Retry on: rate limits (429), nametag-not-found (400), server errors (5xx)
-    const isRetryable =
-      response.status === 429 ||
-      (response.status === 400 && body.includes('Nametag not found')) ||
-      response.status >= 500;
-    if (isRetryable) {
-      const backoff = Math.min(FAUCET_INITIAL_BACKOFF_MS * Math.pow(2, attempt), FAUCET_MAX_BACKOFF_MS);
-      const reason =
-        response.status === 429 ? 'rate limited' :
-        response.status >= 500 ? 'server error' : 'nametag not found';
-      console.log(
-        `[requestFaucet] ${reason} (${response.status}), retrying in ${Math.round(backoff / 1000)}s (attempt ${attempt + 1}/${FAUCET_MAX_RETRIES})`,
-      );
-      lastError = new Error(`Faucet ${reason}: HTTP ${response.status} — ${body}`);
-      await sleep(backoff);
-      continue;
+    if (status >= 400 && status < 500) {
+      // Client error — fast-fail, retrying won't help.
+      throw new Error(`Faucet returned ${status}: ${errBody.slice(0, 200)}`);
     }
 
-    throw new Error(`Faucet request failed: HTTP ${response.status} — ${body}`);
+    // 5xx (or unexpected status) — retry with backoff.
+    lastError = new Error(`Faucet returned ${status}: ${errBody.slice(0, 200)}`);
+    if (attempt === MAX_ATTEMPTS) break;
+    await sleep(backoffMs(attempt));
   }
 
   throw lastError ?? new Error('Faucet request failed after retries');
-}
-
-// ---------------------------------------------------------------------------
-// fundWallet
-// ---------------------------------------------------------------------------
-
-/**
- * Fund an agent's wallet via the testnet faucet.
- *
- * For trader agents: polls GET_PORTFOLIO until the balance appears.
- * For base tenants: waits a fixed duration for Nostr delivery.
- *
- * @param env         - Live test environment (for sending commands).
- * @param agent       - The spawned agent to fund.
- * @param coin        - Faucet coin name (e.g. 'unicity', 'ethereum').
- * @param amount      - Number of whole tokens to request.
- * @param coinSymbol  - Expected symbol in GET_PORTFOLIO (e.g. 'UCT', 'ETH').
- *                      If provided, polls GET_PORTFOLIO for confirmation.
- */
-export async function fundWallet(
-  env: LiveTestEnvironment,
-  agent: SpawnedAgent,
-  coin: string,
-  amount: number,
-  coinSymbol?: string,
-): Promise<void> {
-  const recipient = agent.tenantNametag ?? '';
-  if (!recipient) {
-    throw new Error(
-      `Cannot fund ${agent.instanceName}: no nametag available. ` +
-      `Ensure the tenant registers a nametag during Sphere.init().`,
-    );
-  }
-
-  console.log(
-    `[fundWallet] Requesting ${amount} ${coin} for ${agent.instanceName} (@${recipient})`,
-  );
-  await requestFaucet(recipient, coin, amount);
-
-  if (coinSymbol) {
-    // Poll GET_PORTFOLIO until the balance appears
-    console.log(
-      `[fundWallet] Polling GET_PORTFOLIO for ${coinSymbol} on ${agent.instanceName}...`,
-    );
-    const deadline = Date.now() + PORTFOLIO_POLL_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      try {
-        const result = await sendCommand(env, agent.instanceName, 'GET_PORTFOLIO', {}, 10_000);
-        const balances = result['balances'] as Array<Record<string, unknown>> | undefined;
-        if (balances) {
-          const found = balances.find(
-            (b) => b['asset'] === coinSymbol || b['symbol'] === coinSymbol,
-          );
-          if (found) {
-            const total = found['total'] ?? found['totalAmount'] ?? '0';
-            if (BigInt(String(total)) > 0n) {
-              console.log(`[fundWallet] ${agent.instanceName} received ${coinSymbol}: ${total}`);
-              return;
-            }
-          }
-        }
-      } catch {
-        // GET_PORTFOLIO may fail transiently or not be supported
-      }
-      await sleep(PORTFOLIO_POLL_INTERVAL_MS);
-    }
-    console.warn(
-      `[fundWallet] ${agent.instanceName} did not confirm ${coinSymbol} balance within timeout — proceeding anyway`,
-    );
-  }
-  // No sleep when coinSymbol is not provided — caller handles batch delivery wait
-}
+};
