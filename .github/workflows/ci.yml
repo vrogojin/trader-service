@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# NOTE ON SPHERE-SDK SIBLING DEPENDENCY
+# ------------------------------------
+# trader-service's package.json pins `@unicitylabs/sphere-sdk` via
+# `file:../sphere-sdk`. The required swap / market / accounting exports are
+# not yet on npm with stable versions, so CI clones sphere-sdk next to the
+# trader-service checkout and builds it in place. GitHub Actions checks out
+# at $GITHUB_WORKSPACE = /home/runner/work/trader-service/trader-service/ ;
+# `../sphere-sdk` therefore resolves to /home/runner/work/trader-service/sphere-sdk
+# — exactly where we clone.
+# Bump the SHA pin when newer upstream code is required; remove the whole
+# workaround once sphere-sdk publishes a unified release with the swap,
+# market, and accounting exports.
+
+jobs:
+  build-test:
+    name: typecheck + lint + test + build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x]
+    steps:
+      - name: Checkout trader-service
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Clone sphere-sdk sibling
+        # Pinned to feat/swap-module-spec tip (44b4705) — that branch carries
+        # the swap / market / accounting module exports the trader requires.
+        # Mirrors the escrow-service and agentic-hosting CI pins so all three
+        # repos build against the same SHA.
+        env:
+          SPHERE_SDK_SHA: 44b4705352c1582575eeeafbc46dddc8d95e8995
+        run: |
+          git clone https://github.com/unicity-sphere/sphere-sdk.git ../sphere-sdk
+          git -C ../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
+
+      - name: "Build sphere-sdk (required for file: dependency to resolve types)"
+        run: |
+          cd ../sphere-sdk
+          npm ci
+          npm run build
+
+      - name: Install trader-service dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
