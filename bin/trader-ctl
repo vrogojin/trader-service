@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# trader-ctl — controller-side CLI for a running trader tenant.
+# Invokes the compiled CLI at dist/cli/main.js.
+exec node "$(dirname "$0")/../dist/cli/main.js" "$@"

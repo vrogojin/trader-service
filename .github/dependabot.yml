@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Keep base image digests (node:22-alpine@sha256:...) fresh so the pinned
+  # version picks up security patches on a predictable cadence. Without this,
+  # digests decay silently and rebuilding later pulls an older image.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+
+  # npm deps — separate from docker so one ecosystem's noise doesn't drown out
+  # the other. Grouped by dev-vs-runtime to keep PRs readable.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      runtime-dependencies:
+        dependency-type: "production"
+
+  # GitHub Actions versions — pin action versions for the same reproducibility
+  # reason that Dockerfiles pin image digests.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
