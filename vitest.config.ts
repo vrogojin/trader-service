@@ -9,10 +9,12 @@ export default defineConfig({
     ],
     exclude: [
       'node_modules',
-      // Live e2e tests require agentic-hosting Host Manager + real Docker +
-      // testnet relays. They are not runnable in trader-service standalone.
-      // See test/e2e-live/README.md.
-      'test/e2e-live/**',
+      // Live e2e tests require real Docker + testnet relays. They are not
+      // runnable in default `npm test`. See test/e2e-live/README.md.
+      //
+      // Helpers under test/e2e-live/helpers/ ARE included here — those modules
+      // mock external deps and are safe to run in CI without infra.
+      'test/e2e-live/*.test.ts',
     ],
     coverage: {
       provider: 'v8',
