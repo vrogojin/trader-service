@@ -12,6 +12,7 @@
     "node_modules",
     "dist",
     "test/e2e-live/*.test.ts",
+    "test/e2e-live/**/*.e2e-live.test.ts",
     "test/e2e-live/scenarios"
   ]
 }

@@ -16,6 +16,8 @@ export default defineConfig({
       // default suite — they live in `test/e2e-live/helpers/*.test.ts` and
       // keep the harness honest while the real-network scenarios stay gated.
       'test/e2e-live/*.test.ts',
+      'test/e2e-live/**/*.e2e.test.ts',
+      'test/e2e-live/**/*.e2e-live.test.ts',
       'test/e2e-live/scenarios/**',
     ],
     coverage: {
