@@ -22,7 +22,7 @@ import { runTraderCtl } from './trader-ctl-driver.js';
 import { pollUntil } from './polling.js';
 import { SWAP_TIMEOUT_MS } from './constants.js';
 import { getControllerWallet } from './tenant-fixture.js';
-import { getContainerLogs } from './docker-helpers.js';
+import { getContainerLogs, listContainersByNamePrefix } from './docker-helpers.js';
 
 const DEAL_POLL_INTERVAL_MS = 2_000;
 const CREATE_INTENT_TIMEOUT_MS = 30_000;
@@ -233,6 +233,25 @@ export async function waitForDealInState(
     } catch {
       /* container may already be gone */
     }
+
+    // Also dump every running escrow container's recent logs. The trader-side
+    // logs alone don't tell us whether the escrow received the deposit, paid
+    // out, or got stuck — without these, parallel-swap and unreachable-escrow
+    // failures are nearly impossible to diagnose post-mortem.
+    try {
+      const escrowNames = await listContainersByNamePrefix('escrow-e2e');
+      for (const name of escrowNames) {
+        try {
+          const logs = await getContainerLogs(name, 1500);
+          console.error(`[waitForDealInState] last 1500 log lines from escrow ${name}:\n${logs}`);
+        } catch {
+          /* container may have just exited — skip */
+        }
+      }
+    } catch {
+      /* listing failed (docker error) — skip escrow logs */
+    }
+
     throw new Error(
       `waitForDealInState: no deal reached ${state} on tenant ${tenant.address} within ${timeoutMs}ms`,
     );

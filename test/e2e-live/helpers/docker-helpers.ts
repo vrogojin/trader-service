@@ -347,6 +347,40 @@ export async function inspectContainer(id: string): Promise<boolean> {
   return isRunning(id);
 }
 
+/**
+ * List running container names matching a `docker ps --filter name=<prefix>`
+ * search. Used by diagnostic dumps to locate sibling escrow/trader containers
+ * when only one tenant's identity is known to the failing test.
+ *
+ * @param namePrefix - Prefix to match against container names.
+ * @returns Array of container names (oldest first).
+ */
+export async function listContainersByNamePrefix(
+  namePrefix: string,
+): Promise<string[]> {
+  if (typeof namePrefix !== 'string' || namePrefix.length === 0) {
+    throw new DockerError('listContainersByNamePrefix: namePrefix must be a non-empty string');
+  }
+  // Tight allowlist — names are validated downstream via assertValidContainerId
+  // when used for log fetches, but we sanitize the filter argument here too
+  // to prevent injection of additional flags.
+  if (!/^[a-zA-Z0-9._-]+$/.test(namePrefix)) {
+    throw new DockerError(
+      `listContainersByNamePrefix: invalid name prefix '${namePrefix}' (must be [A-Za-z0-9._-]+)`,
+    );
+  }
+  try {
+    const { stdout } = await execFileImpl('docker', [
+      'ps',
+      '--filter', `name=${namePrefix}`,
+      '--format', '{{.Names}}',
+    ]);
+    return stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
+  } catch (err) {
+    throw new DockerError(`docker ps failed for prefix ${namePrefix}: ${errMsg(err)}`, err);
+  }
+}
+
 async function isRunning(id: string): Promise<boolean> {
   try {
     const { stdout } = await execFileImpl('docker', [
