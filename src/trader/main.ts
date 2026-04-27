@@ -351,8 +351,10 @@ export async function startTrader(): Promise<void> {
 
   const payments: PaymentsAdapter = {
     getConfirmedBalance(coinId: string): bigint {
-      const assets = sphere.payments.getBalance(coinId);
-      const asset = assets[0];
+      // getBalance(coinId) filters by exact hex coinId, not by symbol.
+      // Intent assets ('UCT', 'USDU') are symbols — search all balances.
+      const assets = sphere.payments.getBalance();
+      const asset = assets.find(a => a.coinId === coinId || a.symbol === coinId);
       return asset ? BigInt(asset.confirmedAmount) : 0n;
     },
     getAllBalances() {
@@ -461,7 +463,23 @@ export async function startTrader(): Promise<void> {
       try {
         const receiveResult = await sphere.payments.receive({ finalize: true });
         if (receiveResult.transfers.length > 0) {
-          logger.info('sync_receive_transfers', { count: receiveResult.transfers.length });
+          logger.info('sync_receive_transfers', {
+            count: receiveResult.transfers.length,
+            // DIAGNOSTIC: per-transfer details so we can distinguish
+            // invoice-token deliveries from actual payout payments.
+            transfers: receiveResult.transfers.map((t) => ({
+              id: t.id,
+              senderPubkey: t.senderPubkey?.slice(0, 16),
+              senderNametag: t.senderNametag,
+              memo: t.memo?.slice(0, 80) ?? null,
+              receivedAt: t.receivedAt,
+              tokens: t.tokens?.map((tok) => ({
+                coinId: tok.coinId?.slice(0, 16) ?? null,
+                symbol: tok.symbol ?? null,
+                amount: tok.amount ?? null,
+              })),
+            })),
+          });
         }
         // IPFS sync — tokens may be published there alongside Nostr
         if (stopped) return;
@@ -539,8 +557,47 @@ export async function startTrader(): Promise<void> {
               if (status.progress === 'announced') {
                 try {
                   if (stopped) return;
-                  await sphere.swap.deposit(s.swapId);
-                  logger.info('swap_deposit_sent', { swap_id: s.swapId, trigger: 'poll' });
+                  // DIAGNOSTIC: log where the deposit will go vs. expected escrow address.
+                  try {
+                    const diagInvoice = status.depositInvoiceId && sphere.accounting
+                      ? sphere.accounting.getInvoice(status.depositInvoiceId)
+                      : null;
+                    logger.info('swap_deposit_target_diag', {
+                      swap_id: s.swapId,
+                      depositInvoiceId: status.depositInvoiceId,
+                      escrowDirectAddress: status.escrowDirectAddress,
+                      escrowPubkey: status.escrowPubkey,
+                      my_role: status.role,
+                      manifest_escrow_address: status.manifest?.escrow_address,
+                      manifest_party_a_address: status.manifest?.party_a_address,
+                      manifest_party_b_address: status.manifest?.party_b_address,
+                      // DIAGNOSTIC: full currency assignment so we can detect
+                      // role↔currency direction inversions (e.g. buyer
+                      // accidentally paying base instead of quote).
+                      manifest_party_a_currency: status.manifest?.party_a_currency_to_change,
+                      manifest_party_a_value: status.manifest?.party_a_value_to_change,
+                      manifest_party_b_currency: status.manifest?.party_b_currency_to_change,
+                      manifest_party_b_value: status.manifest?.party_b_value_to_change,
+                      // Invoice target slot ordering (escrow constructs the
+                      // invoice with assets[0]=partyA-pair, assets[1]=partyB-pair)
+                      invoice_target_addresses: diagInvoice?.terms?.targets?.map((t) => t.address) ?? null,
+                      invoice_target_assets: diagInvoice?.terms?.targets?.[0]?.assets?.map((a) => a.coin) ?? null,
+                      invoice_creator: diagInvoice?.terms?.creator,
+                    });
+                  } catch (diagErr) {
+                    logger.warn('swap_deposit_target_diag_failed', {
+                      swap_id: s.swapId,
+                      error: diagErr instanceof Error ? diagErr.message : String(diagErr),
+                    });
+                  }
+                  const transferResult = await sphere.swap.deposit(s.swapId);
+                  logger.info('swap_deposit_sent', {
+                    swap_id: s.swapId,
+                    trigger: 'poll',
+                    transfer_id: transferResult?.id,
+                    transfer_status: transferResult?.status,
+                    token_count: transferResult?.tokens?.length,
+                  });
                   await sphere.payments.waitForPendingOperations();
                 } catch (err: unknown) {
                   const msg = err instanceof Error ? err.message : String(err);
@@ -890,20 +947,15 @@ export async function startTrader(): Promise<void> {
           // ambiguous assignment is blocked inside the executor.
           try {
             const status = await swapModule.getSwapStatus(data.swapId);
-            const s = status as unknown as {
-              partyACurrency?: string;
-              partyAAmount?: string;
-              partyBCurrency?: string;
-              partyBAmount?: string;
-              partyA?: string;
-              proposer?: string;
-            };
+            // SwapRef has deal.partyACurrency, deal.partyAAmount, etc. and
+            // counterpartyPubkey (transport pubkey of the proposer).
+            const s = status;
             registered = agent.registerSwapId(data.swapId, {
-              partyACurrency: s.partyACurrency,
-              partyAAmount: s.partyAAmount,
-              partyBCurrency: s.partyBCurrency,
-              partyBAmount: s.partyBAmount,
-              counterpartyPubkey: s.proposer ?? s.partyA,
+              partyACurrency: s.deal?.partyACurrency,
+              partyAAmount: s.deal?.partyAAmount,
+              partyBCurrency: s.deal?.partyBCurrency,
+              partyBAmount: s.deal?.partyBAmount,
+              counterpartyPubkey: s.counterpartyPubkey ?? s.proposerChainPubkey,
             });
           } catch (err: unknown) {
             logger.warn('swap_proposal_status_fetch_failed', {
@@ -990,11 +1042,103 @@ export async function startTrader(): Promise<void> {
       logger.info('swap_payout_received', { swap_id: data.swapId });
     }) as Parameters<typeof sphere.on>[1]));
 
-    // Log completion + update deal tracker
+    // Log completion + update deal tracker.
+    // Per spec §7.9.2 (Constraint #9): payoutVerified must be true before
+    // marking the deal volume_filled. The SDK's first auto-verify can race
+    // with payout-invoice token import — getInvoice() returns null before
+    // the import completes, causing verifyPayout() to return false. Retry
+    // 30s × 10 (5-minute window) before declaring PAYOUT_UNVERIFIED.
     sphereUnsubscribers.push(sphere.on('swap:completed' as SphereEventType, ((data: { swapId: string; payoutVerified: boolean }) => {
       logger.info('swap_completed', { swap_id: data.swapId, payout_verified: data.payoutVerified });
-      agent.handleSwapCompleted(data.swapId, data.payoutVerified);
       sphere.payments.receive().catch(() => {});
+      if (data.payoutVerified) {
+        agent.handleSwapCompleted(data.swapId, true);
+        return;
+      }
+      // Async retry loop — fire-and-forget, gated on stopped flag.
+      void (async () => {
+        // Spec §7.9.2: 30s × 10 = 5-minute window before escalating to FAILED.
+        // Real-network testnet payout delivery has been observed to take up to
+        // several minutes for the payInvoice transfer to be received and
+        // attributed; 5 minutes is the published tolerance.
+        const MAX_ATTEMPTS = 10;
+        const RETRY_INTERVAL_MS = 30_000;
+        let verified = false;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          await waitCancellable(RETRY_INTERVAL_MS);
+          if (stopped) return;
+          // Pull pending tokens before each verify so a late-arriving payout
+          // invoice import has a chance to land.
+          await sphere.payments.receive({ finalize: true }).catch(() => {});
+          if (stopped) return;
+          try {
+            if (!sphere.swap) {
+              logger.warn('swap_verify_payout_module_unavailable', { swap_id: data.swapId, attempt });
+              break;
+            }
+            // DIAGNOSTIC: dump the payout-invoice coverage state to identify which
+            // returnFalse() branch in SDK verifyPayout is firing.
+            try {
+              const swapStatus = await sphere.swap.getSwapStatus(data.swapId);
+              const payoutId = swapStatus.payoutInvoiceId;
+              if (payoutId && sphere.accounting) {
+                const inv = sphere.accounting.getInvoice(payoutId);
+                let invStatus: unknown = null;
+                try {
+                  invStatus = await sphere.accounting.getInvoiceStatus(payoutId);
+                } catch (statusErr) {
+                  invStatus = `status_threw:${statusErr instanceof Error ? statusErr.message : String(statusErr)}`;
+                }
+                logger.info('swap_payout_verify_diag', {
+                  swap_id: data.swapId,
+                  attempt,
+                  payoutInvoiceId: payoutId,
+                  invoice_imported: inv !== null,
+                  invoice_terms: inv ? {
+                    creator: inv.terms.creator,
+                    targets: inv.terms.targets.map((t) => ({
+                      address: t.address,
+                      assets: t.assets.map((a) => ({ coin: a.coin })),
+                    })),
+                  } : null,
+                  invoice_status: invStatus,
+                });
+              }
+            } catch (diagErr) {
+              logger.warn('swap_payout_verify_diag_failed', {
+                swap_id: data.swapId,
+                attempt,
+                error: diagErr instanceof Error ? diagErr.message : String(diagErr),
+              });
+            }
+            verified = await sphere.swap.verifyPayout(data.swapId);
+          } catch (err) {
+            // verifyPayout throws on terminal non-completed states. If that
+            // happens, the swap has been moved to failed/cancelled by some
+            // other code path — no point retrying.
+            logger.warn('swap_verify_payout_threw', {
+              swap_id: data.swapId,
+              attempt,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            break;
+          }
+          if (verified) {
+            logger.info('swap_payout_verified_on_retry', {
+              swap_id: data.swapId,
+              attempt,
+            });
+            break;
+          }
+          logger.info('swap_payout_verify_retry_failed', {
+            swap_id: data.swapId,
+            attempt,
+            remaining: MAX_ATTEMPTS - attempt,
+          });
+        }
+        if (stopped) return;
+        agent.handleSwapCompleted(data.swapId, verified);
+      })();
     }) as Parameters<typeof sphere.on>[1]));
 
     sphereUnsubscribers.push(sphere.on('swap:failed' as SphereEventType, ((data: { swapId: string; error: string }) => {

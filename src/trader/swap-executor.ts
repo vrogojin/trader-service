@@ -359,6 +359,25 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
     // 4. Build SwapDealInput from DealTerms (proposer only)
     const swapDealInput = buildSwapDealInput(deal, agentPubkey, swapAddress);
 
+    // DIAGNOSTIC: log the full SwapDealInput so we can verify direction-to-
+    // currency mapping. Bug-suspicion: if proposer is direction='buy' but
+    // partyACurrency lands on base_asset (UCT) instead of quote_asset (USDU),
+    // the buyer ends up depositing the wrong currency.
+    logger.info('swap_propose_input_diag', {
+      deal_id: deal.terms.deal_id,
+      proposer_direction: deal.terms.proposer_direction,
+      base_asset: deal.terms.base_asset,
+      quote_asset: deal.terms.quote_asset,
+      rate: deal.terms.rate.toString(),
+      volume: deal.terms.volume.toString(),
+      partyA: swapDealInput.partyA,
+      partyB: swapDealInput.partyB,
+      partyACurrency: swapDealInput.partyACurrency,
+      partyAAmount: swapDealInput.partyAAmount,
+      partyBCurrency: swapDealInput.partyBCurrency,
+      partyBAmount: swapDealInput.partyBAmount,
+    });
+
     // 5. Register before proposeSwap
     const entry: ActiveDeal = { deal, swapId: null };
     registerActive(entry);

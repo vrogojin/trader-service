@@ -162,8 +162,9 @@ function addCreateIntent(parent: Command): Command {
     .requiredOption('--rate-min <bigint>', 'Minimum acceptable rate (string-encoded bigint)')
     .requiredOption('--rate-max <bigint>', 'Maximum acceptable rate (string-encoded bigint)')
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
-    .requiredOption('--volume-total <bigint>', 'Total intent volume')
+    .requiredOption('--volume-max <bigint>', 'Maximum volume the intent will accept')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
+    .option('--escrow-address <address>', 'Escrow address for this intent (default: "any")')
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -178,10 +179,15 @@ function addCreateIntent(parent: Command): Command {
         rate_min: local['rateMin'],
         rate_max: local['rateMax'],
         volume_min: local['volumeMin'],
-        volume_total: local['volumeTotal'],
+        volume_max: local['volumeMax'],
       };
-      if (local['expiryMs'] !== undefined) {
-        params['expiry_ms'] = Number.parseInt(local['expiryMs'], 10);
+      const expiryMs =
+        local['expiryMs'] !== undefined
+          ? Number.parseInt(local['expiryMs'], 10)
+          : 24 * 60 * 60 * 1000; // default 24h
+      params['expiry_sec'] = Math.floor(expiryMs / 1000);
+      if (local['escrowAddress'] !== undefined) {
+        params['escrow_address'] = local['escrowAddress'];
       }
       await runCommand(opts, 'CREATE_INTENT', params);
     });

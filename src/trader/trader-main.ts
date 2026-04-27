@@ -303,16 +303,62 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         // intent engine as `__perCandidateVolume` (internal field).
         const withPerCandidate = counterparty as MarketSearchResult & { __perCandidateVolume?: bigint };
         const remainingVolume = ownIntent.intent.volume_max - ownIntent.intent.volume_filled;
-        const proposalVolume = withPerCandidate.__perCandidateVolume ?? remainingVolume;
-        if (proposalVolume <= 0n) {
-          logger.info('match_found_zero_volume_for_candidate', {
+        const myShare = withPerCandidate.__perCandidateVolume ?? remainingVolume;
+
+        // Cap to counterparty's [volume_min, volume_max] from the parsed
+        // description. The fan-out share is computed only from my own remaining
+        // capacity, so it can exceed the counterparty's max — which the
+        // receiver rejects as VOLUME_OUT_OF_RANGE. Take the intersection of
+        // both [vol_min, vol_max] ranges; if it's empty, abort the proposal.
+        const overlapMaxVol = myShare < parsed.volume_max ? myShare : parsed.volume_max;
+        const overlapMinVol = ownIntent.intent.volume_min > parsed.volume_min
+          ? ownIntent.intent.volume_min : parsed.volume_min;
+        if (overlapMaxVol < overlapMinVol || overlapMaxVol <= 0n) {
+          logger.info('match_found_no_volume_overlap', {
             intent_id: ownIntent.intent.intent_id,
             counterparty: counterparty.agentPublicKey,
-            remaining_volume: remainingVolume.toString(),
+            my_share: myShare.toString(),
+            cp_volume_min: parsed.volume_min.toString(),
+            cp_volume_max: parsed.volume_max.toString(),
+            own_volume_min: ownIntent.intent.volume_min.toString(),
           });
           return;
         }
-        const escrow = ownIntent.intent.escrow_address;
+        const proposalVolume = overlapMaxVol;
+        // Resolve a CONCRETE escrow address before proposing. Intents with
+        // escrow_address='any' (the default) advertise flexibility, but the
+        // np.propose_deal envelope MUST carry a real address: the receiver's
+        // trusted_escrows allowlist is matched as an exact string and 'any'
+        // never matches a real escrow's DIRECT://<pubkey>.
+        // Selection order:
+        //   1) own intent specifies a concrete escrow → use it
+        //   2) counterparty's intent specifies a concrete escrow that we also
+        //      trust → use it (maximises mutual-trust intersection)
+        //   3) fall back to our first trusted escrow
+        //   4) no trusted escrow at all → cannot propose, skip
+        let escrow = ownIntent.intent.escrow_address;
+        if (escrow === 'any' || escrow === '') {
+          const cpEscrow = parsed.escrow_address;
+          if (
+            cpEscrow !== '' &&
+            cpEscrow !== 'any' &&
+            strategy.trusted_escrows.includes(cpEscrow)
+          ) {
+            escrow = cpEscrow;
+          } else if (strategy.trusted_escrows.length > 0) {
+            const first = strategy.trusted_escrows[0];
+            if (first !== undefined) {
+              escrow = first;
+            }
+          }
+          if (escrow === 'any' || escrow === '') {
+            logger.warn('match_found_no_concrete_escrow', {
+              intent_id: ownIntent.intent.intent_id,
+              counterparty: counterparty.agentPublicKey,
+            });
+            return;
+          }
+        }
         await negotiationHandler.proposeDeal(
           ownIntent,
           counterparty,
@@ -329,9 +375,25 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         // than proceed. Previously a failed reserve logged a warning and fell
         // through to proposeSwap, potentially over-committing volume across
         // concurrent deals. Now we cancel/fail the deal and release the intent.
+        // Reserve the asset we are obligated to DELIVER in this deal.
+        // Seller delivers base_asset; buyer delivers quote_asset.
+        const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
+        const proposerSells = deal.terms.proposer_direction === 'sell';
+        const weAreSeller =
+          (weAreProposer && proposerSells) || (!weAreProposer && !proposerSells);
+        const assetToReserve = weAreSeller ? deal.terms.base_asset : deal.terms.quote_asset;
+        // Seller delivers `volume` units of base; buyer delivers `volume*rate`
+        // units of quote. The previous reservation always used `volume` which
+        // under-reserved the quote side whenever rate>1 (e.g. rate=2 deal
+        // would reserve 100 USDU but actually owe 200 USDU on payout, leading
+        // to insufficient-funds failures during settlement).
+        const amountToReserve = weAreSeller
+          ? deal.terms.volume
+          : deal.terms.volume * deal.terms.rate;
+
         let reserved = false;
         try {
-          reserved = await ledger.reserve(deal.terms.base_asset, deal.terms.volume, deal.terms.deal_id);
+          reserved = await ledger.reserve(assetToReserve, amountToReserve, deal.terms.deal_id);
           if (reserved) {
             await stateStore.saveReservations(ledger.serialize());
           }
@@ -346,7 +408,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         if (!reserved) {
           logger.error('deal_volume_reservation_failed_aborting', {
             deal_id: deal.terms.deal_id,
-            base_asset: deal.terms.base_asset,
+            asset: assetToReserve,
             volume: deal.terms.volume.toString(),
           });
           // Fail the NP-0 deal so the counterparty sees it go terminal and the

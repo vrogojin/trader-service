@@ -775,10 +775,13 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
   // Duplicate deal guard (spec Section 5.7)
   // -----------------------------------------------------------------------
 
-  function hasActiveDealForAcceptorIntent(acceptorIntentId: string): boolean {
+  // Check either role — the same intent must not participate in two concurrent
+  // non-terminal deals regardless of whether we are proposer or acceptor.
+  function hasActiveDealForIntent(ownIntentId: string): boolean {
     for (const deal of deals.values()) {
       if (
-        deal.terms.acceptor_intent_id === acceptorIntentId &&
+        (deal.terms.acceptor_intent_id === ownIntentId ||
+         deal.terms.proposer_intent_id === ownIntentId) &&
         !(TERMINAL_DEAL_STATES as readonly string[]).includes(deal.state)
       ) {
         return true;
@@ -1008,8 +1011,8 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     // F5: rate-limit gate was moved to the top of handleProposeDeal so it
     // applies BEFORE any outbound reject DM can be emitted. Nothing to do here.
 
-    // Duplicate deal guard (spec 5.7)
-    if (hasActiveDealForAcceptorIntent(terms.acceptor_intent_id)) {
+    // Duplicate deal guard (spec 5.7) — reject if our intent is already live in any role
+    if (hasActiveDealForIntent(terms.acceptor_intent_id)) {
       logger.info('np_propose_deal_duplicate_guard', {
         deal_id: msg.deal_id,
         acceptor_intent_id: terms.acceptor_intent_id,
@@ -1428,7 +1431,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
 
     const terms: DealTerms = {
       deal_id: '', // placeholder, computed below
-      proposer_intent_id: ownIntent.intent.intent_id,
+      proposer_intent_id: ownIntent.intent.market_intent_id,
       acceptor_intent_id: counterparty.id,
       proposer_pubkey: agentPubkey,
       acceptor_pubkey: counterparty.agentPublicKey,
