@@ -31,7 +31,7 @@ export const IPFS_GATEWAY = 'https://unicity-ipfs1.dyndns.org';
 export const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 
 /** Default trader image (matches templates.json shortcut). */
-export const TRADER_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/trader:v0.1';
+export const TRADER_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/trader:v0.2';
 
 /** Default escrow image. */
 export const ESCROW_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.1';

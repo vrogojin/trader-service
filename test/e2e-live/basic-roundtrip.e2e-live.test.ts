@@ -19,18 +19,17 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   provisionTrader,
+  provisionEscrow,
   type ProvisionedTenant,
+  type InternalProvisionOptions,
 } from './helpers/tenant-fixture.js';
 import {
   createMatchingIntents,
   waitForDealInState,
 } from './helpers/scenario-helpers.js';
 import { runTraderCtl } from './helpers/trader-ctl-driver.js';
-import {
-  runContainer,
-  stopContainer,
-  removeContainer,
-} from './helpers/docker-helpers.js';
+import { getControllerWallet } from './helpers/tenant-fixture.js';
+import { getContainerLogs } from './helpers/docker-helpers.js';
 import { TESTNET } from './helpers/constants.js';
 
 // ---------------------------------------------------------------------------
@@ -38,68 +37,19 @@ import { TESTNET } from './helpers/constants.js';
 // and Docker spin-up cost. Real testnet → tens of seconds per fresh wallet.
 // ---------------------------------------------------------------------------
 
-interface EscrowFixture {
-  /** trader-ctl-targetable address (DIRECT://hex or 64-char hex). */
-  address: string;
-  /** Container ID for cleanup. */
-  containerId: string;
-  /** Idempotent stop+remove. */
-  dispose(): Promise<void>;
-}
-
-let escrow: EscrowFixture;
+let escrow: ProvisionedTenant;
 let buyer: ProvisionedTenant;
 let seller: ProvisionedTenant;
-
-/**
- * Spawn a single escrow service container and resolve its trader-ctl
- * address. Used by every file's beforeAll. Wraps runContainer so that
- * docker-helpers stays single-purpose.
- */
-async function provisionEscrow(label: string): Promise<EscrowFixture> {
-  const container = await runContainer({
-    image: TESTNET.ESCROW_IMAGE,
-    label,
-    env: {
-      UNICITY_RELAYS: TESTNET.RELAYS.join(','),
-      UNICITY_AGGREGATOR_URL: TESTNET.AGGREGATOR_URL,
-      UNICITY_IPFS_GATEWAY: TESTNET.IPFS_GATEWAY,
-    },
-    network: 'bridge',
-    startTimeoutMs: 30_000,
-  });
-
-  // The escrow address is exposed by the image as ESCROW_ADDRESS in its
-  // JSON-Lines startup log; for now we synthesize a DIRECT://<containerId>
-  // shape that the trader-ctl driver accepts as a deterministic test fixture
-  // address. Real address resolution lives in the docker-helpers/escrow
-  // probe (out of scope for this file).
-  const address = `DIRECT://${container.id.slice(0, 64)}`;
-
-  return {
-    address,
-    containerId: container.id,
-    async dispose() {
-      try {
-        await stopContainer(container.id, 10_000);
-      } catch {
-        /* idempotent — already stopped is fine */
-      }
-      try {
-        await removeContainer(container.id);
-      } catch {
-        /* container may already be gone */
-      }
-    },
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Setup / Teardown
 // ---------------------------------------------------------------------------
 
 beforeAll(async () => {
-  escrow = await provisionEscrow('basic-escrow');
+  escrow = await provisionEscrow({
+    label: 'basic-escrow',
+    relayUrls: [...TESTNET.RELAYS],
+  });
   [buyer, seller] = await Promise.all([
     provisionTrader({
       label: 'basic-buyer',
@@ -107,18 +57,36 @@ beforeAll(async () => {
       relayUrls: [...TESTNET.RELAYS],
       waitForReady: true,
       readyTimeoutMs: 90_000,
-    }),
+      fundFromFaucet: true,
+    } satisfies InternalProvisionOptions),
     provisionTrader({
       label: 'basic-seller',
       trustedEscrows: [escrow.address],
       relayUrls: [...TESTNET.RELAYS],
       waitForReady: true,
       readyTimeoutMs: 90_000,
-    }),
+      fundFromFaucet: true,
+    } satisfies InternalProvisionOptions),
   ]);
 }, 600_000);
 
 afterAll(async () => {
+  // Dump container logs BEFORE cleanup — captured on every run for diagnostics.
+  const tenants = [
+    { label: 'buyer', t: buyer },
+    { label: 'seller', t: seller },
+    { label: 'escrow', t: escrow },
+  ];
+  for (const { label, t } of tenants) {
+    if (!t?.container) continue;
+    try {
+      const logs = await getContainerLogs(t.container.id, 500);
+      console.error(`\n=== CONTAINER LOGS [${label}] (last 500 lines) ===\n${logs}\n=== END ${label} ===\n`);
+    } catch (err) {
+      console.error(`[basic-roundtrip afterAll] failed to get logs for ${label}:`, err);
+    }
+  }
+
   // Best-effort cleanup; never let one failure mask another.
   const cleanups = [
     async () => seller?.dispose(),
@@ -139,16 +107,78 @@ afterAll(async () => {
 // ---------------------------------------------------------------------------
 
 describe('Basic round-trip trading', () => {
+  /**
+   * Helper: extract a coin's confirmed balance (in smallest units) from the
+   * portfolio response. Returns 0n if the coin isn't present.
+   *
+   * GET_PORTFOLIO emits each balance as
+   *   { asset: <symbol-or-coinId>, available, total, confirmed, unconfirmed }
+   * with `asset` set to the SDK-known symbol when available (e.g. 'UCT',
+   * 'USDU'), falling back to the raw coinId hash. We match by symbol.
+   */
+  function balanceOf(portfolio: unknown, coinSymbol: string): bigint {
+    if (typeof portfolio !== 'object' || portfolio === null) return 0n;
+    const obj = portfolio as Record<string, unknown>;
+    const balances =
+      (obj['balances'] ?? (obj['result'] as Record<string, unknown> | undefined)?.['balances']) as
+        | Array<Record<string, unknown>>
+        | undefined;
+    if (!Array.isArray(balances)) return 0n;
+    for (const b of balances) {
+      const asset = b['asset'] as string | undefined;
+      if (asset === coinSymbol) {
+        return BigInt(String(b['confirmed'] ?? '0'));
+      }
+    }
+    return 0n;
+  }
+
+  async function getPortfolio(
+    tenantAddress: string,
+  ): Promise<unknown> {
+    const controller = await getControllerWallet();
+    const result = await runTraderCtl('portfolio', [], {
+      tenant: tenantAddress,
+      timeoutMs: 10_000,
+      json: true,
+      dataDir: controller.dataDir,
+      tokensDir: controller.tokensDir,
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `portfolio query failed for ${tenantAddress}: exit ${result.exitCode} | stderr: ${result.stderr || '<empty>'} | output: ${JSON.stringify(result.output)?.slice(0, 200)}`,
+      );
+    }
+    return result.output;
+  }
+
   it(
     'seller and buyer post matching intents → both deals reach COMPLETED',
     async () => {
+      // ---- Pre-swap balance snapshot (regression coverage) ---------------
+      // After the swap completes, the buyer (direction=buy UCT for USDU)
+      // must have +volume UCT and -(rate*volume) USDU; seller is the inverse.
+      // Asserting these post-swap deltas catches the canonical-sort party-
+      // currency-vs-asset-position bug (sphere-sdk SwapModule.deposit) — a
+      // bug where buyer would deposit UCT instead of USDU because the SDK
+      // selected `assetIndex` positionally after canonicalSerialize sorted
+      // the invoice's assets by coinId hash. See sphere-sdk
+      // tests/unit/modules/SwapModule.deposit.test.ts UT-SWAP-DEP-009.
+      const buyerBefore = await getPortfolio(buyer.address);
+      const sellerBefore = await getPortfolio(seller.address);
+      const buyerUctBefore = balanceOf(buyerBefore, 'UCT');
+      const buyerUsduBefore = balanceOf(buyerBefore, 'USDU');
+      const sellerUctBefore = balanceOf(sellerBefore, 'UCT');
+      const sellerUsduBefore = balanceOf(sellerBefore, 'USDU');
+
       const intents = await createMatchingIntents(buyer, seller, {
         base_asset: 'UCT',
         quote_asset: 'USDU',
         rate_min: 1n,
         rate_max: 1n,
-        volume_min: 100n,
-        volume_total: 1000n,
+        volume_min: 1n,
+        volume_max: 10n,
+        escrow_address: escrow.address,
       });
 
       expect(intents.buyerIntentId).toBeTruthy();
@@ -169,13 +199,109 @@ describe('Basic round-trip trading', () => {
       expect(sellerDeal['state']).toBe('COMPLETED');
       // Both sides observe the same deal_id (one negotiation, two ledgers)
       expect(buyerDeal['deal_id']).toBe(sellerDeal['deal_id']);
+
+      // ---- Post-swap balance assertions ----------------------------------
+      // Wait briefly for payments.receive() to finalize the inbound payouts
+      // before reading balances — the trader's loop is on a 15s cycle.
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+
+      const volume = 10n; // matches volume_max above (single-fill swap)
+      const rate = 1n;
+      const expectedUsduAmount = rate * volume;
+
+      const buyerAfter = await getPortfolio(buyer.address);
+      const sellerAfter = await getPortfolio(seller.address);
+      const buyerUctAfter = balanceOf(buyerAfter, 'UCT');
+      const buyerUsduAfter = balanceOf(buyerAfter, 'USDU');
+      const sellerUctAfter = balanceOf(sellerAfter, 'UCT');
+      const sellerUsduAfter = balanceOf(sellerAfter, 'USDU');
+
+      // Buyer (direction='buy' UCT for USDU): +UCT, -USDU
+      expect(
+        buyerUctAfter - buyerUctBefore,
+        `buyer UCT delta should be +${volume}; observed: ${buyerUctAfter - buyerUctBefore}`,
+      ).toBe(volume);
+      expect(
+        buyerUsduBefore - buyerUsduAfter,
+        `buyer USDU delta should be -${expectedUsduAmount}; observed: -${buyerUsduBefore - buyerUsduAfter}`,
+      ).toBe(expectedUsduAmount);
+
+      // Seller (direction='sell' UCT for USDU): -UCT, +USDU
+      expect(
+        sellerUctBefore - sellerUctAfter,
+        `seller UCT delta should be -${volume}; observed: -${sellerUctBefore - sellerUctAfter}`,
+      ).toBe(volume);
+      expect(
+        sellerUsduAfter - sellerUsduBefore,
+        `seller USDU delta should be +${expectedUsduAmount}; observed: ${sellerUsduAfter - sellerUsduBefore}`,
+      ).toBe(expectedUsduAmount);
     },
-    TESTNET.SWAP_TIMEOUT_MS + 60_000,
+    TESTNET.SWAP_TIMEOUT_MS + 60_000, // outer vitest timeout
   );
+
+  /**
+   * Wrapper for runTraderCtl that automatically attaches controller-wallet
+   * credentials. Without these, ACP commands sent to the trader are rejected
+   * because the trader can't verify the sender against its allow-list.
+   */
+  async function authedTraderCtl(
+    cmd: string,
+    args: ReadonlyArray<string>,
+    tenantAddress: string,
+  ): ReturnType<typeof runTraderCtl> {
+    const controller = await getControllerWallet();
+    return runTraderCtl(cmd, args, {
+      tenant: tenantAddress,
+      timeoutMs: 30_000,
+      json: true,
+      dataDir: controller.dataDir,
+      tokensDir: controller.tokensDir,
+    });
+  }
+
+  /**
+   * Pull a string field from a trader-ctl JSON response. The CLI output may
+   * be either the bare result object or the AcpResultPayload envelope with
+   * the result nested under `result`. Tolerate both.
+   */
+  function fieldFromOutput(output: unknown, field: string): string | null {
+    if (typeof output !== 'object' || output === null) return null;
+    const obj = output as Record<string, unknown>;
+    if (typeof obj[field] === 'string') return obj[field] as string;
+    const inner = obj['result'];
+    if (typeof inner === 'object' && inner !== null) {
+      const innerObj = inner as Record<string, unknown>;
+      if (typeof innerObj[field] === 'string') return innerObj[field] as string;
+    }
+    return null;
+  }
+
+  /**
+   * Pull an array field from a trader-ctl JSON response, tolerating both
+   * top-level and `result`-nested envelope shapes.
+   */
+  function arrayFieldFromOutput(
+    output: unknown,
+    field: string,
+  ): Array<Record<string, unknown>> {
+    if (typeof output !== 'object' || output === null) return [];
+    const obj = output as Record<string, unknown>;
+    if (Array.isArray(obj[field])) {
+      return obj[field] as Array<Record<string, unknown>>;
+    }
+    const inner = obj['result'];
+    if (typeof inner === 'object' && inner !== null) {
+      const innerObj = inner as Record<string, unknown>;
+      if (Array.isArray(innerObj[field])) {
+        return innerObj[field] as Array<Record<string, unknown>>;
+      }
+    }
+    return [];
+  }
 
   it('seller cancels intent before match → cancelled state observed', async () => {
     // Seller alone — no matching buyer intent posted in this scenario.
-    const create = await runTraderCtl(
+    const create = await authedTraderCtl(
       'create-intent',
       [
         '--direction',
@@ -190,38 +316,48 @@ describe('Basic round-trip trading', () => {
         '5',
         '--volume-min',
         '50',
-        '--volume-total',
+        '--volume-max',
         '500',
         '--expiry-ms',
         String(10 * 60_000),
       ],
-      { tenant: seller.address, json: true },
+      seller.address,
     );
     expect(create.exitCode).toBe(0);
-    const created = create.output as Record<string, unknown>;
-    const intentId = String(created['intent_id']);
-    expect(intentId).toBeTruthy();
+    const intentId = fieldFromOutput(create.output, 'intent_id');
+    if (!intentId) {
+      throw new Error(
+        `create-intent did not return an intent_id: ${JSON.stringify(create.output)?.slice(0, 500)}`,
+      );
+    }
 
-    const cancel = await runTraderCtl(
+    const cancel = await authedTraderCtl(
       'cancel-intent',
       ['--intent-id', intentId],
-      { tenant: seller.address, json: true },
+      seller.address,
     );
-    expect(cancel.exitCode).toBe(0);
+    if (cancel.exitCode !== 0) {
+      throw new Error(
+        `cancel-intent failed with exit ${cancel.exitCode}; stderr=${cancel.stderr || '<empty>'}; output=${JSON.stringify(cancel.output)?.slice(0, 500)}`,
+      );
+    }
 
-    // Poll list-intents until the intent shows up under the cancelled filter.
+    // Poll list-intents until the intent appears with state=CANCELLED.
+    // Don't rely on the --state filter here (the trader-ctl CLI sends
+    // {state: ...} but the trader's LIST_INTENTS handler reads
+    // params.filter — until that's reconciled, we list all intents and
+    // check the per-record state ourselves).
     await expect
       .poll(
         async () => {
-          const list = await runTraderCtl(
-            'list-intents',
-            ['--state', 'cancelled'],
-            { tenant: seller.address, json: true },
-          );
+          const list = await authedTraderCtl('list-intents', [], seller.address);
           if (list.exitCode !== 0) return false;
-          const intents = ((list.output as Record<string, unknown>)['intents'] ??
-            []) as Array<Record<string, unknown>>;
-          return intents.some((i) => String(i['intent_id']) === intentId);
+          const intents = arrayFieldFromOutput(list.output, 'intents');
+          return intents.some(
+            (i) =>
+              String(i['intent_id']) === intentId &&
+              String(i['state']).toUpperCase() === 'CANCELLED',
+          );
         },
         { timeout: 60_000, interval: 2_000 },
       )
@@ -231,7 +367,7 @@ describe('Basic round-trip trading', () => {
   it('intent expires before match → expired state observed', async () => {
     // Short expiry, no matching counterparty intent → engine should mark EXPIRED.
     const expiryMs = 15_000;
-    const create = await runTraderCtl(
+    const create = await authedTraderCtl(
       'create-intent',
       [
         '--direction',
@@ -246,31 +382,35 @@ describe('Basic round-trip trading', () => {
         '7',
         '--volume-min',
         '10',
-        '--volume-total',
+        '--volume-max',
         '100',
         '--expiry-ms',
         String(expiryMs),
       ],
-      { tenant: seller.address, json: true },
+      seller.address,
     );
     expect(create.exitCode).toBe(0);
-    const created = create.output as Record<string, unknown>;
-    const intentId = String(created['intent_id']);
+    const intentId = fieldFromOutput(create.output, 'intent_id');
+    if (!intentId) {
+      throw new Error(
+        `create-intent did not return an intent_id: ${JSON.stringify(create.output)?.slice(0, 500)}`,
+      );
+    }
 
     // Wait for the engine's expiry sweep to flip state. Allow ~3x expiry to
-    // cover scan-interval slack and DM round-trips.
+    // cover scan-interval slack and DM round-trips. List all intents and
+    // check the per-record state ourselves (see cancel test for rationale).
     await expect
       .poll(
         async () => {
-          const list = await runTraderCtl(
-            'list-intents',
-            ['--state', 'expired'],
-            { tenant: seller.address, json: true },
-          );
+          const list = await authedTraderCtl('list-intents', [], seller.address);
           if (list.exitCode !== 0) return false;
-          const intents = ((list.output as Record<string, unknown>)['intents'] ??
-            []) as Array<Record<string, unknown>>;
-          return intents.some((i) => String(i['intent_id']) === intentId);
+          const intents = arrayFieldFromOutput(list.output, 'intents');
+          return intents.some(
+            (i) =>
+              String(i['intent_id']) === intentId &&
+              String(i['state']).toUpperCase() === 'EXPIRED',
+          );
         },
         { timeout: expiryMs * 4 + 30_000, interval: 2_000 },
       )

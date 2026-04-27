@@ -21,6 +21,8 @@ import type {
 import { runTraderCtl } from './trader-ctl-driver.js';
 import { pollUntil } from './polling.js';
 import { SWAP_TIMEOUT_MS } from './constants.js';
+import { getControllerWallet } from './tenant-fixture.js';
+import { getContainerLogs } from './docker-helpers.js';
 
 const DEAL_POLL_INTERVAL_MS = 2_000;
 const CREATE_INTENT_TIMEOUT_MS = 30_000;
@@ -32,7 +34,8 @@ interface MatchingIntentsTerms {
   rate_min: bigint;
   rate_max: bigint;
   volume_min: bigint;
-  volume_total: bigint;
+  volume_max: bigint;
+  escrow_address?: string;
 }
 
 /**
@@ -43,15 +46,19 @@ function createIntentArgv(
   direction: 'buy' | 'sell',
   terms: MatchingIntentsTerms,
 ): ReadonlyArray<string> {
-  return [
+  const argv: string[] = [
     '--direction', direction,
     '--base', terms.base_asset,
     '--quote', terms.quote_asset,
     '--rate-min', terms.rate_min.toString(),
     '--rate-max', terms.rate_max.toString(),
     '--volume-min', terms.volume_min.toString(),
-    '--volume-total', terms.volume_total.toString(),
+    '--volume-max', terms.volume_max.toString(),
   ];
+  if (terms.escrow_address !== undefined) {
+    argv.push('--escrow-address', terms.escrow_address);
+  }
+  return argv;
 }
 
 /**
@@ -62,8 +69,13 @@ function createIntentArgv(
  */
 function parseIntentId(result: TraderCtlResult, role: 'buyer' | 'seller'): string {
   if (result.exitCode !== 0) {
+    // Surface the full reply payload — error_code, message, etc. The CLI
+    // prints the AcpErrorPayload as JSON on stdout in --json mode and exits
+    // non-zero. stderr is usually empty in that case; the actionable info
+    // is in `output`.
+    const detail = result.stderr || JSON.stringify(result.output) || '<no detail>';
     throw new Error(
-      `createMatchingIntents: ${role} CREATE_INTENT failed with exit ${result.exitCode}: ${result.stderr}`,
+      `createMatchingIntents: ${role} CREATE_INTENT failed with exit ${result.exitCode}: ${detail}`,
     );
   }
   const out = result.output;
@@ -113,10 +125,13 @@ export async function createMatchingIntents(
   // Sequential, not Promise.all — we want clear sequencing of the two CLI
   // subprocesses. A failure on the first lets us skip the second cleanly,
   // and the failure messages are simpler to read in test logs.
+  const controller = await getControllerWallet();
   const buyerResult = await runTraderCtl('create-intent', buyerArgv, {
     tenant: buyer.address,
     timeoutMs: CREATE_INTENT_TIMEOUT_MS,
     json: true,
+    dataDir: controller.dataDir,
+    tokensDir: controller.tokensDir,
   });
   const buyerIntentId = parseIntentId(buyerResult, 'buyer');
 
@@ -124,6 +139,8 @@ export async function createMatchingIntents(
     tenant: seller.address,
     timeoutMs: CREATE_INTENT_TIMEOUT_MS,
     json: true,
+    dataDir: controller.dataDir,
+    tokensDir: controller.tokensDir,
   });
   const sellerIntentId = parseIntentId(sellerResult, 'seller');
 
@@ -170,12 +187,15 @@ export async function waitForDealInState(
 ): Promise<Record<string, unknown>> {
   let lastMatched: Record<string, unknown> | null = null;
 
+  const controller = await getControllerWallet();
   const found = await pollUntil(
     async () => {
       const result = await runTraderCtl('list-deals', [], {
         tenant: tenant.address,
         timeoutMs: LIST_DEALS_TIMEOUT_MS,
         json: true,
+        dataDir: controller.dataDir,
+        tokensDir: controller.tokensDir,
       });
       if (result.exitCode !== 0) return false;
       const deals = extractDealsArray(result.output);
@@ -194,6 +214,25 @@ export async function waitForDealInState(
   );
 
   if (!found || lastMatched === null) {
+    // Dump all deals + container logs for diagnostics before throwing.
+    const controller2 = await getControllerWallet();
+    const diagResult = await runTraderCtl('list-deals', [], {
+      tenant: tenant.address,
+      timeoutMs: LIST_DEALS_TIMEOUT_MS,
+      json: true,
+      dataDir: controller2.dataDir,
+      tokensDir: controller2.tokensDir,
+    });
+    const allDeals = extractDealsArray(diagResult.output);
+    console.error(
+      `[waitForDealInState] timeout waiting for ${state} on ${tenant.address}. All deals:\n${JSON.stringify(allDeals, null, 2)}`,
+    );
+    try {
+      const logs = await getContainerLogs(tenant.container.id, 2000);
+      console.error(`[waitForDealInState] last 2000 log lines from ${tenant.address}:\n${logs}`);
+    } catch {
+      /* container may already be gone */
+    }
     throw new Error(
       `waitForDealInState: no deal reached ${state} on tenant ${tenant.address} within ${timeoutMs}ms`,
     );

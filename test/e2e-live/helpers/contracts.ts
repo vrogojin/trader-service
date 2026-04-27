@@ -234,7 +234,7 @@ export type CreateMatchingIntents = (
     rate_min: bigint;
     rate_max: bigint;
     volume_min: bigint;
-    volume_total: bigint;
+    volume_max: bigint;
   },
 ) => Promise<MatchingIntents>;
 

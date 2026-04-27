@@ -23,7 +23,13 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import {
+  generatePrivateKey,
+  getPublicKey,
+  Sphere,
+} from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 import type {
   ProvisionTraderOptions,
@@ -38,7 +44,7 @@ import {
   waitForContainerRunning,
 } from './docker-helpers.js';
 import { runTraderCtl } from './trader-ctl-driver.js';
-import { RELAYS, TRADER_IMAGE } from './constants.js';
+import { RELAYS, TRADER_IMAGE, ESCROW_IMAGE } from './constants.js';
 import { pollUntil } from './polling.js';
 import { fundWallet } from './funding.js';
 
@@ -50,17 +56,21 @@ import { fundWallet } from './funding.js';
 // few extra knobs that aren't part of the published contract — they're
 // optional so callers using the contract type still compile cleanly.
 
-interface InternalProvisionOptions extends ProvisionTraderOptions {
-  /** Request testnet tokens from the faucet after wallet creation. Default: false. */
+export interface InternalProvisionOptions extends ProvisionTraderOptions {
+  /**
+   * Fund the wallet with faucet tokens after the container boots (uses the
+   * real nametag address, not a synthesized placeholder). Default: false.
+   */
   fundFromFaucet?: boolean;
-  /** Faucet amount when funding (ignored if fundFromFaucet is false). */
-  fundAmount?: bigint;
-  /** Faucet coin id (ignored if fundFromFaucet is false). */
-  fundCoinId?: string;
+  /**
+   * Coin/amount pairs to fund. Funding happens AFTER boot, once the wallet
+   * address (nametag) is known. Each coin is funded independently; faucet
+   * errors are thrown and abort provisioning.
+   * Default when fundFromFaucet=true: [{coinId:'UCT', amount:5000n}, {coinId:'USDU', amount:5000n}]
+   */
+  fundCoins?: Array<{ coinId: string; amount: bigint }>;
   /** Container image override; defaults to constants.TRADER_IMAGE. */
   image?: string;
-  /** When false, skip readiness polling. Defaults to opts.waitForReady ?? true. */
-  waitForReady?: boolean;
 }
 
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
@@ -70,6 +80,68 @@ const DEFAULT_SCAN_INTERVAL_MS = 30_000;
 const DEFAULT_MAX_ACTIVE_INTENTS = 10;
 const FAUCET_RETRY_BASE_MS = 500;
 const FAUCET_MAX_ATTEMPTS = 3;
+
+// ---------------------------------------------------------------------------
+// Controller wallet — shared across all provisionTrader / provisionEscrow
+// calls in a single test process.
+//
+// Why this exists:
+//   - Tenants enforce sender-pubkey auth on incoming DMs. Only senders whose
+//     pubkey matches `UNICITY_MANAGER_PUBKEY` or `UNICITY_CONTROLLER_PUBKEY`
+//     reach the command dispatcher. Anything else routes to handleExternalDm
+//     and the trader-ctl status probe will time out without ever getting a
+//     reply.
+//   - trader-ctl on the host invokes through Sphere with its own wallet.
+//     We need that wallet's pubkey to match what the trader recognises.
+//   - Solution: generate ONE controller wallet on the host, reuse for every
+//     trader-ctl invocation in this process, set its pubkey as
+//     UNICITY_CONTROLLER_PUBKEY on every spawned trader.
+//
+// The wallet lives in a tmp dir; vitest tears the whole process between
+// runs so persistence isn't needed.
+// ---------------------------------------------------------------------------
+
+interface ControllerWallet {
+  /** 33-byte compressed secp256k1 hex — matches what tenants compare against. */
+  pubkey: string;
+  /** Wallet data directory; passed to trader-ctl via --data-dir. */
+  dataDir: string;
+  /** Tokens directory; passed to trader-ctl via --tokens-dir. */
+  tokensDir: string;
+}
+
+let controllerCache: Promise<ControllerWallet> | null = null;
+
+export async function getControllerWallet(): Promise<ControllerWallet> {
+  if (controllerCache !== null) return controllerCache;
+  controllerCache = (async () => {
+    const root = mkdtempSync(join(tmpdir(), 'trader-e2e-controller-'));
+    const dataDir = join(root, 'wallet');
+    const tokensDir = join(root, 'tokens');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(tokensDir, { recursive: true });
+
+    const providers = createNodeProviders({
+      network: 'testnet',
+      dataDir,
+      tokensDir,
+    });
+    const { sphere } = await Sphere.init({
+      storage: providers.storage,
+      transport: providers.transport,
+      oracle: providers.oracle,
+      network: 'testnet',
+      autoGenerate: true,
+    });
+    if (sphere.identity === null) {
+      throw new Error('getControllerWallet: Sphere.init returned null identity');
+    }
+    const pubkey = sphere.identity.chainPubkey;
+    await sphere.destroy();
+    return { pubkey, dataDir, tokensDir };
+  })();
+  return controllerCache;
+}
 
 /**
  * Best-effort cleanup: tolerant of partial state. Never throws — surfaces
@@ -102,15 +174,19 @@ async function safeCleanup(opts: {
 }
 
 /**
- * Generate a synthetic 33-byte secp256k1-shaped hex string. Not a real key —
- * just enough characters to satisfy the `SECP256K1_HEX_KEY_RE` check in
- * `parseTenantConfig` so the in-container service starts. Tests don't drive
- * the trader via the manager channel, so the value's cryptographic validity
- * is irrelevant.
+ * Generate a real, on-curve secp256k1 compressed pubkey. The first run of
+ * the live tests against a real trader image surfaced that random hex strings
+ * with a 0x02 prefix have ~50% probability of NOT being on the curve, and
+ * the trader's startup performs actual point validation (not just regex
+ * shape) — failing with "bad point: is not on curve, sqrt error: Cannot
+ * find square root".
+ *
+ * We don't need the private key (the test never signs as "manager"); just
+ * generate one, derive the pubkey, throw the private key away.
  */
-function fakeSecp256k1Hex(): string {
-  // Compressed pubkey: 0x02 prefix + 32 random bytes = 66 hex chars.
-  return '02' + randomBytes(32).toString('hex');
+function realSecp256k1Pubkey(): string {
+  const privateKey = generatePrivateKey();
+  return getPublicKey(privateKey);  // returns 33-byte compressed hex
 }
 
 /**
@@ -182,18 +258,24 @@ async function fundWithRetry(
 /**
  * Build the env-var bag the trader image expects. See `Dockerfile` and
  * `src/acp-adapter/main.ts` / `src/shared/config.ts` for the canonical list.
+ *
+ * The controller pubkey passed in here is the host-side trader-ctl wallet's
+ * pubkey — set as UNICITY_CONTROLLER_PUBKEY so the trader's auth gate
+ * accepts trader-ctl-signed DMs.
  */
-function buildContainerEnv(opts: InternalProvisionOptions): Record<string, string> {
+function buildContainerEnv(
+  opts: InternalProvisionOptions,
+  controllerPubkey: string,
+): Record<string, string> {
   const relays = (opts.relayUrls ?? RELAYS).join(',');
   const trustedEscrows = (opts.trustedEscrows ?? []).join(',');
   const scanInterval = opts.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
   const maxActiveIntents = opts.maxActiveIntents ?? DEFAULT_MAX_ACTIVE_INTENTS;
 
-  // Synthesize ACP boot envelope. The trader's parseTenantConfig REQUIRES
-  // these even in tests where the manager channel is unused (we drive via
-  // trader-ctl over DM). UNICITY_MANAGER_DIRECT_ADDRESS is consumed by
-  // src/trader/main.ts at startup — see lines 231-235 there.
-  const managerPubkey = fakeSecp256k1Hex();
+  // Synthesize ACP boot envelope. parseTenantConfig requires these even
+  // though we drive the trader via trader-ctl as the controller — the
+  // manager keypair is generated and discarded; only its pubkey matters.
+  const managerPubkey = realSecp256k1Pubkey();
   const instanceId = `trader-e2e-${randomUUID()}`;
   const instanceName = `trader-${opts.label}-${instanceId.slice(-6)}`;
   const bootToken = randomUUID();
@@ -202,6 +284,7 @@ function buildContainerEnv(opts: InternalProvisionOptions): Record<string, strin
     // ACP boot contract (required by parseTenantConfig)
     UNICITY_MANAGER_PUBKEY: managerPubkey,
     UNICITY_MANAGER_DIRECT_ADDRESS: managerPubkey,
+    UNICITY_CONTROLLER_PUBKEY: controllerPubkey,
     UNICITY_BOOT_TOKEN: bootToken,
     UNICITY_INSTANCE_ID: instanceId,
     UNICITY_INSTANCE_NAME: instanceName,
@@ -220,16 +303,23 @@ function buildContainerEnv(opts: InternalProvisionOptions): Record<string, strin
 }
 
 /**
- * Probe the trader by sending a `status` command via trader-ctl. Returns true
- * once the trader replies ok; false on any error or non-ok response. The
+ * Probe the trader by sending a `list-intents` command via trader-ctl. Returns
+ * true once the trader replies ok; false on any error or non-ok response. The
  * outer loop interprets false as "not yet" and keeps polling.
+ *
+ * Why list-intents and not status: STATUS is in the trader's
+ * SYSTEM_ONLY_COMMANDS allowlist (manager-only — see acp-listener.ts:367).
+ * Controllers like trader-ctl get UNAUTHORIZED on STATUS by design. We use
+ * LIST_INTENTS as a controller-accessible "is the engine alive?" probe.
  */
-async function probeReady(tenantAddress: string): Promise<boolean> {
+async function probeReady(tenantAddress: string, controller: ControllerWallet): Promise<boolean> {
   try {
-    const result = await runTraderCtl('status', [], {
+    const result = await runTraderCtl('list-intents', [], {
       tenant: tenantAddress,
       timeoutMs: READY_PROBE_TIMEOUT_MS,
       json: true,
+      dataDir: controller.dataDir,
+      tokensDir: controller.tokensDir,
     });
     return result.exitCode === 0;
   } catch {
@@ -238,21 +328,62 @@ async function probeReady(tenantAddress: string): Promise<boolean> {
 }
 
 /**
- * Compute the trader-ctl-targetable address for a freshly spawned tenant. In
- * the steady state the canonical address is `@<nametag>` — but the tenant
- * doesn't register its nametag until it boots and runs `Sphere.init`. Since
- * we don't have a host-side wallet pre-boot, we return the instance_name as
- * a stand-in DIRECT-style address; the integrator's real implementation will
- * read the actual transport pubkey from the container's `acp.hello` once
- * the bootstrap is wired into this fixture. For now: tests mock this layer
- * end-to-end, and live tests will be broken in a way the integrator must
- * fix when stitching the real docker-helpers + trader-ctl-driver in.
+ * Wait for a container to log its `sphere_initialized` event and return the
+ * resolved on-the-wire address (a `DIRECT://<hex>` or `@<nametag>`).
+ *
+ * Two log shapes supported because trader and escrow use different loggers:
+ *   - Trader (custom JSON):    `{event:'sphere_initialized', details:{agent_address:'@…'}}`
+ *   - Escrow  (pino):          `{msg:'sphere_initialized', direct_address:'DIRECT://…'}`
+ *
+ * The address shape itself doesn't matter — sphere-sdk's `sendDM` accepts
+ * `@nametag`, `DIRECT://hex`, or raw 64-char hex pubkey. We pass through
+ * whichever one the container chose to log.
  */
-function deriveTenantAddressFromEnv(env: Record<string, string>): string {
-  // Use the synthesized DIRECT address so trader-ctl has SOMETHING to dial.
-  // The integrator will replace this with the genuine post-boot resolution.
-  const pk = env['UNICITY_MANAGER_DIRECT_ADDRESS'] ?? '';
-  return `DIRECT://${pk}`;
+async function waitForReadyAddress(
+  containerId: string,
+  opts: { timeoutMs?: number; intervalMs?: number; logsLines?: number } = {},
+): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? 90_000;
+  const intervalMs = opts.intervalMs ?? 1_500;
+  const logsLines = opts.logsLines ?? 500;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    let logs = '';
+    try {
+      logs = await getContainerLogs(containerId, logsLines);
+    } catch {
+      // Container may have already exited; keep trying briefly so we hit
+      // the timeout path with a clear message rather than crashing here.
+    }
+    for (const line of logs.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '' || trimmed[0] !== '{') continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      // Trader format: { event: 'sphere_initialized', details: { agent_address } }
+      if (parsed['event'] === 'sphere_initialized') {
+        const details = parsed['details'];
+        if (typeof details === 'object' && details !== null) {
+          const addr = (details as Record<string, unknown>)['agent_address'];
+          if (typeof addr === 'string' && addr !== '') return addr;
+        }
+      }
+      // Escrow format (pino): { msg: 'sphere_initialized', direct_address }
+      if (parsed['msg'] === 'sphere_initialized') {
+        const addr = parsed['direct_address'];
+        if (typeof addr === 'string' && addr !== '') return addr;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(
+    `waitForReadyAddress: container ${containerId} did not log sphere_initialized within ${timeoutMs}ms`,
+  );
 }
 
 /**
@@ -260,9 +391,9 @@ function deriveTenantAddressFromEnv(env: Record<string, string>): string {
  * RUNNING → optional readiness probe. See module docstring for invariants.
  */
 export async function provisionTrader(
-  opts: ProvisionTraderOptions,
+  opts: InternalProvisionOptions,
 ): Promise<ProvisionedTenant> {
-  const internal = opts as InternalProvisionOptions;
+  const internal = opts;
   let walletDir: string | null = null;
   let container: DockerContainer | null = null;
 
@@ -270,25 +401,9 @@ export async function provisionTrader(
     // 1. Materialize wallet dir on host
     walletDir = materializeWalletDir(opts.label);
 
-    // 2. Optional: fund from faucet. Skipped by default to keep tests bound
-    //    to a single network call instead of three (faucet hit, faucet
-    //    confirm, balance verify).
-    if (internal.fundFromFaucet === true) {
-      // The wallet identity isn't yet generated on the host, so we don't have
-      // a target pubkey to fund. The peer worktree authoring funding.ts may
-      // accept a "post-boot fund this tenant" flow instead; for now we pass
-      // the synthesized direct address as a placeholder. The integrator
-      // reconciles this when the real funding flow lands.
-      const targetAddress = `host-prefund-${randomUUID()}`;
-      await fundWithRetry(
-        targetAddress,
-        internal.fundAmount ?? 0n,
-        internal.fundCoinId,
-      );
-    }
-
-    // 3. docker run trader image
-    const env = buildContainerEnv(internal);
+    // 2. docker run trader image (funding happens AFTER boot once address is known)
+    const controller = await getControllerWallet();
+    const env = buildContainerEnv(internal, controller.pubkey);
     container = await runContainer({
       image: internal.image ?? TRADER_IMAGE,
       label: opts.label,
@@ -316,12 +431,17 @@ export async function provisionTrader(
       );
     }
 
-    // 5. Optional readiness probe
-    const tenantAddress = deriveTenantAddressFromEnv(env);
+    // 5. Read the trader's real address from its sphere_initialized log line.
+    //    Replaces the previous synthesized DIRECT://<managerPubkey> stub.
+    const tenantAddress = await waitForReadyAddress(container.id, {
+      timeoutMs: opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,
+    });
+
+    // 6. Optional readiness probe
     const shouldWaitReady = internal.waitForReady ?? opts.waitForReady ?? true;
     if (shouldWaitReady) {
       const readyTimeout = opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
-      const ready = await pollUntil(() => probeReady(tenantAddress), {
+      const ready = await pollUntil(() => probeReady(tenantAddress, controller), {
         timeoutMs: readyTimeout,
         intervalMs: READY_POLL_INTERVAL_MS,
         description: `trader ${opts.label} ready`,
@@ -338,6 +458,52 @@ export async function provisionTrader(
             `${readyTimeout}ms. Logs: ${logs.slice(-2000)}`,
         );
       }
+    }
+
+    // 7. Optional: post-boot faucet funding. The wallet address (nametag) is now
+    //    known so we can fund the real identity. Runs after readiness to ensure
+    //    the trader's sync loop is already running and will pick up tokens.
+    if (internal.fundFromFaucet === true) {
+      // Faucet expects coin names, not symbols: 'unicity' → UCT, 'unicity-usd' → USDU
+      const coins = internal.fundCoins ?? [
+        { coinId: 'unicity', amount: 5000n },
+        { coinId: 'unicity-usd', amount: 5000n },
+      ];
+      for (const { coinId, amount } of coins) {
+        await fundWithRetry(tenantAddress, amount, coinId);
+      }
+      // Poll portfolio (calls payments.refresh() inside the trader) until
+      // ALL funded coins show a positive confirmed balance, or 120s elapses.
+      const expectedCoinCount = coins.length;
+      await pollUntil(
+        async () => {
+          try {
+            const result = await runTraderCtl('portfolio', [], {
+              tenant: tenantAddress,
+              timeoutMs: 10_000,
+              json: true,
+              dataDir: controller.dataDir,
+              tokensDir: controller.tokensDir,
+            });
+            if (result.exitCode !== 0) return false;
+            const out = result.output as Record<string, unknown>;
+            const balances = (
+              out['balances'] ?? (out['result'] as Record<string, unknown> | undefined)?.['balances']
+            ) as unknown;
+            if (!Array.isArray(balances)) return false;
+            const nonZeroCount = balances.filter(
+              (b: unknown) =>
+                typeof b === 'object' &&
+                b !== null &&
+                BigInt(String((b as Record<string, unknown>)['confirmed'] ?? '0')) > 0n,
+            ).length;
+            return nonZeroCount >= expectedCoinCount;
+          } catch {
+            return false;
+          }
+        },
+        { timeoutMs: 180_000, intervalMs: 5_000, description: `${opts.label} all ${expectedCoinCount} coins funded` },
+      );
     }
 
     // Build dispose() — idempotent via a guard flag captured in closure.
@@ -361,6 +527,110 @@ export async function provisionTrader(
     };
   } catch (err) {
     // Cleanup partial resources before propagating.
+    await safeCleanup({ walletDir, container });
+    throw err;
+  }
+}
+
+// ============================================================================
+// provisionEscrow — same pattern, different image + simpler env
+// ============================================================================
+
+export interface ProvisionEscrowOptions {
+  /** Operator-friendly label, used in container name and logs. */
+  label: string;
+  /** Sphere relay URLs (testnet defaults if omitted). */
+  relayUrls?: string[];
+  /** Deadline for the container to log `sphere_initialized`. Default 90s. */
+  readyTimeoutMs?: number;
+  /** Image override (defaults to constants.ESCROW_IMAGE). */
+  image?: string;
+}
+
+function buildEscrowEnv(
+  opts: ProvisionEscrowOptions,
+  controllerPubkey: string,
+): Record<string, string> {
+  const relays = (opts.relayUrls ?? RELAYS).join(',');
+  const managerPubkey = realSecp256k1Pubkey();
+  const instanceId = `escrow-e2e-${randomUUID()}`;
+  const instanceName = `escrow-${opts.label}-${instanceId.slice(-6)}`;
+  const bootToken = randomUUID();
+  return {
+    UNICITY_MANAGER_PUBKEY: managerPubkey,
+    UNICITY_MANAGER_DIRECT_ADDRESS: managerPubkey,
+    UNICITY_CONTROLLER_PUBKEY: controllerPubkey,
+    UNICITY_BOOT_TOKEN: bootToken,
+    UNICITY_INSTANCE_ID: instanceId,
+    UNICITY_INSTANCE_NAME: instanceName,
+    UNICITY_TEMPLATE_ID: 'escrow',
+    UNICITY_NETWORK: 'testnet',
+    UNICITY_RELAYS: relays,
+    UNICITY_DATA_DIR: '/data/wallet',
+    UNICITY_TOKENS_DIR: '/data/tokens',
+    LOG_LEVEL: 'info',
+  };
+}
+
+/**
+ * End-to-end escrow provision. Mirrors `provisionTrader` for an escrow
+ * tenant: materialize wallet dir → docker run escrow image → wait for
+ * `sphere_initialized` → return ProvisionedTenant.
+ *
+ * Test files use this in their `beforeAll` to spawn an escrow whose
+ * `address` is a real `DIRECT://<pubkey>` that newly-spawned trader tenants
+ * can list as a trusted_escrow.
+ */
+export async function provisionEscrow(
+  opts: ProvisionEscrowOptions,
+): Promise<ProvisionedTenant> {
+  let walletDir: string | null = null;
+  let container: DockerContainer | null = null;
+
+  try {
+    walletDir = materializeWalletDir(opts.label);
+
+    const controller = await getControllerWallet();
+    const env = buildEscrowEnv(opts, controller.pubkey);
+    container = await runContainer({
+      image: opts.image ?? ESCROW_IMAGE,
+      label: opts.label,
+      env,
+      binds: [{ host: walletDir, container: '/data/wallet', readonly: false }],
+    });
+
+    const isRunning = await waitForContainerRunning(container.id);
+    if (!isRunning) {
+      let logs = '';
+      try { logs = await getContainerLogs(container.id); } catch { /* best effort */ }
+      throw new Error(
+        `provisionEscrow: container ${container.id} failed to reach RUNNING. Logs: ${logs.slice(-2000)}`,
+      );
+    }
+
+    const escrowAddress = await waitForReadyAddress(container.id, {
+      timeoutMs: opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,
+    });
+
+    let disposed = false;
+    const capturedContainer = container;
+    const capturedWalletDir = walletDir;
+    const dispose = async (): Promise<void> => {
+      if (disposed) return;
+      disposed = true;
+      await safeCleanup({
+        walletDir: capturedWalletDir,
+        container: capturedContainer,
+      });
+    };
+
+    return {
+      address: escrowAddress,
+      container,
+      walletDir,
+      dispose,
+    };
+  } catch (err) {
     await safeCleanup({ walletDir, container });
     throw err;
   }
