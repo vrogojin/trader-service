@@ -375,8 +375,25 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
       // bug shows up most visibly in partial-fill scenarios where one side's
       // intent should reflect a partial volume credit while the other side's
       // intent fully fills.
-      const ourIntentId = (deal: DealRecord): string => {
+      //
+      // Returns null when neither pubkey matches ours — silently falling
+      // through to acceptor_intent_id on a malformed proposer_pubkey would
+      // re-introduce the silent-no-op bug this helper exists to fix
+      // (recordFill on a market_intent_id we don't own returns undefined,
+      // dropping the fill entirely). Callers must early-return on null.
+      const ourIntentId = (deal: DealRecord): string | null => {
         const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
+        const weAreAcceptor = pubkeysEqual(deal.terms.acceptor_pubkey, agentPubkey);
+        if (!weAreProposer && !weAreAcceptor) {
+          logger.error('callback_unknown_role', {
+            deal_id: deal.terms.deal_id,
+            our_pubkey: agentPubkey,
+            proposer: deal.terms.proposer_pubkey,
+            acceptor: deal.terms.acceptor_pubkey,
+            note: 'malformed deal terms — neither pubkey matches us; cannot identify our intent',
+          });
+          return null;
+        }
         return weAreProposer ? deal.terms.proposer_intent_id : deal.terms.acceptor_intent_id;
       };
 
@@ -429,7 +446,8 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             negotiationHandler.failDeal(deal.terms.deal_id);
           }
           if (intentEngine) {
-            intentEngine.restoreToActive(ourIntentId(deal));
+            const ourId = ourIntentId(deal);
+            if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
           return;
         }
@@ -469,7 +487,8 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             negotiationHandler.failDeal(deal.terms.deal_id);
           }
           if (intentEngine) {
-            intentEngine.restoreToActive(ourIntentId(deal));
+            const ourId = ourIntentId(deal);
+            if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
         }
       };
@@ -504,7 +523,8 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           );
           // Restore the intent so we can retry. Don't record the fill.
           if (intentEngine) {
-            intentEngine.restoreToActive(ourIntentId(deal));
+            const ourId = ourIntentId(deal);
+            if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
           if (negotiationHandler) {
             negotiationHandler.failDeal(deal.terms.deal_id);
@@ -515,13 +535,28 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         ledger.release(deal.terms.deal_id);
         await stateStore.saveReservations(ledger.serialize());
 
+        // Record the fill on OUR intent. Wrapped in try/catch because
+        // recordFill -> transitionIntent -> assertTransition throws when the
+        // intent is in a state outside the allowed source list (e.g. user
+        // CANCELLED the intent mid-swap, or the intent already EXPIRED).
+        // Without the catch, the throw escapes onSwapCompleted before
+        // completeDeal can fire — the swap actually completed but the NP-0
+        // deal stays stuck in EXECUTING forever, surfacing as a "stuck deal"
+        // in LIST_SWAPS that operators can't reconcile.
         if (intentEngine) {
-          // ourIntentId selects proposer_intent_id when WE are proposer, else
-          // acceptor_intent_id. The deal record is shared across both peers,
-          // so always passing proposer_intent_id silently dropped the fill on
-          // the acceptor side — its volume_filled stayed 0 even after the
-          // swap completed with payoutVerified:true.
-          intentEngine.recordFill(ourIntentId(deal), deal.terms.volume);
+          const ourId = ourIntentId(deal);
+          if (ourId !== null) {
+            try {
+              intentEngine.recordFill(ourId, deal.terms.volume);
+            } catch (err: unknown) {
+              logger.warn('record_fill_failed_post_complete', {
+                deal_id: deal.terms.deal_id,
+                intent_id: ourId,
+                error: err instanceof Error ? err.message : String(err),
+                note: 'intent in non-fillable state — proceeding with deal completion regardless',
+              });
+            }
+          }
         }
         // Transition the NP-0 deal to COMPLETED so LIST_SWAPS reflects it
         if (negotiationHandler) {
@@ -540,7 +575,8 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
 
         // Restore the intent to ACTIVE so it can be matched again
         if (intentEngine) {
-          intentEngine.restoreToActive(ourIntentId(deal));
+          const ourId = ourIntentId(deal);
+          if (ourId !== null) intentEngine.restoreToActive(ourId);
         }
         // Transition the NP-0 deal to FAILED so LIST_SWAPS reflects it
         if (negotiationHandler) {

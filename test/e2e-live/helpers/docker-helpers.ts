@@ -348,12 +348,16 @@ export async function inspectContainer(id: string): Promise<boolean> {
 }
 
 /**
- * List running container names matching a `docker ps --filter name=<prefix>`
- * search. Used by diagnostic dumps to locate sibling escrow/trader containers
- * when only one tenant's identity is known to the failing test.
+ * List running container IDs (12-char hex prefix form) for containers whose
+ * name matches `docker ps --filter name=<prefix>`. IDs (not names) are
+ * returned because every downstream consumer (`getContainerLogs`,
+ * `stopContainer`, `removeContainer`) validates the input through
+ * `assertValidContainerId`, which enforces a hex-only regex. Names would be
+ * rejected — every log fetch in the diagnostic-dump path used to silently
+ * throw and get swallowed.
  *
  * @param namePrefix - Prefix to match against container names.
- * @returns Array of container names (oldest first).
+ * @returns Array of container IDs (oldest first).
  */
 export async function listContainersByNamePrefix(
   namePrefix: string,
@@ -361,19 +365,19 @@ export async function listContainersByNamePrefix(
   if (typeof namePrefix !== 'string' || namePrefix.length === 0) {
     throw new DockerError('listContainersByNamePrefix: namePrefix must be a non-empty string');
   }
-  // Tight allowlist — names are validated downstream via assertValidContainerId
-  // when used for log fetches, but we sanitize the filter argument here too
-  // to prevent injection of additional flags.
-  if (!/^[a-zA-Z0-9._-]+$/.test(namePrefix)) {
+  // Docker name rule: must start with [a-zA-Z0-9] and may contain `._-` after.
+  // The leading-char restriction also means a prefix of just `.` or `-`
+  // (which would degenerate to "match every container") is rejected.
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(namePrefix)) {
     throw new DockerError(
-      `listContainersByNamePrefix: invalid name prefix '${namePrefix}' (must be [A-Za-z0-9._-]+)`,
+      `listContainersByNamePrefix: invalid name prefix '${namePrefix}' (must start with [A-Za-z0-9] and contain only [A-Za-z0-9._-])`,
     );
   }
   try {
     const { stdout } = await execFileImpl('docker', [
       'ps',
       '--filter', `name=${namePrefix}`,
-      '--format', '{{.Names}}',
+      '--format', '{{.ID}}',
     ]);
     return stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
   } catch (err) {
