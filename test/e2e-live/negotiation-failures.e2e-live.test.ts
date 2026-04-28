@@ -85,6 +85,12 @@ let trustedEscrow: ProvisionedTenant;
 let untrustedEscrowAddress: string;
 let alice: ProvisionedTenant;
 let bob: ProvisionedTenant;
+/**
+ * Third trader provisioned with `TRADER_FAULT_SKIP_DEPOSITS=1`. Used only by
+ * the deposit-timeout scenario to play the "B accepts the deal but never
+ * deposits" role. Lives behind a separate fixture so the other tests in this
+ * file are unaffected. */
+let faultyTrader: ProvisionedTenant;
 
 /** Format-valid DIRECT:// address pointing nowhere. Used for `INVALID_ESCROW`
  *  scenarios where the escrow is supposed to be REJECTED before any RPC. */
@@ -190,10 +196,20 @@ beforeAll(async () => {
     readyTimeoutMs: 180_000,
     fundFromFaucet: true,
   });
+  faultyTrader = await provisionTrader({
+    label: 'fail-faulty',
+    trustedEscrows: [trustedEscrow.address],
+    relayUrls: [...TESTNET.RELAYS],
+    waitForReady: true,
+    readyTimeoutMs: 180_000,
+    fundFromFaucet: true,
+    faultSkipDeposits: true, // accepts the deal, never calls swapModule.deposit()
+  });
 }, 600_000);
 
 afterAll(async () => {
   const cleanups: Array<() => Promise<void>> = [
+    async () => faultyTrader?.dispose(),
     async () => bob?.dispose(),
     async () => alice?.dispose(),
     async () => trustedEscrow?.dispose(),
@@ -346,22 +362,46 @@ describe('Negotiation failures', () => {
     10 * 60_000,
   );
 
-  it.skip(
-    'deposit timeout: A deposits, B does not → both refunded, deal FAILED',
+  it(
+    'deposit timeout: A deposits, B does not → deal FAILED with EXECUTION_TIMEOUT',
     async () => {
-      // SKIPPED: requires the ability to start a swap and selectively block
-      // ONE peer's deposit transaction. trader-ctl exposes no
-      // hook to short-circuit a peer's deposit step. Implementing this
-      // would require either:
-      //   (1) a debug/fault-injection command on the trader (e.g.
-      //       `trader-ctl fault inject deposit-skip`), OR
-      //   (2) running one peer with a wallet that has zero funds so its
-      //       deposit transaction reliably fails to confirm.
-      //
-      // (2) is feasible if `provisionTrader` exposes a `skipFaucetFunding`
-      // option. As of the current contracts.ts that option is not
-      // declared, so we leave this scenario as a TODO marker that lights
-      // up automatically once the harness gains the capability.
+      await cancelActiveIntents(alice);
+      await cancelActiveIntents(faultyTrader);
+
+      // Pair alice (deposits normally) with `faultyTrader` (TRADER_FAULT_SKIP_DEPOSITS=1
+      // — accepts the deal but never calls swapModule.deposit()). The escrow
+      // sees one side's deposit, waits for the other, and times out after
+      // deposit_timeout_sec. Both peers' execution timers also fire and the
+      // deal lands in FAILED state with EXECUTION_TIMEOUT recorded as
+      // error_code on the DealRecord.
+      const intents = await createMatchingIntents(faultyTrader, alice, {
+        base_asset: 'UCT',
+        quote_asset: 'USDU',
+        rate_min: 1n,
+        rate_max: 1n,
+        volume_min: 100n,
+        volume_max: 500n,
+      });
+      expect(intents.buyerIntentId).toBeTruthy();
+      expect(intents.sellerIntentId).toBeTruthy();
+
+      // The trader's swap-executor's EXECUTION_TIMEOUT = deposit_timeout_sec
+      // (default 300) + EXECUTION_TIMEOUT_GRACE_SEC (120) = 420s. Allow up
+      // to SWAP_TIMEOUT_MS (600s) for the FAILED transition to land + the
+      // updated_at to be persisted.
+      const failed = await waitForDealInState(
+        alice,
+        'FAILED',
+        TESTNET.SWAP_TIMEOUT_MS,
+      );
+      expect(failed['state']).toBe('FAILED');
+
+      // The new error_code surface (DealRecord.error_code) should now
+      // distinguish EXECUTION_TIMEOUT from other failure modes — the
+      // motivating reason for adding the field.
+      const errorCode = String(failed['error_code'] ?? '');
+      expect(errorCode).toContain('EXECUTION_TIMEOUT');
     },
+    11 * 60_000,
   );
 });

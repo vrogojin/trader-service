@@ -458,13 +458,16 @@ describe('T2 — Intent Matching', () => {
     ctx.engine.stop();
   });
 
-  it('should propose regardless of pubkey order (duplicate deal guard handles races)', async () => {
-    // PK_TRADER_C (02ccc...) > PK_TRADER_B (02bbb...) — proposer selection
-    // was removed from the scan loop; the NegotiationHandler's duplicate deal
-    // guard prevents both sides from creating deals simultaneously.
+  it('yields proposal duty when our pubkey sorts AFTER counterparty (spec 5.7)', async () => {
+    // PK_TRADER_C (02ccc...) > PK_TRADER_B (02bbb...). Per spec 5.7 the
+    // lower-pubkey side proposes, the higher-pubkey side waits for the
+    // counterparty's np.propose_deal to arrive over NP-0. We must NOT
+    // call onMatchFound for B from C's engine — that would trigger a
+    // simultaneous fan-out from both sides, both NP-0 duplicate-guards
+    // would fire, and BOTH deals would end up CANCELLED, wedging the
+    // pair on each other's failed-counterparty list.
     const ctx = setupMatchingTest({ agentPubkey: PK_TRADER_C });
 
-    // Need to create intent with the correct pubkey
     const intent = await ctx.engine.createIntent(
       {
         direction: 'sell',
@@ -497,9 +500,7 @@ describe('T2 — Intent Matching', () => {
     ctx.engine.start();
     await vi.advanceTimersByTimeAsync(5100);
 
-    // onMatchFound fires even when own pubkey > counterparty pubkey
-    expect(ctx.matchFoundCalls.length).toBe(1);
-    expect(ctx.matchFoundCalls[0]!.counterparty.agentPublicKey).toBe(PK_TRADER_B);
+    expect(ctx.matchFoundCalls).toHaveLength(0);
     ctx.engine.stop();
   });
 

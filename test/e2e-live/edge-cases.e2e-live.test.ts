@@ -406,18 +406,64 @@ describe('Edge cases', () => {
     5 * 60_000,
   );
 
-  it.skip(
-    'blocked counterparty: A.blocked_counterparties=[B] → B intents never proposed to A',
+  it(
+    'blocked counterparty: A.blocked_counterparties=[B] → no deal A↔B',
     async () => {
-      // SKIPPED: trader-ctl set-strategy does not yet expose a
-      // --blocked-counterparties flag. The runtime strategy engine
-      // (src/trader/intent-engine.ts) supports the criterion. Once the CLI
-      // surfaces it, replace this skip with the real assertion:
-      //   1. set-strategy --blocked-counterparties <bob.address> on alice
-      //   2. post matching intents on alice and bob
-      //   3. assert no deal reaches COMPLETED on either side after a
-      //      conservative quiet window
+      await cancelActiveIntents(alice);
+      await cancelActiveIntents(bob);
+
+      // 1. Alice blocks bob via the new CLI flag. The matcher's filter
+      //    (intent-engine.ts:matchesCriteria) reads strategy.blocked_counterparties
+      //    every scan cycle, so the next scan (within scan_interval_ms) will
+      //    skip bob's intent — but bob's matcher is still free to find alice
+      //    and propose to her. Alice's negotiation handler will then reject
+      //    the proposal because alice's own filter excludes bob.
+      const setStrategy = await runAuthedTraderCtl(
+        'set-strategy',
+        ['--blocked-counterparties', bob.address],
+        { tenant: alice.address, json: true },
+      );
+      expect(setStrategy.exitCode).toBe(0);
+
+      // 2. Post matching intents from both sides. Alice sells, bob buys, same
+      //    rate band — under normal conditions this would complete a deal.
+      const aliceId = await createIntent(alice, {
+        direction: 'sell',
+        rateMin: 1n,
+        rateMax: 1n,
+        volumeMin: 10n,
+        volumeMax: 100n,
+      });
+      const bobId = await createIntent(bob, {
+        direction: 'buy',
+        rateMin: 1n,
+        rateMax: 1n,
+        volumeMin: 10n,
+        volumeMax: 100n,
+      });
+
+      // 3. Wait for >= one full scan cycle on both sides + DM round-trips, then
+      //    assert no completed deal exists between the two of them. We use the
+      //    "no completed deal involving the other tenant" check (same as the
+      //    incompatible-rate-ranges scenario) so that unrelated stale intents
+      //    on the testnet aggregator can't false-positive the test.
+      const stillUnmatched = await intentsRemainUnmatched(
+        alice,
+        aliceId,
+        bob,
+        bobId,
+        45_000,
+      );
+      expect(stillUnmatched).toBe(true);
+
+      // 4. Restore alice's strategy so the next test starts clean.
+      await runAuthedTraderCtl(
+        'set-strategy',
+        ['--blocked-counterparties', ''],
+        { tenant: alice.address, json: true },
+      ).catch(() => undefined);
     },
+    5 * 60_000,
   );
 
   it(

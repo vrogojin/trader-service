@@ -264,6 +264,12 @@ function addSetStrategy(parent: Command): Command {
     .option('--rate-strategy <strategy>', 'Rate strategy: aggressive|moderate|conservative')
     .option('--max-concurrent <n>', 'Max concurrent negotiations')
     .option('--trusted-escrows <list>', 'Comma-separated escrow addresses (overwrites)')
+    .option(
+      '--blocked-counterparties <list>',
+      'Comma-separated counterparty addresses or pubkeys to block (overwrites). ' +
+        'Pass empty string to clear. Engine filters matched intents whose ' +
+        'agent_pubkey is on this list before fan-out.',
+    )
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -274,6 +280,15 @@ function addSetStrategy(parent: Command): Command {
       }
       if (local['trustedEscrows'] !== undefined) {
         params['trusted_escrows'] = local['trustedEscrows'].split(',').map((s) => s.trim()).filter((s) => s !== '');
+      }
+      if (local['blockedCounterparties'] !== undefined) {
+        // Empty string is a valid "clear the list" signal — split('') on ''
+        // gives [''], which we filter out, leaving []. The handler accepts
+        // [] and replaces the strategy field.
+        params['blocked_counterparties'] = local['blockedCounterparties']
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '');
       }
       await runCommand(opts, 'SET_STRATEGY', params);
     });

@@ -124,6 +124,20 @@ export interface DealRecord {
   readonly acceptor_swap_address: string | null;
   readonly updated_at: number;
   /**
+   * Failure reason recorded when state transitions to FAILED. Populated from
+   * the `reason` argument passed to `OnSwapFailed` (e.g. `EXECUTION_TIMEOUT`,
+   * `ESCROW_UNREACHABLE`, `INVALID_ESCROW`, `PAYOUT_UNVERIFIED`,
+   * `PROPOSE_SWAP_FAILED: <message>`) and surfaced via list-deals so
+   * operators can distinguish a network-unreachable failure from a
+   * protocol-violation failure from a verification-gap failure without
+   * cross-referencing logs.
+   *
+   * Optional: only present on FAILED records. Absent on PROPOSED / ACCEPTED /
+   * EXECUTING / COMPLETED / CANCELLED transitions (CANCELLED has its own
+   * counterparty-signed `np.reject_deal` payload as the source of truth).
+   */
+  readonly error_code?: string;
+  /**
    * Round-17 F1: the counterparty-signed NP-0 envelope that proves this deal
    * was genuinely negotiated. For role=PROPOSER this is the `np.accept_deal`
    * message received from the acceptor; for role=ACCEPTOR this is the

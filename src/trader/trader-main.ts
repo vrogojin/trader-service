@@ -443,7 +443,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           // Fail the NP-0 deal so the counterparty sees it go terminal and the
           // intent is restored to ACTIVE rather than parked in MATCHING.
           if (negotiationHandler) {
-            negotiationHandler.failDeal(deal.terms.deal_id);
+            negotiationHandler.failDeal(deal.terms.deal_id, 'VOLUME_RESERVATION_FAILED');
           }
           if (intentEngine) {
             const ourId = ourIntentId(deal);
@@ -484,7 +484,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             }),
           );
           if (negotiationHandler) {
-            negotiationHandler.failDeal(deal.terms.deal_id);
+            negotiationHandler.failDeal(deal.terms.deal_id, `EXECUTE_DEAL_FAILED: ${msg}`);
           }
           if (intentEngine) {
             const ourId = ourIntentId(deal);
@@ -527,7 +527,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
           if (negotiationHandler) {
-            negotiationHandler.failDeal(deal.terms.deal_id);
+            negotiationHandler.failDeal(deal.terms.deal_id, 'PAYOUT_UNVERIFIED');
           }
           return;
         }
@@ -578,9 +578,12 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           const ourId = ourIntentId(deal);
           if (ourId !== null) intentEngine.restoreToActive(ourId);
         }
-        // Transition the NP-0 deal to FAILED so LIST_SWAPS reflects it
+        // Transition the NP-0 deal to FAILED so LIST_SWAPS reflects it,
+        // forwarding the reason from the swap-executor (e.g.
+        // EXECUTION_TIMEOUT, ESCROW_UNREACHABLE) so list-deals can show
+        // operators a distinguishing failure code without log archaeology.
         if (negotiationHandler) {
-          negotiationHandler.failDeal(deal.terms.deal_id);
+          negotiationHandler.failDeal(deal.terms.deal_id, reason);
         }
         logger.warn('swap_failed_reservation_released', { deal_id: deal.terms.deal_id, reason });
       };

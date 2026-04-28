@@ -202,7 +202,11 @@ describe('NegotiationHandler', () => {
 
       expect(deal.terms.proposer_pubkey).toBe(AGENT_PUBKEY);
       expect(deal.terms.acceptor_pubkey).toBe(COUNTERPARTY_PUBKEY);
-      expect(deal.terms.proposer_intent_id).toBe(ownIntent.intent.intent_id);
+      // DealTerms.proposer_intent_id carries the MARKET intent_id (UUID), not
+      // the local SHA-256 hash. Peers exchange the IDs they can see in market
+      // search results — the local intent_id is private to each side. The
+      // engine resolves either form via resolveIntentByEitherId.
+      expect(deal.terms.proposer_intent_id).toBe(ownIntent.intent.market_intent_id);
       expect(deal.terms.acceptor_intent_id).toBe(counterparty.id);
       expect(deal.terms.base_asset).toBe('ALPHA');
       expect(deal.terms.quote_asset).toBe('BRAVO');

@@ -71,6 +71,15 @@ export interface InternalProvisionOptions extends ProvisionTraderOptions {
   fundCoins?: Array<{ coinId: string; amount: bigint }>;
   /** Container image override; defaults to constants.TRADER_IMAGE. */
   image?: string;
+  /**
+   * Test-only fault injection. When true, sets `TRADER_FAULT_SKIP_DEPOSITS=1`
+   * in the container env so the trader's `swap:announced` handler skips its
+   * `swapModule.deposit()` call. Used by negotiation-failures' deposit-timeout
+   * scenario to simulate a peer that accepts the deal but never deposits;
+   * the counterparty's swap then hits EXECUTION_TIMEOUT and both sides
+   * transition to FAILED. Production deployments must NEVER set this.
+   */
+  faultSkipDeposits?: boolean;
 }
 
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
@@ -299,6 +308,8 @@ function buildContainerEnv(
     TRADER_SCAN_INTERVAL_MS: String(scanInterval),
     TRADER_MAX_ACTIVE_INTENTS: String(maxActiveIntents),
     LOG_LEVEL: 'info',
+    // Fault-injection: deposit-skip. Only set when the test caller asks.
+    ...(opts.faultSkipDeposits === true ? { TRADER_FAULT_SKIP_DEPOSITS: '1' } : {}),
   };
 }
 

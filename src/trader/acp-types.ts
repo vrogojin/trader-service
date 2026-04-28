@@ -109,6 +109,11 @@ export interface DealSummary {
   readonly swap_id: string | null;
   readonly created_ms: number;
   readonly updated_ms: number;
+  /**
+   * Failure reason — present only on FAILED records. See DealRecord.error_code
+   * in types.ts for the enumerated codes the trader emits.
+   */
+  readonly error_code?: string;
 }
 
 export interface ListSwapsResult {

@@ -170,7 +170,13 @@ export interface NegotiationHandler {
   completeDeal(dealId: string): void;
 
   /** Transition a deal to FAILED (called when swap fails). */
-  failDeal(dealId: string): void;
+  /**
+   * Transition the deal to FAILED. Optional `errorCode` is persisted on
+   * the DealRecord so list-deals can surface a distinguishing reason
+   * (e.g. `EXECUTION_TIMEOUT`, `ESCROW_UNREACHABLE`, `PAYOUT_UNVERIFIED`,
+   * `PROPOSE_SWAP_FAILED: ...`).
+   */
+  failDeal(dealId: string, errorCode?: string): void;
 
   /** Get a deal record by ID. */
   getDeal(dealId: string): DealRecord | null;
@@ -551,7 +557,11 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     return (allowed as readonly string[]).includes(to);
   }
 
-  async function transitionDeal(dealId: string, newState: DealState): Promise<DealRecord | null> {
+  async function transitionDeal(
+    dealId: string,
+    newState: DealState,
+    options?: { errorCode?: string },
+  ): Promise<DealRecord | null> {
     const deal = deals.get(dealId);
     if (!deal) return null;
     if (!isValidTransition(deal.state, newState)) {
@@ -566,6 +576,14 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       ...deal,
       state: newState,
       updated_at: Date.now(),
+      // Persist the failure reason ONLY on FAILED transitions. Other
+      // terminal states (CANCELLED, COMPLETED) carry their own
+      // counterparty-signed payloads (np.reject_deal / np.accept_deal +
+      // payout) which already encode the outcome; an error_code there
+      // would be redundant and possibly contradictory.
+      ...(newState === 'FAILED' && options?.errorCode !== undefined
+        ? { error_code: options.errorCode }
+        : {}),
     };
     deals.set(dealId, updated);
 
@@ -2046,11 +2064,13 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
         logger.warn('complete_deal_transition_failed', { deal_id: dealId, error: message });
       });
     },
-    failDeal(dealId: string): void {
-      transitionDeal(dealId, 'FAILED').catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.warn('fail_deal_transition_failed', { deal_id: dealId, error: message });
-      });
+    failDeal(dealId: string, errorCode?: string): void {
+      transitionDeal(dealId, 'FAILED', errorCode !== undefined ? { errorCode } : undefined).catch(
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn('fail_deal_transition_failed', { deal_id: dealId, error: message });
+        },
+      );
     },
     hydrateDeal(deal: DealRecord): void {
       // Round-21 F1: thin wrapper over hydrateDealAttempt for backwards

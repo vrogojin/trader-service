@@ -1004,8 +1004,29 @@ export async function startTrader(): Promise<void> {
     // retry loop can escape as an unhandled rejection. Waits are cancelable
     // via the `stopped` flag so SIGTERM doesn't leave a background loop
     // retrying deposit() after the trader is torn down.
+    // Fault-injection: when `TRADER_FAULT_SKIP_DEPOSITS=1` is set in the
+    // environment, the trader receives swap:announced events normally but
+    // does NOT call swapModule.deposit(). The escrow's deposit_timeout_sec
+    // counter then expires and the swap fails with EXECUTION_TIMEOUT, which
+    // is exactly the "B does not deposit" leg of the negotiation-failures
+    // deposit-timeout test. Read once at module init so the gate is
+    // immutable for the trader's lifetime — operators can't accidentally
+    // toggle this on a live swap.
+    const FAULT_SKIP_DEPOSITS = process.env['TRADER_FAULT_SKIP_DEPOSITS'] === '1';
+    if (FAULT_SKIP_DEPOSITS) {
+      logger.warn('fault_inject_deposit_skip_enabled', {
+        note: 'trader will NOT deposit on swap:announced; downstream swaps will EXECUTION_TIMEOUT. Production deployments must NOT set TRADER_FAULT_SKIP_DEPOSITS.',
+      });
+    }
     sphereUnsubscribers.push(sphere.on('swap:announced' as SphereEventType, ((data: { swapId: string }) => {
       logger.info('swap_announced', { swap_id: data.swapId });
+      if (FAULT_SKIP_DEPOSITS) {
+        logger.warn('fault_inject_deposit_skipped', {
+          swap_id: data.swapId,
+          note: 'TRADER_FAULT_SKIP_DEPOSITS=1 — deposit() not called; counterparty will time out',
+        });
+        return;
+      }
       void (async () => {
         try {
           const deadline = Date.now() + 60_000;
