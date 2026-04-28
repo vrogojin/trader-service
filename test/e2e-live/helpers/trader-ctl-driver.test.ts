@@ -298,11 +298,14 @@ describe('runTraderCtl — output parsing', () => {
     expect(res.stderr).toBe('commander: unknown option --foo\n');
   });
 
-  it('parses error envelope with trailing newline (CLI appends \\n via process.stdout.write)', async () => {
-    // The real CLI's emitResult does `process.stdout.write(JSON.stringify(...) + '\n')`,
-    // so a trailing newline is the wire-format reality. JSON.parse handles it.
+  it('parses error envelope tolerating CRLF / leading whitespace (cross-platform CI shells)', async () => {
+    // The real CLI does `process.stdout.write(JSON.stringify(...) + '\n')`, but
+    // CI shells on Windows can rewrite '\n' → '\r\n', and a future stdio
+    // wrapper might emit a leading newline. JSON.parse accepts both per spec —
+    // this test pins the contract so a hand-rolled `endsWith('}')` parser
+    // can't slip in without a failure.
     const envelope = JSON.stringify({ ok: false, error_code: 'TIMEOUT', message: 'x' });
-    stageChildExit(1, `${envelope}\n`, '');
+    stageChildExit(1, `\n${envelope}\r\n`, '');
 
     const res = await runTraderCtl('status', [], { tenant: '@a', json: true });
 
@@ -331,8 +334,14 @@ describe('runTraderCtl — output parsing', () => {
     const res = await runTraderCtl('portfolio', [], { tenant: '@a', json: true });
 
     expect(res.exitCode).toBe(0);
-    const balances = ((res.output as Record<string, unknown>)['result'] as Record<string, unknown>)['balances'] as Array<Record<string, unknown>>;
+    const result = (res.output as Record<string, unknown>)['result'] as Record<string, unknown>;
+    const balances = result['balances'] as Array<Record<string, unknown>>;
     expect(balances[0]?.['available']).toBe('12345678901234567890'); // STRING, not number
+    // Also assert the deeply-nested field — proves the parse handled depth
+    // correctly, not just the top-level array. (No reviver coerces along the
+    // path.)
+    const nested = result['nested'] as Record<string, Record<string, string>>;
+    expect(nested['deep']?.['value']).toBe('99999999999999999999');
   });
 });
 
