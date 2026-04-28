@@ -425,7 +425,10 @@ describe('Edge cases', () => {
       );
       expect(
         setStrategy.exitCode,
-        `set-strategy failed: output=${JSON.stringify(setStrategy.output)?.slice(0, 500)} stderr=${(setStrategy.stderr || '<empty>').slice(0, 500)}`,
+        // Pretty-print the structured AcpErrorPayload so error_code/message
+        // stay legible across line wraps; cap at 2000 chars (vs 500) so a full
+        // envelope + stderr can both fit without mid-token truncation.
+        `set-strategy failed: output=${JSON.stringify(setStrategy.output, null, 2)?.slice(0, 2000)} stderr=${(setStrategy.stderr || '<empty>').slice(0, 2000)}`,
       ).toBe(0);
 
       // 2. Post matching intents from both sides. Alice sells, bob buys, same

@@ -297,6 +297,43 @@ describe('runTraderCtl — output parsing', () => {
     expect(res.output).toBe('');
     expect(res.stderr).toBe('commander: unknown option --foo\n');
   });
+
+  it('parses error envelope with trailing newline (CLI appends \\n via process.stdout.write)', async () => {
+    // The real CLI's emitResult does `process.stdout.write(JSON.stringify(...) + '\n')`,
+    // so a trailing newline is the wire-format reality. JSON.parse handles it.
+    const envelope = JSON.stringify({ ok: false, error_code: 'TIMEOUT', message: 'x' });
+    stageChildExit(1, `${envelope}\n`, '');
+
+    const res = await runTraderCtl('status', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(1);
+    expect((res.output as Record<string, unknown>)['error_code']).toBe('TIMEOUT');
+  });
+
+  it('preserves stringified bigint values in parsed envelope (domain wire format)', async () => {
+    // Trader emits bigint fields (rate, volume, balances) as strings on the
+    // wire. A regression that emits them as JS numbers would silently lose
+    // precision past Number.MAX_SAFE_INTEGER. This test pins the contract
+    // that we DO surface what the CLI sent — even when the CLI follows the
+    // string convention. (We can't catch a silent-number regression in the
+    // CLI itself from here, but we can guarantee the driver doesn't coerce.)
+    const envelope = JSON.stringify({
+      ok: true,
+      result: {
+        balances: [
+          { asset: 'UCT', available: '12345678901234567890', confirmed: '0' },
+        ],
+        nested: { deep: { value: '99999999999999999999' } },
+      },
+    });
+    stageChildExit(0, envelope, '');
+
+    const res = await runTraderCtl('portfolio', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(0);
+    const balances = ((res.output as Record<string, unknown>)['result'] as Record<string, unknown>)['balances'] as Array<Record<string, unknown>>;
+    expect(balances[0]?.['available']).toBe('12345678901234567890'); // STRING, not number
+  });
 });
 
 // ---------------------------------------------------------------------------
