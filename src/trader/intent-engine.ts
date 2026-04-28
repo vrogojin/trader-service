@@ -162,6 +162,18 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   // Prevents repeatedly matching against the same dead counterparty.
   const failedCounterparties = new Map<string, Set<string>>();
 
+  // Per-intent timestamp of the FIRST scan-cycle yield under spec 5.7. When
+  // every match candidate is a lower-pubkey-priority peer (so we should
+  // wait for them to propose), we record `Date.now()`. If a scan still
+  // finds only lower-priority candidates `YIELD_TIMEOUT_MS` later AND we've
+  // never received an `np.propose_deal` for this intent, the original yield
+  // partner is presumed dead (likely a stale aggregator listing) and we
+  // fall through to propose anyway. The duplicate-guard + no-blacklist
+  // pair already shipped (commit c1f24d8 + later) breaks the live-vs-live
+  // race without permanently wedging either side.
+  const firstYieldAt = new Map<string, number>();
+  const YIELD_TIMEOUT_MS = 45_000;
+
   // Timers
   let scanTimer: ReturnType<typeof setInterval> | null = null;
   let expiryTimer: ReturnType<typeof setInterval> | null = null;
@@ -359,30 +371,61 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
 
     // Spec 5.7 — deterministic proposer election. The lower-pubkey side
     // proposes; the higher-pubkey side waits for the counterparty's
-    // np.propose_deal to arrive over the NP-0 channel. Without this, two
-    // simultaneous fan-outs (A finds B's intent at the same time B finds A's)
-    // produce two parallel proposals, both NP-0 duplicate-guards fire, and
-    // BOTH deals end up CANCELLED — wedging the pair on each other's
-    // failed-counterparty list and leaving the intents permanently unable to
-    // re-match. Filter our own match list to only candidates we should
-    // propose to: those whose pubkey sorts AFTER ours.
+    // np.propose_deal to arrive over NP-0. Filter our match list to only
+    // candidates whose pubkey sorts AFTER ours.
     const myKey = canonicalPubkeyKey(agentPubkey);
-    const proposingMatches = matches.filter((m) => {
+    let proposingMatches = matches.filter((m) => {
       const cpKey = canonicalPubkeyKey(m.agentPublicKey);
-      // String compare is fine — both keys are hex of equal length, so
-      // lexicographic order equals byte-wise numeric order.
       return myKey < cpKey;
     });
     if (proposingMatches.length === 0) {
-      // Nothing to propose to — every match is a higher-priority counterparty
-      // who will propose to us first. Stay ACTIVE and wait for their
-      // np.propose_deal.
-      logger.info('match_proposer_election_yield', {
+      // Every candidate is a lower-priority peer that should propose to us.
+      // Track when we FIRST started yielding for this intent. If a peer is
+      // alive and elected proposer, their np.propose_deal arrives within
+      // their own scan interval (5–30s typically). If we're still yielding
+      // YIELD_TIMEOUT_MS later, treat the partner as dead (e.g. a stale
+      // intent listing on a shared aggregator) and fall through to propose
+      // anyway. The duplicate-guard + no-blacklist combo handles the
+      // live-vs-live race without permanently wedging the pair.
+      const now = nowMs();
+      const firstAt = firstYieldAt.get(own.intent_id);
+      if (firstAt === undefined) {
+        firstYieldAt.set(own.intent_id, now);
+        logger.info('match_proposer_election_yield', {
+          intent_id: own.intent_id,
+          candidate_count: matches.length,
+          note: 'all candidates have lower-priority pubkey — waiting for their np.propose_deal',
+        });
+        return;
+      }
+      const elapsed = now - firstAt;
+      if (elapsed < YIELD_TIMEOUT_MS) {
+        logger.info('match_proposer_election_yield', {
+          intent_id: own.intent_id,
+          candidate_count: matches.length,
+          elapsed_ms: elapsed,
+          timeout_ms: YIELD_TIMEOUT_MS,
+        });
+        return;
+      }
+      // Yield timeout exceeded — proceed with the original (unfiltered)
+      // candidates. This is the "presumed-dead lower-priority candidate"
+      // fall-through. Once we propose, the engine clears the timestamp on
+      // the next successful match cycle (or the intent transitions out of
+      // ACTIVE/PARTIALLY_FILLED, in which case the entry is harmless and
+      // ages out via the periodic intents-map cleanup).
+      logger.warn('match_proposer_election_yield_timeout', {
         intent_id: own.intent_id,
         candidate_count: matches.length,
-        note: 'all candidates have lower-priority pubkey — waiting for their np.propose_deal',
+        elapsed_ms: elapsed,
+        timeout_ms: YIELD_TIMEOUT_MS,
+        note: 'lower-priority candidates have not proposed within timeout — falling through to propose anyway',
       });
-      return;
+      proposingMatches = matches;
+    } else {
+      // We have proposing-elected candidates — clear the yield timestamp
+      // so the next yield (if any) starts a fresh window.
+      firstYieldAt.delete(own.intent_id);
     }
 
     // Sort by priority (spec 5.5) — only the proposer-elected candidates.
@@ -719,6 +762,7 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       if (TERMINAL_INTENT_STATES.includes(record.state) && record.updated_at < purgeThreshold) {
         intents.delete(id);
         failedCounterparties.delete(id);
+        firstYieldAt.delete(id);
         logger.debug('intent_purged', { intent_id: id, state: record.state });
       }
     }
