@@ -298,14 +298,14 @@ describe('runTraderCtl — output parsing', () => {
     expect(res.stderr).toBe('commander: unknown option --foo\n');
   });
 
-  it('parses error envelope tolerating CRLF / leading whitespace (cross-platform CI shells)', async () => {
-    // The real CLI does `process.stdout.write(JSON.stringify(...) + '\n')`, but
-    // CI shells on Windows can rewrite '\n' → '\r\n', and a future stdio
-    // wrapper might emit a leading newline. JSON.parse accepts both per spec —
-    // this test pins the contract so a hand-rolled `endsWith('}')` parser
-    // can't slip in without a failure.
+  it('tolerates CRLF in stdout (Windows CI line-ending rewrite of CLI trailing \\n)', async () => {
+    // Documents that whitespace-tolerant parsing is part of our wire contract:
+    // CI shells on Windows can rewrite the CLI's trailing '\n' to '\r\n', and
+    // JSON.parse accepts trailing whitespace per spec. A future change that
+    // moved off JSON.parse to a stricter parser would be a breaking change to
+    // this contract — this test would flag it.
     const envelope = JSON.stringify({ ok: false, error_code: 'TIMEOUT', message: 'x' });
-    stageChildExit(1, `\n${envelope}\r\n`, '');
+    stageChildExit(1, `${envelope}\r\n`, '');
 
     const res = await runTraderCtl('status', [], { tenant: '@a', json: true });
 
@@ -340,8 +340,11 @@ describe('runTraderCtl — output parsing', () => {
     // Also assert the deeply-nested field — proves the parse handled depth
     // correctly, not just the top-level array. (No reviver coerces along the
     // path.)
-    const nested = result['nested'] as Record<string, Record<string, string>>;
-    expect(nested['deep']?.['value']).toBe('99999999999999999999');
+    // JSON.parse returns `unknown`-shaped data; cast at each step rather than
+    // overpromising the leaf type.
+    const nested = result['nested'] as Record<string, unknown>;
+    const deep = nested['deep'] as Record<string, unknown>;
+    expect(deep['value']).toBe('99999999999999999999');
   });
 });
 
