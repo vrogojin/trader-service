@@ -1078,11 +1078,14 @@ export async function startTrader(): Promise<void> {
       }
       // Async retry loop — fire-and-forget, gated on stopped flag.
       void (async () => {
-        // Spec §7.9.2: 30s × 10 = 5-minute window before escalating to FAILED.
-        // Real-network testnet payout delivery has been observed to take up to
-        // several minutes for the payInvoice transfer to be received and
-        // attributed; 5 minutes is the published tolerance.
-        const MAX_ATTEMPTS = 10;
+        // 30s × 20 = 10-minute window before escalating to FAILED.
+        // The SDK's verifyPayout fails closed when payout-invoice tokens
+        // are L3-pending. On testnet, aggregator inclusion-proof
+        // propagation has been observed to take up to ~7 minutes during
+        // peak load — 5 minutes (the previous limit) reliably escalated
+        // legitimate payouts to PAYOUT_UNVERIFIED. 10 minutes covers the
+        // observed P99 with margin.
+        const MAX_ATTEMPTS = 20;
         const RETRY_INTERVAL_MS = 30_000;
         let verified = false;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
