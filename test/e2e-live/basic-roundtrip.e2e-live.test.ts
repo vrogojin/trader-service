@@ -49,25 +49,29 @@ beforeAll(async () => {
   escrow = await provisionEscrow({
     label: 'basic-escrow',
     relayUrls: [...TESTNET.RELAYS],
+    readyTimeoutMs: 180_000,
   });
-  [buyer, seller] = await Promise.all([
-    provisionTrader({
-      label: 'basic-buyer',
-      trustedEscrows: [escrow.address],
-      relayUrls: [...TESTNET.RELAYS],
-      waitForReady: true,
-      readyTimeoutMs: 90_000,
-      fundFromFaucet: true,
-    } satisfies InternalProvisionOptions),
-    provisionTrader({
-      label: 'basic-seller',
-      trustedEscrows: [escrow.address],
-      relayUrls: [...TESTNET.RELAYS],
-      waitForReady: true,
-      readyTimeoutMs: 90_000,
-      fundFromFaucet: true,
-    } satisfies InternalProvisionOptions),
-  ]);
+  // Sequential provisioning + 180s ready timeout: parallel nametag
+  // registrations against the testnet aggregator can trip a rate-limit
+  // (one of two concurrent provisions sometimes fails to log
+  // sphere_initialized within 90s while the other completes in ~5s).
+  // Sequential adds ~10–15s; well within the 600s beforeAll budget.
+  buyer = await provisionTrader({
+    label: 'basic-buyer',
+    trustedEscrows: [escrow.address],
+    relayUrls: [...TESTNET.RELAYS],
+    waitForReady: true,
+    readyTimeoutMs: 180_000,
+    fundFromFaucet: true,
+  } satisfies InternalProvisionOptions);
+  seller = await provisionTrader({
+    label: 'basic-seller',
+    trustedEscrows: [escrow.address],
+    relayUrls: [...TESTNET.RELAYS],
+    waitForReady: true,
+    readyTimeoutMs: 180_000,
+    fundFromFaucet: true,
+  } satisfies InternalProvisionOptions);
 }, 600_000);
 
 afterAll(async () => {

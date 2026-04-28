@@ -20,7 +20,13 @@ export const TERMINAL_INTENT_STATES: readonly IntentState[] = ['FILLED', 'CANCEL
 
 export const VALID_INTENT_TRANSITIONS: Record<IntentState, readonly IntentState[]> = {
   DRAFT: ['ACTIVE'],
-  ACTIVE: ['MATCHING', 'CANCELLED', 'EXPIRED'],
+  // ACTIVE → PARTIALLY_FILLED / FILLED is permitted because an acceptor never
+  // passes through MATCHING: only the side that proposes runs the match-fan-out
+  // path that transitions the intent into MATCHING. The acceptor's intent
+  // remains ACTIVE until the swap completes, and recordFill must be able to
+  // record the fill directly. Without this, every swap silently failed to
+  // credit volume on the acceptor's side.
+  ACTIVE: ['MATCHING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'EXPIRED'],
   MATCHING: ['NEGOTIATING', 'ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED'],
   NEGOTIATING: ['ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED'],
   PARTIALLY_FILLED: ['MATCHING', 'FILLED', 'CANCELLED', 'EXPIRED'],
