@@ -109,6 +109,21 @@ export interface TraderAgent {
   handleSwapFailed(swapId: string, reason: string): void;
   /** Get the current trading strategy. */
   getStrategy(): TraderStrategy;
+  /**
+   * Spec 7.9.3 (deposit idempotency): atomically mark a swapId as
+   * deposit-attempted and return whether this is the first time. The
+   * caller (swap:announced handler in main.ts) must check the result
+   * BEFORE calling sphere.swap.deposit() and skip the call if false.
+   *
+   * Persistence: the set is flushed to disk before the function returns,
+   * so a crash between the persist and the deposit() call (the only
+   * window the flag protects) results in the set knowing the deposit
+   * was attempted — on restart, swap:announced re-fires but markDepositAttempted
+   * returns false → deposit() not re-issued. The SDK's swap state is
+   * authoritative for deposit reception (so SWAP_WRONG_STATE catches the
+   * "already deposited" case from the SDK's side).
+   */
+  markDepositAttempted(swapId: string): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +158,13 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
   let negotiationHandler: NegotiationHandler | null = null;
   let swapExecutor: SwapExecutor | null = null;
   let acpListener: AcpListener | null = null;
+  /**
+   * Spec 7.9.3 deposit-attempted set. Loaded from disk at start(),
+   * persisted on every add via markDepositAttempted(). Surface for the
+   * caller (trader/main.ts swap:announced handler) which checks the
+   * boolean return from markDepositAttempted() before issuing deposit().
+   */
+  const depositAttempted: Set<string> = new Set();
 
   // Event unsubscribers collected during start()
   const unsubscribers: Array<() => void> = [];
@@ -252,6 +274,22 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           strategy = { ...strategy, trusted_escrows: list };
           logger.info('trusted_escrows_env_applied', { count: list.length });
         }
+      }
+
+      // 3a. Spec 7.9.3: load the deposit-attempted set so the swap:announced
+      // handler doesn't re-issue deposit() for a swapId we already deposited
+      // on a previous lifetime. The SDK's SWAP_WRONG_STATE guard catches
+      // most cases, but defense-in-depth at the trader is the spec mandate.
+      try {
+        const persistedAttempts = await stateStore.loadDepositAttempted();
+        for (const swapId of persistedAttempts) {
+          depositAttempted.add(swapId);
+        }
+        logger.info('deposit_attempted_restored', { count: persistedAttempts.length });
+      } catch (err) {
+        logger.warn('deposit_attempted_restore_failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
 
       // 3. Create VolumeReservationLedger, restoring persisted reservations
@@ -1210,15 +1248,20 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           strategy: capturedStrategy,
           agentPubkey,
           agentAddress,
-          // NOTE: Strategy mutation limitation — updating `strategy` here only
-          // affects the TraderCommandHandler's local copy and the persisted state.
-          // The IntentEngine and SwapExecutor capture the strategy reference at
-          // creation time and will NOT see runtime changes. An updateStrategy()
-          // method on IntentEngine/SwapExecutor would be needed for full propagation.
-          // This is out of scope for now but should be addressed in a future iteration.
+          // C1/W3 (steelman round-4): persist FIRST, then mutate. If the disk
+          // write fails, the in-memory strategy stays consistent with what's
+          // on disk — on restart the persisted (old) state loads cleanly. The
+          // previous order silently diverged in-memory from on-disk on
+          // partial-write failure. After successful persist, propagate to
+          // IntentEngine AND SwapExecutor so SET_STRATEGY actually takes
+          // effect at runtime (was: SwapExecutor's strategy was a frozen
+          // startup snapshot — `max_concurrent_swaps`/`trusted_escrows`
+          // changes never reached it).
           saveStrategy: async (s: TraderStrategy) => {
-            strategy = s;
             await capturedStateStore.saveStrategy(s);
+            strategy = s;
+            capturedIntentEngine.updateStrategy(s);
+            capturedSwapExecutor.updateStrategy(s);
           },
           withdraw,
           debugResolve: deps.debugResolve,
@@ -1394,6 +1437,30 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
 
     getStrategy(): TraderStrategy {
       return { ...strategy };
+    },
+
+    async markDepositAttempted(swapId: string): Promise<boolean> {
+      if (depositAttempted.has(swapId)) return false;
+      depositAttempted.add(swapId);
+      // Persist BEFORE returning so the caller (which is about to issue
+      // sphere.swap.deposit()) is guaranteed that a crash between mark and
+      // deposit() leaves the persisted set with this swapId.
+      try {
+        if (stateStore) {
+          await stateStore.saveDepositAttempted([...depositAttempted]);
+        }
+      } catch (err: unknown) {
+        // Persist failure is logged but doesn't block the deposit attempt.
+        // Worst case on crash: depositAttempted lost → swap:announced
+        // re-fires → deposit() retries → SDK's SWAP_WRONG_STATE guard
+        // prevents double-deposit. Same fallback as before, just less
+        // explicit.
+        logger.warn('deposit_attempted_persist_failed', {
+          swap_id: swapId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return true;
     },
   };
 }

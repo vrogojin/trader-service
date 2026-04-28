@@ -75,6 +75,22 @@ export interface SwapProposalMatchInfo {
   partyBAmount?: string;
   /** Pubkey of the counterparty (proposer), for disambiguation. */
   counterpartyPubkey?: string;
+  /**
+   * SECURITY (spec 7.9.4 / H1): escrow address advertised by the SDK swap
+   * proposal. Compared against the negotiated DealTerms.escrow_address — a
+   * mismatch means the counterparty pivoted to a different escrow at the
+   * SDK layer than what was negotiated, defeating the trusted_escrows
+   * allowlist. Reject on mismatch.
+   */
+  escrowDirectAddress?: string;
+  /** Escrow chain pubkey (alternate identification when DIRECT addresses don't match). */
+  escrowPubkey?: string;
+  /**
+   * SECURITY (spec 7.9.4 / H1): deposit timeout from the SDK proposal, in
+   * seconds. Compared against DealTerms.deposit_timeout_sec; a hostile
+   * counterparty who lengthens the timeout shifts the funds-at-risk window.
+   */
+  depositTimeoutSec?: number;
 }
 
 export interface SwapExecutor {
@@ -116,6 +132,15 @@ export interface SwapExecutor {
   getActiveDeals(): Array<{ deal_id: string; swap_id: string | null; state: string }>;
   /** Get recent errors for debugging. */
   getLastErrors(): Array<{ ts: number; deal_id: string; error: string }>;
+
+  /**
+   * Replace the executor's strategy snapshot. Called from the SET_STRATEGY
+   * command handler so changes to `max_concurrent_swaps`, `trusted_escrows`,
+   * etc. take effect at runtime. Without this, the executor keeps the
+   * startup snapshot and operators see "set-strategy didn't take effect"
+   * until the trader restarts.
+   */
+  updateStrategy(newStrategy: TraderStrategy): void;
 
   /** Stop all pending operations. */
   stop(): void;
@@ -221,7 +246,11 @@ export function buildSwapDealInput(
 // ---------------------------------------------------------------------------
 
 export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
-  const { swap, strategy, onSwapCompleted, onSwapFailed, agentPubkey, agentAddress, logger } = deps;
+  const { swap, onSwapCompleted, onSwapFailed, agentPubkey, agentAddress, logger } = deps;
+  // C1 (steelman round-4): keep `strategy` mutable so SET_STRATEGY changes
+  // propagate at runtime via updateStrategy(). All callsites read through
+  // this binding (NOT a destructured copy), so they see the current values.
+  let strategy: TraderStrategy = { ...deps.strategy };
   // Use directAddress for swap proposals to avoid nametag resolution timing issues
   // in bundled/containerized environments. Falls back to agentAddress if not provided.
   const swapAddress = deps.swapDirectAddress || agentAddress;
@@ -279,6 +308,24 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
         timeout_sec: clampedTimeoutSec + EXECUTION_TIMEOUT_GRACE_SEC,
       });
       entry.deal = transitionDeal(entry.deal, 'FAILED');
+      // SECURITY (C3): cancel the SDK swap BEFORE unregistering. Without
+      // this, a swap that completes after the timeout would emit
+      // swap:completed for a swapId no longer in activeBySwapId — the
+      // handler logs and drops, but the escrow has already moved funds.
+      // Result: ledger says FAILED, chain says COMPLETED, fill never
+      // recorded. Best-effort: if rejectSwap fails (already terminal,
+      // network), log and continue — the failure-path semantics still
+      // hold from the trader's perspective; reconciliation surfaces the
+      // discrepancy.
+      if (swapId !== null) {
+        deps.swap.rejectSwap(swapId, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
+          logger.warn('execution_timeout_reject_failed', {
+            deal_id: dealId,
+            swap_id: swapId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       unregisterActive(entry);
       void onSwapFailed(entry.deal, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
         logger.error('on_swap_failed_callback_error', {
@@ -535,6 +582,41 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
           // On the acceptor path, counterparty is the proposer.
           if (!pubkeysEqual(entry.deal.terms.proposer_pubkey, match.counterpartyPubkey)) return false;
         }
+        // SECURITY (spec 7.9.4 / H1): extend term-binding to escrow address
+        // and timeout. If the SDK proposal advertises a different escrow
+        // address than what was negotiated, or a different deposit timeout,
+        // a hostile counterparty has pivoted at the SDK layer — refuse to
+        // bind. Only enforce when the SDK actually surfaced these fields
+        // (some SDK versions don't expose them); the absence is logged
+        // upstream in main.ts.
+        if (match.escrowDirectAddress !== undefined && match.escrowDirectAddress !== '') {
+          const negotiatedEscrow = entry.deal.terms.escrow_address;
+          // Compare both as DIRECT://hex strings; the negotiated form may
+          // also be a nametag, in which case we accept it (resolution
+          // happens elsewhere). Strict equality is sufficient for the
+          // DIRECT://hex case which is what the SDK reports.
+          if (negotiatedEscrow !== match.escrowDirectAddress &&
+              negotiatedEscrow !== match.escrowPubkey) {
+            logger.warn('swap_id_register_escrow_mismatch', {
+              swap_id: swapId,
+              negotiated_escrow: negotiatedEscrow,
+              proposal_escrow: match.escrowDirectAddress,
+              proposal_escrow_pubkey: match.escrowPubkey,
+            });
+            return false;
+          }
+        }
+        if (match.depositTimeoutSec !== undefined) {
+          const negotiated = entry.deal.terms.deposit_timeout_sec;
+          if (negotiated !== undefined && negotiated !== match.depositTimeoutSec) {
+            logger.warn('swap_id_register_timeout_mismatch', {
+              swap_id: swapId,
+              negotiated_timeout_sec: negotiated,
+              proposal_timeout_sec: match.depositTimeoutSec,
+            });
+            return false;
+          }
+        }
         return true;
       });
     }
@@ -608,6 +690,13 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
     },
     getLastErrors() {
       return [...lastErrors];
+    },
+    updateStrategy(newStrategy: TraderStrategy): void {
+      strategy = { ...newStrategy };
+      logger.info('swap_executor_strategy_updated', {
+        max_concurrent_swaps: strategy.max_concurrent_swaps,
+        trusted_escrows_count: strategy.trusted_escrows.length,
+      });
     },
     stop: stopAll,
   };

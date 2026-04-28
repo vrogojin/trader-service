@@ -400,12 +400,11 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       }
       const elapsed = now - firstAt;
       if (elapsed < YIELD_TIMEOUT_MS) {
-        logger.info('match_proposer_election_yield', {
-          intent_id: own.intent_id,
-          candidate_count: matches.length,
-          elapsed_ms: elapsed,
-          timeout_ms: YIELD_TIMEOUT_MS,
-        });
+        // W4 (steelman round-4): rate-limit yield logging to fresh-yield
+        // only (handled in the firstAt === undefined branch above). The
+        // continuing-yield case fires every scan iteration (~5s) for the
+        // 45s window — 9 redundant log lines per yield session. Fall
+        // through silently; the timestamp suffices as state.
         return;
       }
       // Yield timeout exceeded — proceed with the original (unfiltered)
@@ -422,7 +421,18 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
         note: 'lower-priority candidates have not proposed within timeout — falling through to propose anyway',
       });
       proposingMatches = matches;
-    } else {
+      // W2 (steelman round-4): blacklist the failed-yield candidates so the
+      // next scan tries OTHER candidates first. Without this, every scan
+      // re-yields → 45s timeout → propose → AGENT_BUSY race → cancel →
+      // re-yield, a pathological retry loop. The failed-counterparty Set
+      // is per-intent and per-pubkey; it's used by matchesCriteria's
+      // criterion-7-equivalent in the next scan cycle.
+      // (TTL semantics: failedCounterparties uses an LRU+capacity bound
+      // rather than a per-entry TTL. Adding here moves the entry to the
+      // most-recent position; old entries age out as new failures arrive.)
+      for (const m of matches) {
+        engine.markCounterpartyFailed(own.intent_id, m.agentPublicKey);
+      }
       // We have proposing-elected candidates — clear the yield timestamp
       // so the next yield (if any) starts a fresh window.
       firstYieldAt.delete(own.intent_id);

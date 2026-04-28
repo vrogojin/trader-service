@@ -52,6 +52,14 @@ export interface TraderStateStore {
   // Volume reservation ledger state
   saveReservations(serialized: string): Promise<void>;
   loadReservations(): Promise<string | null>;
+
+  // Deposit-attempted ledger (spec 7.9.3): swapIds for which we have
+  // ALREADY issued sphere.swap.deposit() at least once. Persisted BEFORE
+  // the deposit() call, so a crash mid-deposit never causes a retry to
+  // re-issue. Loaded at startup to seed the in-memory dedup set so the
+  // swap:announced event replay doesn't double-deposit.
+  saveDepositAttempted(swapIds: ReadonlyArray<string>): Promise<void>;
+  loadDepositAttempted(): Promise<string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +238,7 @@ export function createFsTraderStateStore(baseDir: string): TraderStateStore {
   const dealsDir = join(baseDir, 'deals');
   const strategyPath = join(baseDir, 'strategy.json');
   const reservationsPath = join(baseDir, 'reservations.json');
+  const depositAttemptedPath = join(baseDir, 'deposit-attempted.json');
 
   function intentPath(intentId: string): string {
     return join(intentsDir, `${intentId}.json`);
@@ -367,6 +376,29 @@ export function createFsTraderStateStore(baseDir: string): TraderStateStore {
     async loadReservations(): Promise<string | null> {
       return safeReadFile(reservationsPath);
     },
+
+    async saveDepositAttempted(swapIds: ReadonlyArray<string>): Promise<void> {
+      // De-dup the persisted list so the file doesn't grow without bound
+      // (every crash + retry would otherwise append duplicates). Bounded
+      // implicitly by the lifetime of the Set in main.ts (entries are
+      // cleared on swap:completed/swap:failed/swap:cancelled in a future
+      // pass; for now the file size grows with the trader's swap throughput
+      // and is read once at startup — acceptable cost).
+      const unique = Array.from(new Set(swapIds));
+      await atomicWrite(depositAttemptedPath, JSON.stringify(unique));
+    },
+
+    async loadDepositAttempted(): Promise<string[]> {
+      const raw = await safeReadFile(depositAttemptedPath);
+      if (raw === null) return [];
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter((s): s is string => typeof s === 'string');
+      } catch {
+        return [];
+      }
+    },
   };
 }
 
@@ -391,5 +423,8 @@ export function createNullTraderStateStore(): TraderStateStore {
 
     async saveReservations(_serialized: string): Promise<void> { /* no-op */ },
     async loadReservations(): Promise<string | null> { return null; },
+
+    async saveDepositAttempted(_swapIds: ReadonlyArray<string>): Promise<void> { /* no-op */ },
+    async loadDepositAttempted(): Promise<string[]> { return []; },
   };
 }

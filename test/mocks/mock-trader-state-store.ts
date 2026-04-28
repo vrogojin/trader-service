@@ -146,6 +146,16 @@ export class MockTraderStateStore implements TraderStateStore {
   async loadReservations(): Promise<string | null> {
     return this.reservations;
   }
+
+  private depositAttempted: string[] = [];
+
+  async saveDepositAttempted(swapIds: ReadonlyArray<string>): Promise<void> {
+    this.depositAttempted = [...swapIds];
+  }
+
+  async loadDepositAttempted(): Promise<string[]> {
+    return [...this.depositAttempted];
+  }
 }
 
 /**
