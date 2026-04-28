@@ -937,14 +937,28 @@ export async function startTrader(): Promise<void> {
             // SECURITY (spec 7.9.5): reject any swap that isn't on
             // protocolVersion === 2. v1 lacks the mutual-consent signature
             // chain and doesn't bind escrow_address into swap_id, opening
-            // a MITM substitution vector. The SDK status type may not
-            // surface protocolVersion explicitly — we read it through an
-            // optional chain so v1 (or unspecified) hits the reject path.
-            const protocolVersion = (s as unknown as { protocolVersion?: number }).protocolVersion;
-            if (protocolVersion !== 2) {
+            // a MITM substitution vector.
+            //
+            // N1 (round-4 audit) — type-drift defense: parse permissively
+            // so a future SDK that changes the field's encoding (e.g.
+            // string "v2", semver "2.0.0") doesn't silently DoS every
+            // proposal. Accepts: number 2, string "2", string "v2",
+            // semver "2.x.y". Reject everything else.
+            const rawProtocolVersion = (s as unknown as { protocolVersion?: unknown }).protocolVersion;
+            const isV2 = (() => {
+              if (rawProtocolVersion === 2) return true;
+              if (typeof rawProtocolVersion === 'string') {
+                if (rawProtocolVersion === '2' || rawProtocolVersion === 'v2') return true;
+                // semver "2.x.y" → major version 2
+                const match = /^v?(\d+)(?:\.\d+)*$/.exec(rawProtocolVersion);
+                if (match && match[1] === '2') return true;
+              }
+              return false;
+            })();
+            if (!isV2) {
               logger.warn('swap_proposal_rejected_protocol_version', {
                 swap_id: data.swapId,
-                protocol_version: protocolVersion ?? 'unspecified',
+                protocol_version: rawProtocolVersion ?? 'unspecified',
               });
               try {
                 await swapModule.rejectSwap(data.swapId, 'PROTOCOL_VERSION_TOO_OLD');
@@ -969,8 +983,15 @@ export async function startTrader(): Promise<void> {
               });
               try {
                 await swapModule.rejectSwap(data.swapId, 'MISSING_COUNTERPARTY_PUBKEY');
-              } catch {
-                /* best-effort */
+              } catch (rejErr: unknown) {
+                // N5 (round-5 audit): mirror the protocolVersion path —
+                // surface rejectSwap failures so an operator can tell
+                // when the escrow held funds awaiting a manual reclaim.
+                logger.error('swap_reject_failed', {
+                  swap_id: data.swapId,
+                  reason: 'MISSING_COUNTERPARTY_PUBKEY',
+                  error: rejErr instanceof Error ? rejErr.message : String(rejErr),
+                });
               }
               return;
             }
@@ -1162,6 +1183,10 @@ export async function startTrader(): Promise<void> {
     sphereUnsubscribers.push(sphere.on('swap:completed' as SphereEventType, ((data: { swapId: string; payoutVerified: boolean }) => {
       logger.info('swap_completed', { swap_id: data.swapId, payout_verified: data.payoutVerified });
       sphere.payments.receive().catch(() => {});
+      // Round-5: clear the persisted deposit-attempted flag so the
+      // long-lived persistent set doesn't grow without bound.
+      depositInFlight.delete(data.swapId);
+      void agent.clearDepositAttempted(data.swapId).catch(() => {});
       if (data.payoutVerified) {
         agent.handleSwapCompleted(data.swapId, true);
         return;
@@ -1257,7 +1282,17 @@ export async function startTrader(): Promise<void> {
 
     sphereUnsubscribers.push(sphere.on('swap:failed' as SphereEventType, ((data: { swapId: string; error: string }) => {
       logger.error('swap_failed', { swap_id: data.swapId, error: data.error });
+      depositInFlight.delete(data.swapId);
+      void agent.clearDepositAttempted(data.swapId).catch(() => {});
       agent.handleSwapFailed(data.swapId, data.error);
+    }) as Parameters<typeof sphere.on>[1]));
+
+    // Round-5: also subscribe swap:cancelled so the deposit-attempted set
+    // gets cleared on every terminal state.
+    sphereUnsubscribers.push(sphere.on('swap:cancelled' as SphereEventType, ((data: { swapId: string }) => {
+      logger.info('swap_cancelled', { swap_id: data.swapId });
+      depositInFlight.delete(data.swapId);
+      void agent.clearDepositAttempted(data.swapId).catch(() => {});
     }) as Parameters<typeof sphere.on>[1]));
   }
 

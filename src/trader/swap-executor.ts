@@ -319,11 +319,20 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
       // discrepancy.
       if (swapId !== null) {
         deps.swap.rejectSwap(swapId, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
-          logger.warn('execution_timeout_reject_failed', {
+          // N4 (round-5 audit): escalate to error level — when this fails,
+          // there's a real risk the SDK swap subsequently completes while
+          // our ledger says FAILED, producing the exact ledger-vs-chain
+          // inconsistency the round-4 fix was added for. Operator-visible
+          // alert path: the entry is also pushed into lastErrors so
+          // getLastErrors() surfaces it without log archaeology.
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error('execution_timeout_reject_failed', {
             deal_id: dealId,
             swap_id: swapId,
-            error: err instanceof Error ? err.message : String(err),
+            error: msg,
+            inconsistency_risk: true,
           });
+          recordError(dealId, `EXECUTION_TIMEOUT_REJECT_FAILED: ${msg}`);
         });
       }
       unregisterActive(entry);
@@ -589,21 +598,48 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
         // bind. Only enforce when the SDK actually surfaced these fields
         // (some SDK versions don't expose them); the absence is logged
         // upstream in main.ts.
+        // SECURITY (round-4 audit N2 + round-5 review CRITICAL): bind the
+        // SDK swap's escrow to the negotiated DealTerms.escrow_address
+        // ONLY when the negotiated form is concrete (DIRECT://hex). Two
+        // legitimate negotiated forms must skip the binding check:
+        //
+        //   1. The wildcard sentinel 'any' (DEFAULT_ESCROW) — used when
+        //      the intent was created without an explicit escrow. The
+        //      `trusted_escrows` allowlist filter at NP-0 negotiation
+        //      time already enforces policy; a per-swap concrete-binding
+        //      check here would reject the entire default flow.
+        //   2. Nametag form (starts with '@') — the negotiated form
+        //      hasn't been resolved to DIRECT://hex yet; comparison
+        //      against the SDK's resolved DIRECT://hex form is moot.
+        //      Resolution happens at SDK swap-proposal time; the
+        //      trusted_escrows filter still ran on the original nametag.
+        //
+        // For concrete (DIRECT://hex) negotiated forms, require BOTH the
+        // escrowDirectAddress AND escrowPubkey (when supplied) to match.
+        // The previous OR semantics let a hostile counterparty spoof
+        // ONE of the two and still pass binding.
         if (match.escrowDirectAddress !== undefined && match.escrowDirectAddress !== '') {
           const negotiatedEscrow = entry.deal.terms.escrow_address;
-          // Compare both as DIRECT://hex strings; the negotiated form may
-          // also be a nametag, in which case we accept it (resolution
-          // happens elsewhere). Strict equality is sufficient for the
-          // DIRECT://hex case which is what the SDK reports.
-          if (negotiatedEscrow !== match.escrowDirectAddress &&
-              negotiatedEscrow !== match.escrowPubkey) {
-            logger.warn('swap_id_register_escrow_mismatch', {
-              swap_id: swapId,
-              negotiated_escrow: negotiatedEscrow,
-              proposal_escrow: match.escrowDirectAddress,
-              proposal_escrow_pubkey: match.escrowPubkey,
-            });
-            return false;
+          const isWildcard = negotiatedEscrow === 'any';
+          const isNametag = negotiatedEscrow.startsWith('@');
+          if (!isWildcard && !isNametag) {
+            // Concrete DIRECT://hex form — strict binding.
+            const directMatches = negotiatedEscrow === match.escrowDirectAddress;
+            const pubkeyMatches =
+              match.escrowPubkey === undefined ||
+              negotiatedEscrow === match.escrowPubkey ||
+              negotiatedEscrow === `DIRECT://${match.escrowPubkey}`;
+            if (!directMatches || !pubkeyMatches) {
+              logger.warn('swap_id_register_escrow_mismatch', {
+                swap_id: swapId,
+                negotiated_escrow: negotiatedEscrow,
+                proposal_escrow: match.escrowDirectAddress,
+                proposal_escrow_pubkey: match.escrowPubkey,
+                direct_match: directMatches,
+                pubkey_match: pubkeyMatches,
+              });
+              return false;
+            }
           }
         }
         if (match.depositTimeoutSec !== undefined) {

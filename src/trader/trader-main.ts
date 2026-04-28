@@ -124,6 +124,15 @@ export interface TraderAgent {
    * "already deposited" case from the SDK's side).
    */
   markDepositAttempted(swapId: string): Promise<boolean>;
+
+  /**
+   * Round-5: clear the deposit-attempted flag for a swap that has reached
+   * a terminal state (swap:completed / swap:failed / swap:cancelled).
+   * Called by the corresponding event handlers in main.ts so the
+   * persisted set doesn't grow without bound. Safe to call for swapIds
+   * that aren't in the set (no-op).
+   */
+  clearDepositAttempted(swapId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,6 +1450,17 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
 
     async markDepositAttempted(swapId: string): Promise<boolean> {
       if (depositAttempted.has(swapId)) return false;
+      // Round-5: LRU cap on the in-memory set so a long-running tenant
+      // doesn't accumulate unbounded entries even if a code path forgets
+      // to call clearDepositAttempted on terminal states. The persisted
+      // file is also bounded by this cap (saveDepositAttempted dedups,
+      // load reads what was persisted).
+      const MAX_DEPOSIT_ATTEMPTED = 10_000;
+      if (depositAttempted.size >= MAX_DEPOSIT_ATTEMPTED) {
+        // Drop the oldest insertion (Set iteration order is insertion order).
+        const oldest = depositAttempted.values().next().value;
+        if (oldest !== undefined) depositAttempted.delete(oldest);
+      }
       depositAttempted.add(swapId);
       // Persist BEFORE returning so the caller (which is about to issue
       // sphere.swap.deposit()) is guaranteed that a crash between mark and
@@ -1461,6 +1481,24 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         });
       }
       return true;
+    },
+
+    async clearDepositAttempted(swapId: string): Promise<void> {
+      if (!depositAttempted.has(swapId)) return;
+      depositAttempted.delete(swapId);
+      try {
+        if (stateStore) {
+          await stateStore.saveDepositAttempted([...depositAttempted]);
+        }
+      } catch (err: unknown) {
+        // Best-effort: even if the persist fails, the in-memory removal
+        // happened. The next markDepositAttempted call will rewrite the
+        // file with the corrected set.
+        logger.warn('deposit_attempted_clear_persist_failed', {
+          swap_id: swapId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }
