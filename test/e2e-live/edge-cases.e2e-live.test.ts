@@ -423,7 +423,10 @@ describe('Edge cases', () => {
         ['--blocked-counterparties', bob.address],
         { tenant: alice.address, json: true },
       );
-      expect(setStrategy.exitCode).toBe(0);
+      expect(
+        setStrategy.exitCode,
+        `set-strategy failed: output=${JSON.stringify(setStrategy.output)} stderr=${setStrategy.stderr}`,
+      ).toBe(0);
 
       // 2. Post matching intents from both sides. Alice sells, bob buys, same
       //    rate band — under normal conditions this would complete a deal.
