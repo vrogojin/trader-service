@@ -357,7 +357,8 @@ export async function inspectContainer(id: string): Promise<boolean> {
  * throw and get swallowed.
  *
  * @param namePrefix - Prefix to match against container names.
- * @returns Array of container IDs (oldest first).
+ * @returns Array of container IDs (newest first per Docker's default
+ *   ordering — `docker ps` lists most-recently-started containers first).
  */
 export async function listContainersByNamePrefix(
   namePrefix: string,

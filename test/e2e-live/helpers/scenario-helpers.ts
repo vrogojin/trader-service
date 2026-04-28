@@ -239,11 +239,13 @@ export async function waitForDealInState(
     // out, or got stuck — without these, parallel-swap and unreachable-escrow
     // failures are nearly impossible to diagnose post-mortem.
     try {
-      const escrowNames = await listContainersByNamePrefix('escrow-e2e');
-      for (const name of escrowNames) {
+      const escrowContainerIds = await listContainersByNamePrefix('escrow-e2e');
+      for (const id of escrowContainerIds) {
         try {
-          const logs = await getContainerLogs(name, 1500);
-          console.error(`[waitForDealInState] last 1500 log lines from escrow ${name}:\n${logs}`);
+          const logs = await getContainerLogs(id, 1500);
+          console.error(
+            `[waitForDealInState] last 1500 log lines from escrow container ${id}:\n${logs}`,
+          );
         } catch {
           /* container may have just exited — skip */
         }
