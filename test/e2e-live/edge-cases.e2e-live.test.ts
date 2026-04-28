@@ -425,7 +425,7 @@ describe('Edge cases', () => {
       );
       expect(
         setStrategy.exitCode,
-        `set-strategy failed: output=${JSON.stringify(setStrategy.output)} stderr=${setStrategy.stderr}`,
+        `set-strategy failed: output=${JSON.stringify(setStrategy.output)?.slice(0, 500)} stderr=${(setStrategy.stderr || '<empty>').slice(0, 500)}`,
       ).toBe(0);
 
       // 2. Post matching intents from both sides. Alice sells, bob buys, same

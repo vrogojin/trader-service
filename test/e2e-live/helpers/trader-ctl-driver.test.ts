@@ -253,14 +253,49 @@ describe('runTraderCtl — output parsing', () => {
   });
 
   it('does NOT throw on invalid JSON when child exits non-zero, even if json=true', async () => {
-    // Caller decides whether to surface the error; we just hand back the bytes.
+    // Non-JSON stdout on the error path silently falls back to the raw string —
+    // the success path throws on non-JSON, the error path doesn't, so a
+    // diagnostic dump that happens to contain log lines won't poison the test.
     stageChildExit(1, 'not-json', 'Error: command rejected\n');
 
     const res = await runTraderCtl('create-intent', [], { tenant: '@a', json: true });
 
     expect(res.exitCode).toBe(1);
-    expect(res.output).toBe('not-json'); // unparsed
+    expect(res.output).toBe('not-json'); // raw fallback, not parsed
     expect(res.stderr).toBe('Error: command rejected\n');
+  });
+
+  it('parses stdout as JSON when child exits non-zero AND stdout is a JSON envelope', async () => {
+    // The CLI's emitResult writes the AcpErrorPayload envelope to stdout even
+    // when ok===false (and exits 1). Tests need access to error_code/message
+    // to assert the failure mode rather than a bare exit code.
+    const envelope = JSON.stringify({
+      ok: false,
+      error_code: 'INVALID_PARAM',
+      message: 'rate_min must be <= rate_max',
+      msg_id: 'cmd-123',
+    });
+    stageChildExit(1, envelope, '');
+
+    const res = await runTraderCtl('create-intent', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toEqual({
+      ok: false,
+      error_code: 'INVALID_PARAM',
+      message: 'rate_min must be <= rate_max',
+      msg_id: 'cmd-123',
+    });
+  });
+
+  it('preserves empty stdout as raw "" on non-zero exit (no JSON parse attempted)', async () => {
+    stageChildExit(1, '', 'commander: unknown option --foo\n');
+
+    const res = await runTraderCtl('status', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toBe('');
+    expect(res.stderr).toBe('commander: unknown option --foo\n');
   });
 });
 
