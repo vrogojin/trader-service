@@ -351,7 +351,12 @@ async function waitForReadyAddress(
   while (Date.now() < deadline) {
     let logs = '';
     try {
-      logs = await getContainerLogs(containerId, logsLines);
+      // `?? ''` defends against a mocked or future implementation that
+      // resolves with a non-string; the production getContainerLogs always
+      // returns a string but the unit-test mock can return undefined when
+      // not explicitly stubbed, which would otherwise crash split('\n')
+      // before the timeout-path's clearer error message kicks in.
+      logs = (await getContainerLogs(containerId, logsLines)) ?? '';
     } catch {
       // Container may have already exited; keep trying briefly so we hit
       // the timeout path with a clear message rather than crashing here.

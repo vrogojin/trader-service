@@ -560,10 +560,13 @@ describe('IntentEngine', () => {
       expect(onMatchFound).not.toHaveBeenCalled();
     });
 
-    it('proposes regardless of pubkey order (duplicate deal guard handles races)', async () => {
-      // Our pubkey is HIGHER — engine still calls onMatchFound because
-      // proposer selection was removed; the NegotiationHandler's duplicate
-      // deal guard prevents both sides from creating deals simultaneously.
+    it('yields proposal duty when our pubkey sorts AFTER counterparty (spec 5.7)', async () => {
+      // Our pubkey 'b...' sorts AFTER counterparty's 'a...' — counterparty is
+      // the proposer-elected side per spec 5.7. We must NOT propose; we wait
+      // for their np.propose_deal to arrive over NP-0. Without this election,
+      // both sides race their fan-outs simultaneously, both NP-0 duplicate-
+      // guards fire, and the pair gets wedged on each other's failed-
+      // counterparty lists with no way to recover.
       const { engine, market, onMatchFound } = createTestEngine({
         strategy: { scan_interval_ms: 1000, auto_match: true },
         agentPubkey: 'b'.repeat(64),
@@ -574,6 +577,29 @@ describe('IntentEngine', () => {
       const result = buildSearchResult({
         direction: 'sell',
         agentPublicKey: 'a'.repeat(64),
+      });
+      market.setSearchResults([result]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      expect(onMatchFound).not.toHaveBeenCalled();
+    });
+
+    it('proposes when our pubkey sorts BEFORE counterparty (spec 5.7)', async () => {
+      // Mirror of the above — we are the proposer-elected side, so the
+      // engine must call onMatchFound exactly once for this candidate.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: 'a'.repeat(64),
+      });
+
+      await engine.createIntent(defaultParams(), 'a'.repeat(64), AGENT_ADDRESS);
+
+      const result = buildSearchResult({
+        direction: 'sell',
+        agentPublicKey: 'b'.repeat(64),
       });
       market.setSearchResults([result]);
 

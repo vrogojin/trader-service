@@ -607,15 +607,23 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         },
         getTrustedEscrows: () => strategy.trusted_escrows,
         onDealCancelled: (deal) => {
-          // When a deal is cancelled (e.g. proposal timeout to a dead counterparty),
-          // mark the counterparty as failed so the engine skips it on the next scan,
-          // then restore the intent to ACTIVE to try a different match.
-          // Detect which side we are to use the correct intent ID (steelman #5).
+          // Restore the intent to ACTIVE so the next scan cycle can re-match.
+          //
+          // We deliberately DO NOT call markCounterpartyFailed() on a plain
+          // CANCELLED deal. Cancellation reasons include:
+          //   - proposal timeout (counterparty unreachable — could be transient)
+          //   - AGENT_BUSY rejection (proposer-election race, fully recoverable)
+          //   - sibling-cancellation when another deal won proposer-election
+          // None of these justify permanently blacklisting the counterparty —
+          // and doing so caused a real deadlock when both sides happened to
+          // race fan-outs (carol's outgoing proposal got AGENT_BUSY-rejected
+          // because dave's incoming arrived first; carol then permanently
+          // blacklisted dave; carol's intent could never re-match dave). The
+          // 30s NP-0 PROPOSED-state timeout + spec 5.7 proposer-election are
+          // sufficient to break the race within one scan cycle. Permanent
+          // blacklisting belongs to higher-level signals (e.g. repeated
+          // verification failures) that aren't surfaced through this callback.
           if (!intentEngine) return;
-          // pubkeysEqual (not ===) because terms.*_pubkey may be in wire format
-          // (x-only from Nostr) while agentPubkey is SDK-canonical (compressed).
-          // A naive === misclassifies us as "unknown role" and the intent is
-          // never restored to ACTIVE — silent failure.
           const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
           const weAreAcceptor = pubkeysEqual(deal.terms.acceptor_pubkey, agentPubkey);
           if (!weAreProposer && !weAreAcceptor) {
@@ -630,10 +638,6 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           const ourIntentId = weAreProposer
             ? deal.terms.proposer_intent_id
             : deal.terms.acceptor_intent_id;
-          const theirPubkey = weAreProposer
-            ? deal.terms.acceptor_pubkey
-            : deal.terms.proposer_pubkey;
-          intentEngine.markCounterpartyFailed(ourIntentId, theirPubkey);
           intentEngine.restoreToActive(ourIntentId);
         },
         agentPubkey,

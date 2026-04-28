@@ -357,8 +357,36 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
 
     if (matches.length === 0) return;
 
-    // Sort by priority (spec 5.5)
-    matches.sort((a, b) => {
+    // Spec 5.7 — deterministic proposer election. The lower-pubkey side
+    // proposes; the higher-pubkey side waits for the counterparty's
+    // np.propose_deal to arrive over the NP-0 channel. Without this, two
+    // simultaneous fan-outs (A finds B's intent at the same time B finds A's)
+    // produce two parallel proposals, both NP-0 duplicate-guards fire, and
+    // BOTH deals end up CANCELLED — wedging the pair on each other's
+    // failed-counterparty list and leaving the intents permanently unable to
+    // re-match. Filter our own match list to only candidates we should
+    // propose to: those whose pubkey sorts AFTER ours.
+    const myKey = canonicalPubkeyKey(agentPubkey);
+    const proposingMatches = matches.filter((m) => {
+      const cpKey = canonicalPubkeyKey(m.agentPublicKey);
+      // String compare is fine — both keys are hex of equal length, so
+      // lexicographic order equals byte-wise numeric order.
+      return myKey < cpKey;
+    });
+    if (proposingMatches.length === 0) {
+      // Nothing to propose to — every match is a higher-priority counterparty
+      // who will propose to us first. Stay ACTIVE and wait for their
+      // np.propose_deal.
+      logger.info('match_proposer_election_yield', {
+        intent_id: own.intent_id,
+        candidate_count: matches.length,
+        note: 'all candidates have lower-priority pubkey — waiting for their np.propose_deal',
+      });
+      return;
+    }
+
+    // Sort by priority (spec 5.5) — only the proposer-elected candidates.
+    proposingMatches.sort((a, b) => {
       const parsedA = parseDescription(a.description);
       const parsedB = parseDescription(b.description);
       if (!parsedA || !parsedB) return 0;
@@ -396,8 +424,9 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
 
     logger.info('matches_found', {
       intent_id: own.intent_id,
-      count: matches.length,
-      counterparties: matches.slice(0, 5).map((m) => m.agentPublicKey.slice(0, 12)),
+      count: proposingMatches.length,
+      total_candidates: matches.length,
+      counterparties: proposingMatches.slice(0, 5).map((m) => m.agentPublicKey.slice(0, 12)),
     });
 
     // Transition to MATCHING BEFORE fanning out proposals to prevent the next
@@ -414,7 +443,7 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     // Dead counterparties simply never respond and their proposals time out harmlessly.
     // Cap at max_concurrent_swaps to avoid flooding.
     const fanOutLimit = Math.max(1, strategy.max_concurrent_swaps * 3);
-    const candidates = matches.slice(0, fanOutLimit);
+    const candidates = proposingMatches.slice(0, fanOutLimit);
 
     // F6 — divide remaining volume across fan-out candidates so two
     // concurrent accepts cannot exceed volume_max. Distribute the remainder

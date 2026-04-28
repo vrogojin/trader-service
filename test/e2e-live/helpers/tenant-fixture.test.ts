@@ -85,6 +85,13 @@ function okCreateIntentReply(intentId: string): TraderCtlResult {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default: getContainerLogs returns a sphere_initialized line so
+  // waitForReadyAddress() resolves on its first poll. Tests that need to
+  // exercise the timeout path override this with mockGetContainerLogs.
+  // Trader format: { event: 'sphere_initialized', details: { agent_address } }
+  mockGetContainerLogs.mockResolvedValue(
+    '{"event":"sphere_initialized","details":{"agent_address":"DIRECT://aa11bb22cc33dd44ee55ff6677889900112233445566778899aabbccddeeff00"}}\n',
+  );
 });
 
 // ===========================================================================
@@ -183,11 +190,15 @@ describe('provisionTrader', () => {
     mockWaitForContainerRunning.mockResolvedValue(true);
     // Always returns failure → poll exhausts
     mockRunTraderCtl.mockResolvedValue({ exitCode: 1, output: null, stderr: 'not ready' });
+    // Logs without sphere_initialized → waitForReadyAddress hits its timeout
+    // BEFORE probeReady is even reached. The cleanup invariant must hold for
+    // EITHER readiness failure mode (provisionTrader catches both into the
+    // same safeCleanup path). Accept either error message.
     mockGetContainerLogs.mockResolvedValue('boot logs here');
 
     await expect(
       provisionTrader({ label: 'ready-fail', readyTimeoutMs: 100 }),
-    ).rejects.toThrow(/did not become reachable/);
+    ).rejects.toThrow(/did not become reachable|did not log sphere_initialized/);
 
     expect(mockStopContainer).toHaveBeenCalledWith(container.id);
     expect(mockRemoveContainer).toHaveBeenCalledWith(container.id);
