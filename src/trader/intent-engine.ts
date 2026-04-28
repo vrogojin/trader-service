@@ -175,6 +175,33 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   // Internal state helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Resolve an intent record from EITHER a local intent_id (the SHA-256 hash
+   * keyed in `intents`) OR a market_intent_id (UUID assigned by MarketModule
+   * when the intent is posted).
+   *
+   * Why both are accepted: DealTerms carry market IDs by necessity — peers
+   * exchange their MarketModule-visible intent IDs in np.propose_deal /
+   * np.accept_deal because they don't share each other's local hash IDs. So
+   * any callback that runs from a deal-context (onSwapCompleted, onSwapFailed,
+   * onDealCancelled) only has market IDs to work with, but the engine's
+   * lookup table is local-id-keyed. Without this fallback, every fill record
+   * and every state restore on a deal completion silently no-ops, leaving
+   * the intent at volume_filled=0 and stuck in MATCHING.
+   *
+   * Local-id lookup is O(1) via the Map; market-id lookup falls back to a
+   * linear scan, which is fine because `intents` is bounded by
+   * `strategy.max_active_intents` (default 20).
+   */
+  function resolveIntentByEitherId(id: string): IntentRecord | undefined {
+    const direct = intents.get(id);
+    if (direct) return direct;
+    for (const record of intents.values()) {
+      if (record.intent.market_intent_id === id) return record;
+    }
+    return undefined;
+  }
+
   function transitionIntent(
     record: IntentRecord,
     target: IntentState,
@@ -879,12 +906,12 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     },
 
     restoreToActive(intentId: string): void {
-      const record = intents.get(intentId);
+      const record = resolveIntentByEitherId(intentId);
       if (!record) return;
       if (record.state === 'MATCHING' || record.state === 'NEGOTIATING') {
         try {
           transitionIntent(record, 'ACTIVE');
-          logger.info('intent_restored_to_active', { intent_id: intentId });
+          logger.info('intent_restored_to_active', { intent_id: record.intent.intent_id });
         } catch {
           // Transition failed — intent may have been cancelled/expired
         }
@@ -892,11 +919,17 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     },
 
     markCounterpartyFailed(intentId: string, counterpartyPubkey: string): void {
+      // Resolve to the LOCAL intent_id so the failed-counterparty Set is
+      // keyed consistently regardless of whether the caller passed a local
+      // or a market intent_id (DealTerms carry market IDs).
+      const record = resolveIntentByEitherId(intentId);
+      const localId = record?.intent.intent_id ?? intentId;
+
       const MAX_FAILED_PER_INTENT = 1000;
-      let set = failedCounterparties.get(intentId);
+      let set = failedCounterparties.get(localId);
       if (!set) {
         set = new Set();
-        failedCounterparties.set(intentId, set);
+        failedCounterparties.set(localId, set);
       }
       // Use canonical form so a peer can't re-engage by presenting a different
       // pubkey encoding of the same identity.
@@ -914,11 +947,11 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
         if (oldest !== undefined) set.delete(oldest);
       }
       set.add(key);
-      logger.info('counterparty_marked_failed', { intent_id: intentId, counterparty: counterpartyPubkey });
+      logger.info('counterparty_marked_failed', { intent_id: localId, counterparty: counterpartyPubkey });
     },
 
     recordFill(intentId: string, filledVolume: bigint): void {
-      const record = intents.get(intentId);
+      const record = resolveIntentByEitherId(intentId);
       if (!record) return;
       const newFilled = record.intent.volume_filled + filledVolume;
       const remaining = record.intent.volume_max - newFilled;

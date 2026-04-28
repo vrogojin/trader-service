@@ -368,6 +368,18 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         );
       };
 
+      // The DealRecord is symmetric across both peers — `proposer_intent_id`
+      // and `acceptor_intent_id` reference each side's own intent. When a
+      // callback runs locally we MUST update OUR intent, not always the
+      // proposer's, otherwise the acceptor's volume_filled never moves. The
+      // bug shows up most visibly in partial-fill scenarios where one side's
+      // intent should reflect a partial volume credit while the other side's
+      // intent fully fills.
+      const ourIntentId = (deal: DealRecord): string => {
+        const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
+        return weAreProposer ? deal.terms.proposer_intent_id : deal.terms.acceptor_intent_id;
+      };
+
       const onDealAccepted: OnDealAccepted = async (deal: DealRecord) => {
         if (!swapExecutor || !ledger || !stateStore) return;
 
@@ -417,7 +429,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             negotiationHandler.failDeal(deal.terms.deal_id);
           }
           if (intentEngine) {
-            intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+            intentEngine.restoreToActive(ourIntentId(deal));
           }
           return;
         }
@@ -457,7 +469,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             negotiationHandler.failDeal(deal.terms.deal_id);
           }
           if (intentEngine) {
-            intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+            intentEngine.restoreToActive(ourIntentId(deal));
           }
         }
       };
@@ -492,7 +504,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           );
           // Restore the intent so we can retry. Don't record the fill.
           if (intentEngine) {
-            intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+            intentEngine.restoreToActive(ourIntentId(deal));
           }
           if (negotiationHandler) {
             negotiationHandler.failDeal(deal.terms.deal_id);
@@ -504,7 +516,12 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         await stateStore.saveReservations(ledger.serialize());
 
         if (intentEngine) {
-          intentEngine.recordFill(deal.terms.proposer_intent_id, deal.terms.volume);
+          // ourIntentId selects proposer_intent_id when WE are proposer, else
+          // acceptor_intent_id. The deal record is shared across both peers,
+          // so always passing proposer_intent_id silently dropped the fill on
+          // the acceptor side — its volume_filled stayed 0 even after the
+          // swap completed with payoutVerified:true.
+          intentEngine.recordFill(ourIntentId(deal), deal.terms.volume);
         }
         // Transition the NP-0 deal to COMPLETED so LIST_SWAPS reflects it
         if (negotiationHandler) {
@@ -523,7 +540,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
 
         // Restore the intent to ACTIVE so it can be matched again
         if (intentEngine) {
-          intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+          intentEngine.restoreToActive(ourIntentId(deal));
         }
         // Transition the NP-0 deal to FAILED so LIST_SWAPS reflects it
         if (negotiationHandler) {
