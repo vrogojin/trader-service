@@ -511,6 +511,64 @@ export async function startTrader(): Promise<void> {
   // SDK test calls pingEscrow once before any swaps — we do it here because
   // trusted_escrows are set via ACP command after startup).
   const pingedEscrows = new Set<string>();
+
+  // depositInFlight: per-swapId guard against duplicate deposit() calls.
+  // Used by BOTH the swap:announced event handler AND the swap-poll loop's
+  // fallback path (some SDK paths fire swap:announced only on the proposer
+  // side, not the acceptor — observed live 2026-04-29 basic-roundtrip).
+  // Hoisted to outer scope so both paths share the same dedup state.
+  const depositInFlight = new Set<string>();
+  // Track the deposit fallback issuer separately from the event-driven
+  // path so the structured-log event identifies which path triggered.
+  async function tryDepositForSwap(swapId: string, trigger: 'event' | 'poll'): Promise<void> {
+    if (!sphere.swap) {
+      logger.warn('swap_deposit_no_swap_module', { swap_id: swapId, trigger });
+      return;
+    }
+    const swapMod = sphere.swap;
+    if (depositInFlight.has(swapId)) {
+      logger.debug('swap_deposit_already_in_flight', { swap_id: swapId, trigger });
+      return;
+    }
+    depositInFlight.add(swapId);
+    try {
+      const isFresh = await agent.markDepositAttempted(swapId);
+      if (!isFresh) {
+        logger.info('swap_deposit_skipped_already_attempted', {
+          swap_id: swapId,
+          trigger,
+          note: 'persistent record indicates this swap was deposited on a previous lifetime',
+        });
+        return;
+      }
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && !stopped) {
+        try {
+          await swapMod.deposit(swapId);
+          logger.info('swap_deposit_sent', { swap_id: swapId, trigger });
+          await sphere.payments.waitForPendingOperations();
+          return;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('not yet available') || msg.includes('SWAP_WRONG_STATE')) {
+            await waitCancellable(3000);
+            if (stopped) return;
+            continue;
+          }
+          logger.error('swap_deposit_failed', { swap_id: swapId, trigger, error: msg });
+          return;
+        }
+      }
+    } catch (err: unknown) {
+      logger.error('swap_announced_handler_failed', {
+        swap_id: swapId,
+        trigger,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      depositInFlight.delete(swapId);
+    }
+  }
   function scheduleSwapPoll(): void {
     if (stopped) return;
     // Remove the previous timer from tracked set (it already fired or is
@@ -558,9 +616,20 @@ export async function startTrader(): Promise<void> {
               if (stopped) return;
               const status = await sphere.swap.getSwapStatus(s.swapId);
               if (status.progress === 'announced') {
-                // DIAGNOSTIC ONLY: log where the deposit would go. The
-                // actual deposit is issued from the swap:announced event
-                // handler, gated by depositInFlight.
+                // ROUND-5C FIX (basic-roundtrip flake fix 2026-04-29):
+                // also dispatch deposit from the poll path. The SDK's
+                // swap:announced event was observed firing only on the
+                // proposer side; the acceptor's poll detected
+                // progress=='announced' but never deposited. Now both
+                // paths call tryDepositForSwap which dedups via
+                // depositInFlight + markDepositAttempted (persistent).
+                // Fire-and-forget — the gate prevents redundant work.
+                void tryDepositForSwap(s.swapId, 'poll').catch((err: unknown) => {
+                  logger.warn('swap_deposit_poll_dispatch_failed', {
+                    swap_id: s.swapId,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                });
                 try {
                   const diagInvoice = status.depositInvoiceId && sphere.accounting
                     ? sphere.accounting.getInvoice(status.depositInvoiceId)
@@ -1099,13 +1168,11 @@ export async function startTrader(): Promise<void> {
         network: NETWORK,
       });
     }
-    // W1 (steelman round-4): per-swapId deposit-in-flight gate. Even though
-    // the poll loop no longer issues deposit(), the swap:announced event
-    // can fire multiple times (relay redelivery, reconnect, persisted-event
-    // replay on restart). Without this gate, two concurrent retry loops
-    // can race against the SDK's SWAP_WRONG_STATE guard and emit duplicate
-    // swap_deposit_sent log lines + double-call waitForPendingOperations.
-    const depositInFlight = new Set<string>();
+    // ROUND-5C: deposit dispatch unified between event + poll paths via
+    // tryDepositForSwap (defined earlier in this scope). The swap:announced
+    // event fires reliably for the proposer side; the acceptor relies on
+    // the poll loop's same dispatch (depositInFlight + markDepositAttempted
+    // gate dedups across both paths).
     sphereUnsubscribers.push(sphere.on('swap:announced' as SphereEventType, ((data: { swapId: string }) => {
       logger.info('swap_announced', { swap_id: data.swapId });
       if (FAULT_SKIP_DEPOSITS) {
@@ -1115,58 +1182,9 @@ export async function startTrader(): Promise<void> {
         });
         return;
       }
-      // Dedup against duplicate event delivery.
-      if (depositInFlight.has(data.swapId)) {
-        logger.debug('swap_deposit_already_in_flight', { swap_id: data.swapId });
-        return;
-      }
-      depositInFlight.add(data.swapId);
-      void (async () => {
-        try {
-          // SPEC 7.9.3 (C4): mark attempt PERSISTED before issuing deposit.
-          // If the persistence-then-mark returns false, this swapId was
-          // already deposited in a previous trader lifetime — skip the
-          // SDK call entirely. The SDK's SWAP_WRONG_STATE guard would
-          // catch the duplicate at runtime anyway, but the spec mandates
-          // a trader-side defense-in-depth so a future SDK refactor that
-          // weakens the guard doesn't open a double-deposit window.
-          const isFresh = await agent.markDepositAttempted(data.swapId);
-          if (!isFresh) {
-            logger.info('swap_deposit_skipped_already_attempted', {
-              swap_id: data.swapId,
-              note: 'persistent record indicates this swap was deposited on a previous lifetime',
-            });
-            return;
-          }
-          const deadline = Date.now() + 60_000;
-          while (Date.now() < deadline && !stopped) {
-            try {
-              await swapModule.deposit(data.swapId);
-              logger.info('swap_deposit_sent', { swap_id: data.swapId });
-              await sphere.payments.waitForPendingOperations();
-              return;
-            } catch (err: unknown) {
-              const msg = err instanceof Error ? err.message : String(err);
-              if (msg.includes('not yet available') || msg.includes('SWAP_WRONG_STATE')) {
-                // Cancelable sleep — bail immediately on shutdown rather than
-                // leaking a 3s setTimeout past teardown.
-                await waitCancellable(3000);
-                if (stopped) return;
-                continue;
-              }
-              logger.error('swap_deposit_failed', { swap_id: data.swapId, error: msg });
-              return;
-            }
-          }
-        } catch (err: unknown) {
-          logger.error('swap_announced_handler_failed', {
-            swap_id: data.swapId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        } finally {
-          depositInFlight.delete(data.swapId);
-        }
-      })();
+      void tryDepositForSwap(data.swapId, 'event').catch(() => {
+        /* tryDepositForSwap logs internally */
+      });
     }) as Parameters<typeof sphere.on>[1]));
 
     // Log payout received — SDK auto-verifies internally
