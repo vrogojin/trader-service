@@ -797,6 +797,37 @@ export async function startTrader(): Promise<void> {
         sender: dm.senderPubkey.slice(0, 16),
         length: dm.content.length,
       });
+      return;
+    }
+    // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+    // the escrow's deposit-invoice delivery DM is JSON without a string
+    // prefix — `{"type":"invoice_delivery", "invoice_token": {...}, ...}`.
+    // Log it explicitly so we can confirm receipt on the trader side
+    // when the buyer's invoice_target_addresses stays null in
+    // swap_deposit_target_diag. Distinguishes "DM lost in transport"
+    // from "DM received but not imported into accounting".
+    if (dm.content.startsWith('{') && dm.content.includes('invoice_delivery')) {
+      let messageType = 'unknown';
+      let swapId: string | undefined;
+      let invoiceType: string | undefined;
+      let invoiceId: string | undefined;
+      try {
+        const parsed = JSON.parse(dm.content) as Record<string, unknown>;
+        messageType = String(parsed['type'] ?? 'unknown');
+        if (parsed['swap_id'] !== undefined) swapId = String(parsed['swap_id']);
+        if (parsed['invoice_type'] !== undefined) invoiceType = String(parsed['invoice_type']);
+        if (parsed['invoice_id'] !== undefined) invoiceId = String(parsed['invoice_id']);
+      } catch {
+        /* best-effort */
+      }
+      logger.info('diag_invoice_delivery_dm_received', {
+        message_type: messageType,
+        swap_id: swapId !== undefined ? swapId.slice(0, 16) : undefined,
+        invoice_type: invoiceType,
+        invoice_id: invoiceId !== undefined ? invoiceId.slice(0, 16) : undefined,
+        sender: dm.senderPubkey.slice(0, 16),
+        length: dm.content.length,
+      });
     }
   });
   // Publish the unsubscribe so bootstrap shutdown runs it before sphere.destroy(),
