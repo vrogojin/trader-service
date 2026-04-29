@@ -80,6 +80,24 @@ export interface InternalProvisionOptions extends ProvisionTraderOptions {
    * transition to FAILED. Production deployments must NEVER set this.
    */
   faultSkipDeposits?: boolean;
+  /**
+   * Self-mint funding (replaces faucet HTTP). Each entry instructs the
+   * trader to mint `amount` smallest-units of the canonical CoinId
+   * `coinIdHex` at startup, before agent.start(). The trader uses
+   * sphere.payments.mintFungibleToken (genesis mint with the wallet's
+   * own SigningService as issuer). UCT/USDU coinIds from the public
+   * testnet registry (https://raw.githubusercontent.com/unicitynetwork/
+   * unicity-ids/refs/heads/main/unicity-ids.testnet.json):
+   *
+   *   UCT  → 455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89
+   *   USDU → 8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290f9823a54f52d7
+   *
+   * The mint runs at trader startup (before agent.start), so balances
+   * are visible to the intent engine on the first scan cycle.
+   * Sets TRADER_FAULT_INJECTION_ALLOWED=1 implicitly so the trader's
+   * production guard accepts TRADER_TEST_FUND.
+   */
+  selfMintFund?: Array<{ coinIdHex: string; amount: bigint }>;
 }
 
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
@@ -310,6 +328,19 @@ function buildContainerEnv(
     LOG_LEVEL: 'info',
     // Fault-injection: deposit-skip. Only set when the test caller asks.
     ...(opts.faultSkipDeposits === true ? { TRADER_FAULT_SKIP_DEPOSITS: '1' } : {}),
+    // Self-mint TEST funding (replaces faucet HTTP). When opts.selfMint is
+    // set, the trader self-mints the listed amounts at startup via
+    // sphere.payments.mintFungibleToken. Both the network gate AND
+    // TRADER_FAULT_INJECTION_ALLOWED=1 are required by the trader's
+    // production guard to actually run the mint.
+    ...(opts.selfMintFund !== undefined && opts.selfMintFund.length > 0
+      ? {
+          TRADER_TEST_FUND: opts.selfMintFund
+            .map(({ coinIdHex, amount }) => `${coinIdHex}:${amount.toString()}`)
+            .join(','),
+          TRADER_FAULT_INJECTION_ALLOWED: '1',
+        }
+      : {}),
   };
 }
 
@@ -476,10 +507,45 @@ export async function provisionTrader(
       }
     }
 
-    // 7. Optional: post-boot faucet funding. The wallet address (nametag) is now
-    //    known so we can fund the real identity. Runs after readiness to ensure
-    //    the trader's sync loop is already running and will pick up tokens.
-    if (internal.fundFromFaucet === true) {
+    // 7. Optional funding. Two paths:
+    //    - selfMintFund: trader self-mints at startup (no faucet HTTP).
+    //      Already happened during sphere init (TRADER_TEST_FUND env var
+    //      consumed by src/trader/main.ts before agent.start()). We just
+    //      poll until balances are visible to confirm.
+    //    - fundFromFaucet: legacy faucet HTTP path. Calls testnet faucet
+    //      AFTER readiness; tokens arrive via Nostr DMs.
+    if ((internal.selfMintFund?.length ?? 0) > 0) {
+      const expectedCoinCount = internal.selfMintFund!.length;
+      await pollUntil(
+        async () => {
+          try {
+            const result = await runTraderCtl('portfolio', [], {
+              tenant: tenantAddress,
+              timeoutMs: 10_000,
+              json: true,
+              dataDir: controller.dataDir,
+              tokensDir: controller.tokensDir,
+            });
+            if (result.exitCode !== 0) return false;
+            const out = result.output as Record<string, unknown>;
+            const balances = (
+              out['balances'] ?? (out['result'] as Record<string, unknown> | undefined)?.['balances']
+            ) as unknown;
+            if (!Array.isArray(balances)) return false;
+            const nonZeroCount = balances.filter(
+              (b: unknown) =>
+                typeof b === 'object' &&
+                b !== null &&
+                BigInt(String((b as Record<string, unknown>)['confirmed'] ?? '0')) > 0n,
+            ).length;
+            return nonZeroCount >= expectedCoinCount;
+          } catch {
+            return false;
+          }
+        },
+        { timeoutMs: 180_000, intervalMs: 5_000, description: `${opts.label} all ${expectedCoinCount} coins self-minted` },
+      );
+    } else if (internal.fundFromFaucet === true) {
       // Faucet expects coin names, not symbols: 'unicity' → UCT, 'unicity-usd' → USDU
       const coins = internal.fundCoins ?? [
         { coinId: 'unicity', amount: 5000n },

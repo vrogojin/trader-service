@@ -30,6 +30,18 @@ export const IPFS_GATEWAY = 'https://unicity-ipfs1.dyndns.org';
  */
 export const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 
+/**
+ * Canonical CoinId bytes from the public testnet registry
+ * (https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet.json).
+ *
+ * Used by selfMintFund to mint tokens the trader recognizes as
+ * UCT/USDU via TokenRegistry resolution. There is no cryptographic
+ * restriction on which key issues these CoinId bytes — anyone can
+ * mint a token with these exact bytes via state-transition-sdk.
+ */
+export const UCT_COIN_ID = '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
+export const USDU_COIN_ID = '8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290f9823a54f52d7';
+
 /** Default trader image (matches templates.json shortcut). */
 export const TRADER_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/trader:v0.2';
 

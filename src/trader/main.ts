@@ -1296,6 +1296,70 @@ export async function startTrader(): Promise<void> {
     }) as Parameters<typeof sphere.on>[1]));
   }
 
+  // ---- TRADER_TEST_FUND: self-mint test coins (replaces faucet HTTP) ----
+  //
+  // Format: comma-separated `<coinIdHex>:<amount>` tuples.
+  //   TRADER_TEST_FUND="455ad8720656...:100000000000000000000,8f0f3d7a...:1000000000"
+  // (UCT and USDU coinIds from the public testnet registry.)
+  //
+  // Production-guarded with the same gate as TRADER_FAULT_SKIP_DEPOSITS:
+  // requires UNICITY_NETWORK ∈ {testnet, dev}. Without the network gate
+  // a misconfigured prod deployment could mint arbitrary balances. The
+  // gate also requires TRADER_FAULT_INJECTION_ALLOWED=1 to make the
+  // intent unambiguous. Mint runs BEFORE agent.start() so balances are
+  // visible to the intent engine on the first scan cycle.
+  const TEST_FUND_RAW = process.env['TRADER_TEST_FUND'];
+  if (TEST_FUND_RAW !== undefined && TEST_FUND_RAW !== '') {
+    const TEST_FUND_NETWORK = process.env['UNICITY_NETWORK'] ?? 'testnet';
+    const TEST_FUND_ALLOWED = process.env['TRADER_FAULT_INJECTION_ALLOWED'] === '1';
+    const TEST_FUND_NETWORKS = new Set(['testnet', 'dev']);
+    if (!TEST_FUND_NETWORKS.has(TEST_FUND_NETWORK) || !TEST_FUND_ALLOWED) {
+      const reason = !TEST_FUND_NETWORKS.has(TEST_FUND_NETWORK)
+        ? `network=${TEST_FUND_NETWORK} (allowed: testnet, dev)`
+        : 'TRADER_FAULT_INJECTION_ALLOWED=1 not set';
+      logger.error('test_fund_production_guard_violation', {
+        note: 'TRADER_TEST_FUND rejected at startup',
+        reason,
+        network: TEST_FUND_NETWORK,
+      });
+      throw new Error(
+        `TRADER_TEST_FUND not permitted in this environment: ${reason}. ` +
+          `To enable for testing: set UNICITY_NETWORK=testnet (or dev) AND TRADER_FAULT_INJECTION_ALLOWED=1.`,
+      );
+    }
+    const entries = TEST_FUND_RAW.split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    for (const entry of entries) {
+      const [coinIdHex, amountStr] = entry.split(':');
+      if (!coinIdHex || !amountStr) {
+        logger.warn('test_fund_invalid_entry', { entry });
+        continue;
+      }
+      let amount: bigint;
+      try {
+        amount = BigInt(amountStr);
+      } catch {
+        logger.warn('test_fund_invalid_amount', { entry });
+        continue;
+      }
+      const result = await sphere.payments.mintFungibleToken(coinIdHex, amount);
+      if (!result.success) {
+        logger.error('test_fund_mint_failed', {
+          coin_id: coinIdHex.slice(0, 16) + '...',
+          amount: amountStr,
+          error: result.error,
+        });
+        throw new Error(`TRADER_TEST_FUND mint failed for ${coinIdHex}: ${result.error}`);
+      }
+      logger.info('test_fund_mint_succeeded', {
+        coin_id: coinIdHex.slice(0, 16) + '...',
+        amount: amountStr,
+        token_id: result.tokenId.slice(0, 16) + '...',
+      });
+    }
+  }
+
   await agent.start();
 
   logger.info('trader_agent_running', {

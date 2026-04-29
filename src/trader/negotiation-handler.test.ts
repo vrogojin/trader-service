@@ -410,10 +410,14 @@ describe('NegotiationHandler', () => {
           proposer_pubkey: sybilPubkey,
           proposer_intent_id: `sybil-intent-${i}`,
         });
-        const sybilMsg = buildProposeDealMessage(sybilTerms);
-        // Override sender_pubkey so the proposer-validation passes per-msg.
-        sybilMsg.sender_pubkey = sybilPubkey;
-        sybilMsg.signature = baseSig;
+        // Build the message with sybilPubkey as sender directly (NpMessage
+        // properties are readonly so we can't reassign post-construction).
+        const sybilMsgBase = buildProposeDealMessage(sybilTerms);
+        const sybilMsg = {
+          ...sybilMsgBase,
+          sender_pubkey: sybilPubkey,
+          signature: baseSig,
+        };
         await handler.handleIncomingDm(
           sybilPubkey,
           `direct-${i}`,

@@ -30,7 +30,7 @@ import {
 import { runTraderCtl } from './helpers/trader-ctl-driver.js';
 import { getControllerWallet } from './helpers/tenant-fixture.js';
 import { getContainerLogs } from './helpers/docker-helpers.js';
-import { TESTNET } from './helpers/constants.js';
+import { TESTNET, UCT_COIN_ID, USDU_COIN_ID } from './helpers/constants.js';
 
 // ---------------------------------------------------------------------------
 // Shared fixtures: provisioned ONCE per file to amortize faucet rate-limits
@@ -56,13 +56,23 @@ beforeAll(async () => {
   // (one of two concurrent provisions sometimes fails to log
   // sphere_initialized within 90s while the other completes in ~5s).
   // Sequential adds ~10–15s; well within the 600s beforeAll budget.
+  // Self-mint funding instead of faucet HTTP. The faucet has been a
+  // recurring source of test flakiness (sustained 30s+ HTTP timeouts on
+  // /api/v1/faucet/request while the host TCP layer is healthy). Genesis
+  // mints via state-transition-sdk hit the L3 aggregator directly, the
+  // same dependency the swap-execution path already requires.
+  // 5000 of each is the same amount the faucet path provided.
+  const SELF_MINT = [
+    { coinIdHex: UCT_COIN_ID, amount: 5000n },
+    { coinIdHex: USDU_COIN_ID, amount: 5000n },
+  ];
   buyer = await provisionTrader({
     label: 'basic-buyer',
     trustedEscrows: [escrow.address],
     relayUrls: [...TESTNET.RELAYS],
     waitForReady: true,
     readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
+    selfMintFund: SELF_MINT,
   } satisfies InternalProvisionOptions);
   seller = await provisionTrader({
     label: 'basic-seller',
@@ -70,7 +80,7 @@ beforeAll(async () => {
     relayUrls: [...TESTNET.RELAYS],
     waitForReady: true,
     readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
+    selfMintFund: SELF_MINT,
   } satisfies InternalProvisionOptions);
 }, 600_000);
 
