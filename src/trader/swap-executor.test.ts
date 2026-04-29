@@ -407,9 +407,18 @@ describe('SwapExecutor', () => {
       expect(result).toBe(false);
     });
 
-    it('N2 — rejects when escrowDirectAddress matches but escrowPubkey is wrong', async () => {
-      // Counterparty spoofs ONE field. Round-5 requires BOTH to match
-      // when both supplied (was OR before — ship-blocker fix N2).
+    it('Round-5b — accepts when escrowDirectAddress matches regardless of escrowPubkey', async () => {
+      // Round-5b: the two SDK-reported fields (escrowDirectAddress AND
+      // escrowPubkey) come from the same getSwapStatus() call, NOT
+      // independent sources. They can't diverge under attacker
+      // manipulation. Once directMatches binds against the negotiated
+      // escrow, we've already detected any pivot. An earlier pass
+      // (round-5) wrongly required `DIRECT://${pubkey}` as a secondary
+      // clause via string concatenation — that's not how DIRECT
+      // addresses are derived (they're hashes via
+      // UnmaskedPredicateReference, not the raw pubkey). The earlier
+      // version false-rejected every legitimate proposal observed in
+      // basic-roundtrip 2026-04-29.
       await trackAcceptorDealWithEscrow(ESCROW_DIRECT);
       const result = executor.registerSwapId('swap-4', {
         partyACurrency: 'ALPHA',
@@ -418,9 +427,9 @@ describe('SwapExecutor', () => {
         partyBAmount: '500',
         counterpartyPubkey: PROPOSER_PUBKEY,
         escrowDirectAddress: ESCROW_DIRECT,
-        escrowPubkey: 'f'.repeat(64), // SPOOF
+        escrowPubkey: 'f'.repeat(64), // raw bytes diff from DIRECT — fine
       });
-      expect(result).toBe(false);
+      expect(result).toBe(true);
     });
 
     it('H1 — rejects on deposit_timeout_sec mismatch', async () => {

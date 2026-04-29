@@ -623,20 +623,39 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
           const isWildcard = negotiatedEscrow === 'any';
           const isNametag = negotiatedEscrow.startsWith('@');
           if (!isWildcard && !isNametag) {
-            // Concrete DIRECT://hex form — strict binding.
+            // Concrete DIRECT://hex binding — must match the SDK's
+            // authoritative escrowDirectAddress for this swap.
+            //
+            // Round-5b correction (post-live observation): an earlier
+            // pass also required `negotiatedEscrow === escrowPubkey` or
+            // `negotiatedEscrow === DIRECT://${escrowPubkey}` as a
+            // secondary clause. Both were wrong:
+            //
+            //   1. The two SDK-reported fields (escrowDirectAddress and
+            //      escrowPubkey) come from the SAME getSwapStatus() call,
+            //      not independent sources. They cannot diverge under
+            //      attacker manipulation — a hostile pivot updates both
+            //      together. Once directMatches binds against the
+            //      negotiated escrow, we've already detected any pivot;
+            //      the pubkey clause adds nothing.
+            //
+            //   2. `DIRECT://${pubkey}` is naive string-concat. Real
+            //      DIRECT addresses are derived via
+            //      UnmaskedPredicateReference(pubkey).toAddress() — a
+            //      structural hash, not the raw pubkey. The clause
+            //      false-rejected every legitimate proposal seen in
+            //      basic-roundtrip 2026-04-29.
+            //
+            // If we ever need to verify the pubkey-derives-the-DIRECT
+            // invariant, do it via the SDK's UnmaskedPredicateReference
+            // helper, not string concatenation.
             const directMatches = negotiatedEscrow === match.escrowDirectAddress;
-            const pubkeyMatches =
-              match.escrowPubkey === undefined ||
-              negotiatedEscrow === match.escrowPubkey ||
-              negotiatedEscrow === `DIRECT://${match.escrowPubkey}`;
-            if (!directMatches || !pubkeyMatches) {
+            if (!directMatches) {
               logger.warn('swap_id_register_escrow_mismatch', {
                 swap_id: swapId,
                 negotiated_escrow: negotiatedEscrow,
                 proposal_escrow: match.escrowDirectAddress,
                 proposal_escrow_pubkey: match.escrowPubkey,
-                direct_match: directMatches,
-                pubkey_match: pubkeyMatches,
               });
               return false;
             }
