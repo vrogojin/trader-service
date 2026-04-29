@@ -408,6 +408,37 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
   // Per-counterparty rate limiting: pubkey → timestamps[]
   const rateLimits = new Map<string, number[]>();
 
+  // GLOBAL inbound propose_deal rate-limit (sybil-flood defense).
+  //
+  // The per-counterparty `rateLimits` Map prevents one peer from spamming us,
+  // but does NOT bound a flood of N distinct sybil identities each sending
+  // 1 propose_deal/minute (under the per-peer cap). At N=600+ pubkeys this
+  // saturates ECDSA verification CPU and bloats the DealRecord map.
+  //
+  // Defense: ring-buffer of recent inbound propose_deal arrival timestamps;
+  // before per-peer check, drop the message silently if we've already
+  // accepted MAX_INBOUND_PROPOSALS_PER_MIN in the trailing 60s window.
+  // 600/min = 10/sec — comfortably above any legitimate use (a busy trader
+  // with 10 active intents × 50 candidates × scan-interval-30s would see
+  // ~17/sec inbound; this cap is 60% above that worst-case legitimate
+  // scenario, with headroom for bursts).
+  const globalProposalTimestamps: number[] = [];
+  const MAX_INBOUND_PROPOSALS_PER_MIN = 600;
+  const GLOBAL_PROPOSAL_WINDOW_MS = 60_000;
+  let globalDropCount = 0;
+  function isGloballyRateLimited(): boolean {
+    const now = Date.now();
+    // Trim entries older than the window. Insertion order is ascending
+    // by arrival, so we can pop from the front.
+    while (globalProposalTimestamps.length > 0 && globalProposalTimestamps[0]! < now - GLOBAL_PROPOSAL_WINDOW_MS) {
+      globalProposalTimestamps.shift();
+    }
+    return globalProposalTimestamps.length >= MAX_INBOUND_PROPOSALS_PER_MIN;
+  }
+  function recordGlobalProposal(): void {
+    globalProposalTimestamps.push(Date.now());
+  }
+
   // Round-13 F6: cap the number of reject DMs we send per deal_id. Without a
   // cap, a malicious counterparty can retry np.propose/accept/reject against
   // a CANCELLED deal many times and we'd send one reject DM per request — a
@@ -888,6 +919,28 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       return;
     }
 
+    // GLOBAL sybil-flood gate (2026-04-29 fix): drop silently when the
+    // 60s rolling window has already accepted MAX_INBOUND_PROPOSALS_PER_MIN
+    // inbound proposals. Goes BEFORE the per-peer rate-limit so sybil
+    // pubkeys aren't recorded into the per-peer Map (which would consume
+    // memory under attack). Log every Nth drop to bound log volume.
+    if (isGloballyRateLimited()) {
+      globalDropCount++;
+      // Log every 50th drop, plus the first one in any sustained burst,
+      // to give operators a signal without flooding logs themselves.
+      if (globalDropCount === 1 || globalDropCount % 50 === 0) {
+        logger.warn('np_propose_deal_global_rate_limited', {
+          drop_count: globalDropCount,
+          window_ms: GLOBAL_PROPOSAL_WINDOW_MS,
+          cap: MAX_INBOUND_PROPOSALS_PER_MIN,
+          deal_id: msg.deal_id,
+          sender: msg.sender_pubkey,
+          note: 'global cap reached — sybil-flood defense triggered',
+        });
+      }
+      return;
+    }
+
     // F5: Rate-limit check FIRST, before any outbound response path (including
     // the UNKNOWN_INTENT reject DM below). Previously, a rate-limited attacker
     // could still trigger 1 inbound → 1 outbound amplification by supplying a
@@ -904,6 +957,15 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       return;
     }
     recordProposal(msg.sender_pubkey);
+    recordGlobalProposal();
+    // Reset the global drop counter on a successful accept — separates
+    // bursts from sustained attacks in the operator-visible log.
+    if (globalDropCount > 0) {
+      logger.info('np_propose_deal_global_rate_recovered', {
+        total_dropped: globalDropCount,
+      });
+      globalDropCount = 0;
+    }
 
     // Verify deal_id matches canonical JSON of terms
     const computedId = computeDealId(terms);

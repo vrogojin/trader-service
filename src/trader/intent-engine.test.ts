@@ -679,6 +679,105 @@ describe('IntentEngine', () => {
   });
 
   // =========================================================================
+  // Yield-timeout state machine (basic-roundtrip flake fix, 2026-04-29)
+  //
+  // Spec 5.7: lower-pubkey peer is the proposer; the higher-pubkey peer
+  // YIELDS, waiting for the lower's np.propose_deal to arrive. A 45s
+  // YIELD_TIMEOUT_MS bound prevents indefinite waiting against a dead
+  // lower-pubkey peer (e.g., stale aggregator listing).
+  //
+  // Round-4 / round-5 fix: after the timeout fires AND we fall through
+  // to propose anyway, the failed-yield candidate must be blacklisted
+  // AND `firstYieldAt` must be reset for the intent so that next-scan
+  // does NOT immediately re-fire the fall-through. Without the reset,
+  // every subsequent scan finds elapsed > timeout and re-fires the
+  // fall-through, creating a proposing storm (~80 proposals in 11.5
+  // min observed in basic-roundtrip 2026-04-28).
+  // =========================================================================
+
+  describe('Yield-timeout state machine', () => {
+    const YIELD_TIMEOUT_MS = 45_000;
+
+    it('yields when ALL candidates have lower-priority pubkey (we have higher)', async () => {
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        // Our pubkey is HIGHER (z > a) — we are the YIELDING side.
+        agentPubkey: 'z'.repeat(64),
+      });
+      await engine.createIntent(defaultParams(), 'z'.repeat(64), AGENT_ADDRESS);
+      // Counterparty has LOWER pubkey — they are the legitimate proposer.
+      market.setSearchResults([buildSearchResult({
+        direction: 'sell',
+        agentPublicKey: 'a'.repeat(64),
+      })]);
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+      // We should NOT propose to a lower-pubkey peer — yield instead.
+      expect(onMatchFound).not.toHaveBeenCalled();
+    });
+
+    it('falls through and proposes ONCE after YIELD_TIMEOUT_MS even with stale candidate', async () => {
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: 'z'.repeat(64),
+      });
+      await engine.createIntent(defaultParams(), 'z'.repeat(64), AGENT_ADDRESS);
+      market.setSearchResults([buildSearchResult({
+        direction: 'sell',
+        agentPublicKey: 'a'.repeat(64),
+      })]);
+      engine.start();
+      // Advance past YIELD_TIMEOUT_MS — fall-through should fire.
+      await vi.advanceTimersByTimeAsync(YIELD_TIMEOUT_MS + 5_000);
+      engine.stop();
+      // Exactly ONE proposal — fall-through fires, then blacklist + reset
+      // prevents subsequent fall-throughs in the same yield session.
+      expect(onMatchFound.mock.calls.length).toBe(1);
+    });
+
+    it('does NOT proposing-storm: at most ONE fall-through per session even after many scans', async () => {
+      // This is the regression test for the basic-roundtrip flake.
+      // Pre-fix observation: 80 proposals fired against ONE peer in 11.5
+      // min because firstYieldAt never reset. Post-fix: at most 1 per
+      // yield session (the blacklist also kicks in to filter the same
+      // peer out of subsequent scan results).
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: 'z'.repeat(64),
+      });
+      await engine.createIntent(defaultParams(), 'z'.repeat(64), AGENT_ADDRESS);
+      market.setSearchResults([buildSearchResult({
+        direction: 'sell',
+        agentPublicKey: 'a'.repeat(64),
+      })]);
+      engine.start();
+      // Run for 10 minutes of simulated time — pre-fix this would emit
+      // ~70 proposals; post-fix at most 1 (blacklisted after fall-through).
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      engine.stop();
+      expect(onMatchFound.mock.calls.length).toBeLessThanOrEqual(1);
+    });
+
+    it('does NOT yield when ANY candidate has higher-priority pubkey (we propose to them)', async () => {
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: 'a'.repeat(64),  // we are LOWER → proposer
+      });
+      await engine.createIntent(defaultParams(), 'a'.repeat(64), AGENT_ADDRESS);
+      market.setSearchResults([buildSearchResult({
+        direction: 'sell',
+        agentPublicKey: 'b'.repeat(64),
+      })]);
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+      // Lower-pubkey side proposes immediately, no yield.
+      expect(onMatchFound).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // =========================================================================
   // 5. Feed subscription
   // =========================================================================
 

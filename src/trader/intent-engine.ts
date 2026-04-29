@@ -433,6 +433,18 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       for (const m of matches) {
         engine.markCounterpartyFailed(own.intent_id, m.agentPublicKey);
       }
+      // CRITICAL state-machine fix (basic-roundtrip flake investigation,
+      // 2026-04-29): RESET firstYieldAt after fall-through. Without this
+      // reset, the next scan finds the same lower-priority candidate
+      // (e.g. after blacklist LRU eviction or counterparty rotation),
+      // sees firstYieldAt is set with elapsed ≫ TIMEOUT, and IMMEDIATELY
+      // re-fires the fall-through. Empirical evidence: a single yield
+      // session of 80 fall-throughs in 11.5 min from one intent against
+      // one peer (basic-roundtrip 2026-04-28 log). The W2 blacklist
+      // alone breaks the storm in the immediate-next-scan, but a stale
+      // firstYieldAt resurrects the storm later. Resetting here means
+      // each yield session has at most ONE fall-through.
+      firstYieldAt.delete(own.intent_id);
       // We have proposing-elected candidates — clear the yield timestamp
       // so the next yield (if any) starts a fresh window.
       firstYieldAt.delete(own.intent_id);
