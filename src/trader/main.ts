@@ -760,6 +760,18 @@ export async function startTrader(): Promise<void> {
         async waitForPendingOperations() {
           await sphere.payments.waitForPendingOperations();
         },
+        async getSwapStatus(id) {
+          // EXECUTION_TIMEOUT skip-when-terminal check — see swap-executor.ts.
+          // Reads SDK swap progress to avoid transitioning a successfully-
+          // completed swap to trader-side FAILED while L3 verifyPayout retries
+          // are still legitimately pending.
+          try {
+            const status = await sdkSwap.getSwapStatus(id);
+            return { progress: status?.progress };
+          } catch {
+            return null;
+          }
+        },
       }
     : {
         async proposeSwap() {

@@ -40,6 +40,17 @@ export interface SwapAdapter {
   verifyPayout(swapId: string): Promise<boolean>;
   /** Wait for background operations (e.g. change token persistence) to complete. */
   waitForPendingOperations?(): Promise<void>;
+  /**
+   * Read SDK-side swap status. Used by EXECUTION_TIMEOUT to detect whether
+   * the swap has already reached a terminal SDK state (completed/cancelled/
+   * failed). On testnet the L3 confirmation latency at the verifyPayout
+   * stage often exceeds the trader's deposit_timeout_sec + grace budget.
+   * Without this check we'd incorrectly transition a successful swap to
+   * trader-side FAILED while the SDK considers it COMPLETED, producing
+   * the ledger-vs-chain inconsistency the EXECUTION_TIMEOUT handler is
+   * supposed to PREVENT.
+   */
+  getSwapStatus?(swapId: string): Promise<{ progress?: string } | null>;
 }
 
 export interface SwapDealInput {
@@ -302,47 +313,98 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
       if (stopped) return;
       const dealId = entry.deal.terms.deal_id;
       const swapId = entry.swapId;
-      logger.error('execution_timeout', {
-        deal_id: dealId,
-        swap_id: swapId,
-        timeout_sec: clampedTimeoutSec + EXECUTION_TIMEOUT_GRACE_SEC,
-      });
-      entry.deal = transitionDeal(entry.deal, 'FAILED');
-      // SECURITY (C3): cancel the SDK swap BEFORE unregistering. Without
-      // this, a swap that completes after the timeout would emit
-      // swap:completed for a swapId no longer in activeBySwapId — the
-      // handler logs and drops, but the escrow has already moved funds.
-      // Result: ledger says FAILED, chain says COMPLETED, fill never
-      // recorded. Best-effort: if rejectSwap fails (already terminal,
-      // network), log and continue — the failure-path semantics still
-      // hold from the trader's perspective; reconciliation surfaces the
-      // discrepancy.
-      if (swapId !== null) {
-        deps.swap.rejectSwap(swapId, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
-          // N4 (round-5 audit): escalate to error level — when this fails,
-          // there's a real risk the SDK swap subsequently completes while
-          // our ledger says FAILED, producing the exact ledger-vs-chain
-          // inconsistency the round-4 fix was added for. Operator-visible
-          // alert path: the entry is also pushed into lastErrors so
-          // getLastErrors() surfaces it without log archaeology.
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.error('execution_timeout_reject_failed', {
-            deal_id: dealId,
-            swap_id: swapId,
-            error: msg,
-            inconsistency_risk: true,
-          });
-          recordError(dealId, `EXECUTION_TIMEOUT_REJECT_FAILED: ${msg}`);
-        });
-      }
-      unregisterActive(entry);
-      void onSwapFailed(entry.deal, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
-        logger.error('on_swap_failed_callback_error', {
-          deal_id: dealId,
-          error: String(err),
-        });
-      });
+
+      // 2026-04-30 FIX (basic-roundtrip flake investigation):
+      // Don't EXECUTION_TIMEOUT a swap that the SDK already considers
+      // terminal. Empirical observation: testnet L3 confirmation latency
+      // at the verifyPayout stage often exceeds deposit_timeout_sec +
+      // grace (420s by default). The SDK's swap state machine reaches
+      // `completed` before the trader's timer fires, but the wallet's
+      // verifyPayout retry loop (10 min) is still running to wait for L3.
+      // Pre-fix, the trader's timer would transition the deal to FAILED
+      // even though the SDK considered the swap done; the subsequent
+      // rejectSwap call returned "Cannot reject: swap is already
+      // completed", flagging the inconsistency.
+      //
+      // Async: we kick off the status check, but don't await — we still
+      // need to fall through to fail-path if the SDK status is unknown
+      // or actively non-terminal. The timer is fire-and-forget; the
+      // status check sets a flag `skipFailPath` that the inner async
+      // function honors before transitioning.
+      void (async () => {
+        if (deps.swap.getSwapStatus !== undefined && swapId !== null) {
+          try {
+            const status = await deps.swap.getSwapStatus(swapId);
+            const progress = status?.progress;
+            if (progress === 'completed' || progress === 'cancelled' || progress === 'failed') {
+              logger.warn('execution_timeout_skipped_terminal_swap', {
+                deal_id: dealId,
+                swap_id: swapId,
+                sdk_progress: progress,
+                note: 'SDK swap is already terminal — letting verifyPayout retries finish',
+              });
+              // Don't transition deal or fire onSwapFailed. The verifyPayout
+              // retry loop in main.ts will resolve via the swap:completed /
+              // swap:failed events.
+              return;
+            }
+          } catch (statusErr: unknown) {
+            // If status check fails we proceed with the original failure
+            // path — better safe than sorry on unknown SDK state.
+            logger.warn('execution_timeout_status_check_failed', {
+              deal_id: dealId,
+              swap_id: swapId,
+              error: statusErr instanceof Error ? statusErr.message : String(statusErr),
+            });
+          }
+        }
+        execFailPath(entry, dealId, swapId);
+      })();
     }, timeoutMs);
+  }
+
+  function execFailPath(entry: ActiveDeal, dealId: string, swapId: string | null): void {
+    if (stopped) return;
+    logger.error('execution_timeout', {
+      deal_id: dealId,
+      swap_id: swapId,
+      timeout_sec: 0, // exact value lost across the async hop; not load-bearing
+    });
+    entry.deal = transitionDeal(entry.deal, 'FAILED');
+    // SECURITY (C3): cancel the SDK swap BEFORE unregistering. Without
+    // this, a swap that completes after the timeout would emit
+    // swap:completed for a swapId no longer in activeBySwapId — the
+    // handler logs and drops, but the escrow has already moved funds.
+    // Result: ledger says FAILED, chain says COMPLETED, fill never
+    // recorded. Best-effort: if rejectSwap fails (already terminal,
+    // network), log and continue — the failure-path semantics still
+    // hold from the trader's perspective; reconciliation surfaces the
+    // discrepancy.
+    if (swapId !== null) {
+      deps.swap.rejectSwap(swapId, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
+        // N4 (round-5 audit): escalate to error level — when this fails,
+        // there's a real risk the SDK swap subsequently completes while
+        // our ledger says FAILED, producing the exact ledger-vs-chain
+        // inconsistency the round-4 fix was added for. Operator-visible
+        // alert path: the entry is also pushed into lastErrors so
+        // getLastErrors() surfaces it without log archaeology.
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error('execution_timeout_reject_failed', {
+          deal_id: dealId,
+          swap_id: swapId,
+          error: msg,
+          inconsistency_risk: true,
+        });
+        recordError(dealId, `EXECUTION_TIMEOUT_REJECT_FAILED: ${msg}`);
+      });
+    }
+    unregisterActive(entry);
+    void onSwapFailed(entry.deal, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
+      logger.error('on_swap_failed_callback_error', {
+        deal_id: dealId,
+        error: String(err),
+      });
+    });
   }
 
   function clearExecutionTimer(entry: ActiveDeal): void {
