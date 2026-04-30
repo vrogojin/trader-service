@@ -608,6 +608,26 @@ export async function provisionTrader(
       dispose,
     };
   } catch (err) {
+    // 2026-04-30 DIAGNOSTIC ENHANCEMENT: dump container logs BEFORE
+    // cleanup so post-mortem analysis can distinguish "hung in Sphere
+    // init" (e.g. Nostr publishNametagBinding never returned) from
+    // "TS exception in our code". Previously the failed-provisioning
+    // path called safeCleanup() immediately, leaving us with no
+    // evidence about where the trader actually hung. Print the dump to
+    // stderr (vitest captures it into the test output) so it shows up
+    // on a CI failure without requiring docker access post-hoc.
+    if (container) {
+      try {
+        const failedLogs = await getContainerLogs(container.id, 500);
+        process.stderr.write(
+          `\n=== CONTAINER LOGS [provisionTrader-failed ${opts.label}] (last 500 lines) ===\n${failedLogs}\n=== END ${opts.label} ===\n`,
+        );
+      } catch (logErr) {
+        process.stderr.write(
+          `\n=== CONTAINER LOGS [provisionTrader-failed ${opts.label}] dump failed: ${logErr instanceof Error ? logErr.message : String(logErr)} ===\n`,
+        );
+      }
+    }
     // Cleanup partial resources before propagating.
     await safeCleanup({ walletDir, container });
     throw err;
