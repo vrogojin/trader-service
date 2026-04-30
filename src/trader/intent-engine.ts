@@ -7,7 +7,7 @@
  * intent state machine from Section 6.1.
  */
 
-import { randomBytes, randomInt } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 
 import type { CreateIntentParams } from './acp-types.js';
 import type {
@@ -510,40 +510,15 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     const fanOutLimit = Math.max(1, strategy.max_concurrent_swaps * 3);
     const candidates = proposingMatches.slice(0, fanOutLimit);
 
-    // F6 — divide remaining volume across fan-out candidates so two
-    // concurrent accepts cannot exceed volume_max. Distribute the remainder
-    // to a rotated window of candidates so the full remainingVolume is
-    // offered; integer truncation would otherwise drop up to
-    // (candidates.length - 1) units. Candidates that receive 0n are skipped.
-    //
-    // F7 — rotate the "+1 remainder" bonus across candidates via a per-scan
-    // random offset. The previous implementation deterministically awarded
-    // the bonus to the first-sorted candidate, giving an attacker who games
-    // the sort keys (rate/time/volume) a small but real preference edge.
-    // Uses crypto.randomInt — this is not a security-critical draw per se,
-    // but randomInt is the correct primitive (uniform, cryptographically
-    // secure) and avoids the Math.random() predictability/modulo-bias
-    // concern that static analysis tools flag (round-13 F3).
     const remainingVolume = current.intent.volume_max - current.intent.volume_filled;
-    const candidateCountBn = BigInt(candidates.length);
-    const baseVolume = remainingVolume / candidateCountBn;
-    const remainderVolume = remainingVolume % candidateCountBn;
-    const rotationOffset = candidates.length > 0 ? randomInt(candidates.length) : 0;
-    const volumeFor = (idx: number): bigint => {
-      const rotated = (idx + rotationOffset) % candidates.length;
-      return rotated < Number(remainderVolume) ? baseVolume + 1n : baseVolume;
-    };
 
-    // If even the smallest share would be zero (i.e. remainingVolume === 0n
-    // OR there is nothing left to distribute), skip the fan-out entirely
-    // and restore the intent to ACTIVE.
+    // If remaining volume is zero, skip fan-out and restore to ACTIVE.
     if (remainingVolume <= 0n) {
       logger.info('fan_out_skipped_zero_remaining_volume', {
         intent_id: own.intent_id,
         remaining_volume: remainingVolume.toString(),
         candidate_count: candidates.length,
       });
-      // Restore the intent to ACTIVE if we were just moved to MATCHING above.
       const currentAfter = intents.get(own.intent_id);
       if (currentAfter?.state === 'MATCHING') {
         try { transitionIntent(currentAfter, 'ACTIVE'); } catch { /* best effort */ }
@@ -551,16 +526,49 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       return;
     }
 
-    // Build the per-candidate volume list, skipping candidates whose share
-    // would be zero (only happens when remainingVolume < candidates.length
-    // for the tail candidates after the remainder is exhausted).
+    // Greedy allocation in priority order — each candidate gets the largest
+    // share it can absorb (capped by its parsed.volume_max), drawn from
+    // remainingVolume in priority order. Sum of shares <= volume_max so
+    // concurrent accepts cannot over-commit (the F6 safety invariant).
+    //
+    // Why greedy beats even-division (the previous F6/F7 scheme):
+    // The aggregator/relay surfaces stale buy/sell intents from prior
+    // sessions on shared infrastructure. Even-division splits remaining
+    // volume across all candidates, including dead ones — diluting the
+    // share offered to the live counterparty.
+    //
+    // Concrete failure (multi-agent partial-fill e2e):
+    //   Alice (sell vMax=100) sees 4 buy candidates at rate=1 (Bob_new
+    //   vMax=30 + 3 stale). Even-division gives each 100/4=25. Alice
+    //   proposes 25 to Bob, Bob accepts (within [10,30]). Alice fills
+    //   25 instead of the expected 30. Stale candidates time out
+    //   silently, wasting 75 units of dilution.
+    //
+    // Greedy assigns the priority-sorted (best-rate, then newest) leader
+    // up to its full vMax cap, then the next, etc. The newest live
+    // candidate (Bob_new) is first in priority and gets min(100, 30)=30.
+    // Stale candidates inherit the remainder and time out without
+    // affecting the live deal.
+    //
+    // Fairness note (replaces F7 rotation): priority order IS the spec
+    // 5.5 ranking (best rate → time → volume). Greedy by priority is
+    // therefore deterministic AND aligned with spec — no rotation
+    // needed because the most-likely-best candidate gets first claim
+    // by design.
     const candidatesWithVolume: Array<MarketSearchResult & { __perCandidateVolume?: bigint }> = [];
-    for (let i = 0; i < candidates.length; i += 1) {
-      const share = volumeFor(i);
-      if (share <= 0n) continue;
-      const entry = candidates[i];
-      if (!entry) continue;
+    let remainingToAllocate = remainingVolume;
+    const ownMin = current.intent.volume_min;
+    for (const entry of candidates) {
+      if (remainingToAllocate <= 0n) break;
+      const parsedCp = parseDescription(entry.description);
+      if (!parsedCp) continue;
+      const cpMax = parsedCp.volume_max;
+      const cpMin = parsedCp.volume_min;
+      const minRequired = ownMin > cpMin ? ownMin : cpMin;
+      const share = remainingToAllocate < cpMax ? remainingToAllocate : cpMax;
+      if (share < minRequired) continue;
       candidatesWithVolume.push({ ...entry, __perCandidateVolume: share });
+      remainingToAllocate -= share;
     }
 
     if (candidatesWithVolume.length === 0) {
