@@ -51,11 +51,6 @@ beforeAll(async () => {
     relayUrls: [...TESTNET.RELAYS],
     readyTimeoutMs: 180_000,
   });
-  // Sequential provisioning + 180s ready timeout: parallel nametag
-  // registrations against the testnet aggregator can trip a rate-limit
-  // (one of two concurrent provisions sometimes fails to log
-  // sphere_initialized within 90s while the other completes in ~5s).
-  // Sequential adds ~10–15s; well within the 600s beforeAll budget.
   // Self-mint funding instead of faucet HTTP. The faucet has been a
   // recurring source of test flakiness (sustained 30s+ HTTP timeouts on
   // /api/v1/faucet/request while the host TCP layer is healthy). Genesis
@@ -66,22 +61,30 @@ beforeAll(async () => {
     { coinIdHex: UCT_COIN_ID, amount: 5000n },
     { coinIdHex: USDU_COIN_ID, amount: 5000n },
   ];
-  buyer = await provisionTrader({
-    label: 'basic-buyer',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    selfMintFund: SELF_MINT,
-  } satisfies InternalProvisionOptions);
-  seller = await provisionTrader({
-    label: 'basic-seller',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    selfMintFund: SELF_MINT,
-  } satisfies InternalProvisionOptions);
+  // 2026-04-30 measurement: concurrent provisioning is actually faster
+  // per-trader than sequential (relay handshakes overlap). Validated
+  // by provisioning-load-investigation.e2e-live.test.ts: 30/30 attempts
+  // succeeded with 3 traders provisioned in parallel, total iter time
+  // 6-9 sec (vs ~12-15 sec sequential). The earlier "parallel sometimes
+  // hangs" observation in this file's history is not reproduced.
+  [buyer, seller] = await Promise.all([
+    provisionTrader({
+      label: 'basic-buyer',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      selfMintFund: SELF_MINT,
+    } satisfies InternalProvisionOptions),
+    provisionTrader({
+      label: 'basic-seller',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      selfMintFund: SELF_MINT,
+    } satisfies InternalProvisionOptions),
+  ]);
 }, 600_000);
 
 afterAll(async () => {

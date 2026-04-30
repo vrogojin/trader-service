@@ -403,6 +403,7 @@ async function waitForReadyAddress(
       // Container may have already exited; keep trying briefly so we hit
       // the timeout path with a clear message rather than crashing here.
     }
+    let earlyError: string | null = null;
     for (const line of logs.split('\n')) {
       const trimmed = line.trim();
       if (trimmed === '' || trimmed[0] !== '{') continue;
@@ -425,6 +426,23 @@ async function waitForReadyAddress(
         const addr = parsed['direct_address'];
         if (typeof addr === 'string' && addr !== '') return addr;
       }
+      // 2026-04-30 FIX: detect early-exit failure conditions and short-
+      // circuit the 180s timeout. Pre-fix, a trader process that crashed
+      // at ~1s with "Failed to register Unicity ID" would leave the
+      // container running but the node process dead — we'd poll for
+      // sphere_initialized for the full 180s budget and report it as a
+      // generic "did not log" hang.
+      if (parsed['event'] === 'trader_acp_startup_failed' ||
+          parsed['msg'] === 'trader_acp_startup_failed') {
+        const errDetails = (parsed['details'] as Record<string, unknown> | undefined)?.['error']
+          ?? parsed['error'];
+        earlyError = `trader_acp_startup_failed: ${typeof errDetails === 'string' ? errDetails : JSON.stringify(errDetails)}`;
+      }
+    }
+    if (earlyError !== null) {
+      throw new Error(
+        `waitForReadyAddress: container ${containerId} reported startup failure: ${earlyError}`,
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }

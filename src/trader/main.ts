@@ -259,7 +259,18 @@ export async function startTrader(): Promise<void> {
     },
   });
 
-  const nametag = `t-${config.instance_id.replace(/[^a-z0-9]/g, '').slice(0, 12)}`;
+  // 2026-04-30 FIX (basic-roundtrip flake investigation): use the FULL
+  // sanitized instance_id, not just the first 12 chars. Previously we
+  // sliced to 12 → "tradere2e" + 3 hex = only 4096 distinct nametags.
+  // Nostr relays persist NIP-17 nametag bindings indefinitely, so test
+  // runs accumulated bindings on the relay until a fresh UUID's first 3
+  // hex chars happened to match a prior run's binding. The trader's
+  // publishNametagBinding then rejected with "already claimed" and the
+  // process exited at ~1s — but our test's `waitForReadyAddress` polls
+  // for sphere_initialized for 180s, mis-interpreting the early exit as
+  // a hang. With the full instance_id (~32 hex chars), the entropy is
+  // effectively collision-free.
+  const nametag = `t-${config.instance_id.replace(/[^a-z0-9]/g, '')}`;
   logger.info('registering_nametag', { nametag });
 
   // Enable SDK debug logging for swap diagnostics only when log_level is debug
