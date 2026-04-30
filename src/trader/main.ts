@@ -1293,10 +1293,12 @@ export async function startTrader(): Promise<void> {
         // The SDK's verifyPayout fails closed when payout-invoice tokens
         // are L3-pending. On testnet, aggregator inclusion-proof
         // propagation has been observed to take up to ~7 minutes during
-        // peak load — 5 minutes (the previous limit) reliably escalated
-        // legitimate payouts to PAYOUT_UNVERIFIED. 10 minutes covers the
-        // observed P99 with margin.
-        const MAX_ATTEMPTS = 20;
+        // peak load — 5 minutes reliably escalated legitimate payouts
+        // to PAYOUT_UNVERIFIED. 2026-04-30 observation: even 10 min
+        // wasn't enough on a slow day (verifyPayout still allConfirmed=false
+        // at attempt 18 = 9 min). 20 min covers the observed worst case
+        // with sufficient margin for testnet's ALB-fronted aggregator.
+        const MAX_ATTEMPTS = 40;
         const RETRY_INTERVAL_MS = 30_000;
         let verified = false;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {

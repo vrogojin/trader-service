@@ -52,11 +52,15 @@ export const ESCROW_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.1';
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
- * Max wait for a swap to terminal state — 10 minutes. Settlement on testnet
+ * Max wait for a swap to terminal state — 25 minutes. Settlement on testnet
  * involves multiple aggregator round-trips, BFT consensus, and Nostr DMs;
- * 60s is not enough on a bad day.
+ * 60s is not enough on a bad day. 2026-04-30 observation: with the
+ * dedup-miss + EXECUTION_TIMEOUT + deposit-retry fixes in place, the
+ * end-to-end swap completes — but the trader's verifyPayout retry loop
+ * (40 × 30s = 20 min on testnet) needs the test budget to exceed it
+ * with margin for provisioning + negotiation overhead.
  */
-export const SWAP_TIMEOUT_MS = 600_000;
+export const SWAP_TIMEOUT_MS = 1_500_000;
 
 /**
  * Aggregate constant — implements the `TestnetConstants` contract from
