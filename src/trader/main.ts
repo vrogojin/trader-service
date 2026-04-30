@@ -531,6 +531,7 @@ export async function startTrader(): Promise<void> {
       return;
     }
     depositInFlight.add(swapId);
+    let depositSucceeded = false;
     try {
       const isFresh = await agent.markDepositAttempted(swapId);
       if (!isFresh) {
@@ -547,10 +548,28 @@ export async function startTrader(): Promise<void> {
           await swapMod.deposit(swapId);
           logger.info('swap_deposit_sent', { swap_id: swapId, trigger });
           await sphere.payments.waitForPendingOperations();
+          depositSucceeded = true;
           return;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes('not yet available') || msg.includes('SWAP_WRONG_STATE')) {
+          // 2026-04-30 FIX: extend the retry filter. Empirical observation
+          // in basic-roundtrip live e2e — when the SDK's `swap:announced`
+          // event fires BEFORE the escrow's invoice_delivery DM arrives
+          // (44ms race seen in the wild), the immediate deposit() call
+          // throws `Deposit invoice not yet imported into accounting
+          // module`. The pre-fix filter only matched "not yet available"
+          // / "SWAP_WRONG_STATE" → fell through to "give up" → the
+          // persistent markDepositAttempted flag from round-5c prevented
+          // future retries. Now we ALSO retry on "not yet imported".
+          //
+          // Defensive: any "not yet" message indicates the SDK-internal
+          // race conditions we care about. Pattern broadened for forward
+          // compat.
+          if (
+            msg.includes('not yet available') ||
+            msg.includes('not yet imported') ||
+            msg.includes('SWAP_WRONG_STATE')
+          ) {
             await waitCancellable(3000);
             if (stopped) return;
             continue;
@@ -567,6 +586,22 @@ export async function startTrader(): Promise<void> {
       });
     } finally {
       depositInFlight.delete(swapId);
+      // 2026-04-30 fix: if deposit didn't succeed, ROLL BACK the
+      // persistent markDepositAttempted flag. Otherwise a transient
+      // failure (or a 60s deadline timeout) would permanently block
+      // future deposit attempts via the persistent
+      // swap_deposit_skipped_already_attempted gate. Spec 7.9.3
+      // idempotency requires "don't double-deposit on restart" — the
+      // flag should only persist AFTER a successful deposit, not
+      // BEFORE the attempt. This restores the correct semantics.
+      if (!depositSucceeded) {
+        await agent.clearDepositAttempted(swapId).catch((clearErr: unknown) => {
+          logger.warn('swap_deposit_attempted_clear_failed', {
+            swap_id: swapId,
+            error: clearErr instanceof Error ? clearErr.message : String(clearErr),
+          });
+        });
+      }
     }
   }
   function scheduleSwapPoll(): void {
