@@ -337,7 +337,11 @@ function buildContainerEnv(
     TRADER_MAX_ACTIVE_INTENTS: String(maxActiveIntents),
     LOG_LEVEL: 'info',
     // Fault-injection: deposit-skip. Only set when the test caller asks.
-    ...(opts.faultSkipDeposits === true ? { TRADER_FAULT_SKIP_DEPOSITS: '1' } : {}),
+    // The trader's production guard requires TRADER_FAULT_INJECTION_ALLOWED=1
+    // alongside the actual fault flag to actually inject the fault.
+    ...(opts.faultSkipDeposits === true
+      ? { TRADER_FAULT_SKIP_DEPOSITS: '1', TRADER_FAULT_INJECTION_ALLOWED: '1' }
+      : {}),
     // Self-mint TEST funding (replaces faucet HTTP). When opts.selfMint is
     // set, the trader self-mints the listed amounts at startup via
     // sphere.payments.mintFungibleToken. Both the network gate AND
