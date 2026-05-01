@@ -605,16 +605,19 @@ describe('T13 — Multi-Agent Swap Flows', () => {
   });
 
   // -------------------------------------------------------------------------
-  // T13.3: Simultaneous discovery — both agents discover, duplicate deal guard resolves race
+  // T13.3: Simultaneous discovery — proposer election (spec 5.7) decides who proposes
   // -------------------------------------------------------------------------
 
-  it('T13.3 — both agents discover match, duplicate deal guard ensures one deal', async () => {
+  it('T13.3 — both agents discover match, only the lower-pubkey side proposes (spec 5.7)', async () => {
     const { agents } = createMultiAgentSetup(2);
     const [agentA, agentB] = agents as [AgentContext, AgentContext];
 
-    // PK_A (02aaa...) < PK_B (02bbb...)
-    // Both agents now fire onMatchFound (proposer selection removed from scan loop).
-    // The NegotiationHandler's duplicate deal guard prevents both from creating deals.
+    // PK_A (02aaa...) < PK_B (02bbb...). Per spec 5.7 the lower-pubkey side
+    // proposes; A's engine fires onMatchFound, B's engine yields. The
+    // duplicate-guard race the previous behavior relied on is no longer
+    // exercised — both sides racing fan-outs would deadlock the pair on
+    // each other's failed-counterparty list (see fix/e2e-live-real-issues
+    // session for the live-testnet failure mode that motivated the change).
 
     // A's intent and B's counterparty view
     const intentA = makeIntentRecord({
@@ -685,11 +688,12 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     expect(agentA.market.searchCalls.length).toBe(1);
     expect(agentB.market.searchCalls.length).toBe(1);
 
-    // Both agents discover the match (proposer selection removed from engine)
+    // Spec 5.7: only the lower-pubkey side (A) discovers + proposes.
+    // B's matcher sees A's intent in its results but yields because
+    // canonicalPubkeyKey(B) > canonicalPubkeyKey(A).
     expect(agentA.matchFoundCalls).toHaveLength(1);
     expect(agentA.matchFoundCalls[0]!.counterparty.agentPublicKey).toBe(PK_B);
-    expect(agentB.matchFoundCalls).toHaveLength(1);
-    expect(agentB.matchFoundCalls[0]!.counterparty.agentPublicKey).toBe(PK_A);
+    expect(agentB.matchFoundCalls).toHaveLength(0);
 
     // A proposes a deal to B
     const dealFromA = await agentA.negotiationHandler.proposeDeal(

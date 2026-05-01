@@ -253,14 +253,98 @@ describe('runTraderCtl — output parsing', () => {
   });
 
   it('does NOT throw on invalid JSON when child exits non-zero, even if json=true', async () => {
-    // Caller decides whether to surface the error; we just hand back the bytes.
+    // Non-JSON stdout on the error path silently falls back to the raw string —
+    // the success path throws on non-JSON, the error path doesn't, so a
+    // diagnostic dump that happens to contain log lines won't poison the test.
     stageChildExit(1, 'not-json', 'Error: command rejected\n');
 
     const res = await runTraderCtl('create-intent', [], { tenant: '@a', json: true });
 
     expect(res.exitCode).toBe(1);
-    expect(res.output).toBe('not-json'); // unparsed
+    expect(res.output).toBe('not-json'); // raw fallback, not parsed
     expect(res.stderr).toBe('Error: command rejected\n');
+  });
+
+  it('parses stdout as JSON when child exits non-zero AND stdout is a JSON envelope', async () => {
+    // The CLI's emitResult writes the AcpErrorPayload envelope to stdout even
+    // when ok===false (and exits 1). Tests need access to error_code/message
+    // to assert the failure mode rather than a bare exit code.
+    const envelope = JSON.stringify({
+      ok: false,
+      error_code: 'INVALID_PARAM',
+      message: 'rate_min must be <= rate_max',
+      msg_id: 'cmd-123',
+    });
+    stageChildExit(1, envelope, '');
+
+    const res = await runTraderCtl('create-intent', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toEqual({
+      ok: false,
+      error_code: 'INVALID_PARAM',
+      message: 'rate_min must be <= rate_max',
+      msg_id: 'cmd-123',
+    });
+  });
+
+  it('preserves empty stdout as raw "" on non-zero exit (no JSON parse attempted)', async () => {
+    stageChildExit(1, '', 'commander: unknown option --foo\n');
+
+    const res = await runTraderCtl('status', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toBe('');
+    expect(res.stderr).toBe('commander: unknown option --foo\n');
+  });
+
+  it('tolerates CRLF in stdout (Windows CI line-ending rewrite of CLI trailing \\n)', async () => {
+    // Documents that whitespace-tolerant parsing is part of our wire contract:
+    // CI shells on Windows can rewrite the CLI's trailing '\n' to '\r\n', and
+    // JSON.parse accepts trailing whitespace per spec. A future change that
+    // moved off JSON.parse to a stricter parser would be a breaking change to
+    // this contract — this test would flag it.
+    const envelope = JSON.stringify({ ok: false, error_code: 'TIMEOUT', message: 'x' });
+    stageChildExit(1, `${envelope}\r\n`, '');
+
+    const res = await runTraderCtl('status', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(1);
+    expect((res.output as Record<string, unknown>)['error_code']).toBe('TIMEOUT');
+  });
+
+  it('preserves stringified bigint values in parsed envelope (domain wire format)', async () => {
+    // Trader emits bigint fields (rate, volume, balances) as strings on the
+    // wire. A regression that emits them as JS numbers would silently lose
+    // precision past Number.MAX_SAFE_INTEGER. This test pins the contract
+    // that we DO surface what the CLI sent — even when the CLI follows the
+    // string convention. (We can't catch a silent-number regression in the
+    // CLI itself from here, but we can guarantee the driver doesn't coerce.)
+    const envelope = JSON.stringify({
+      ok: true,
+      result: {
+        balances: [
+          { asset: 'UCT', available: '12345678901234567890', confirmed: '0' },
+        ],
+        nested: { deep: { value: '99999999999999999999' } },
+      },
+    });
+    stageChildExit(0, envelope, '');
+
+    const res = await runTraderCtl('portfolio', [], { tenant: '@a', json: true });
+
+    expect(res.exitCode).toBe(0);
+    const result = (res.output as Record<string, unknown>)['result'] as Record<string, unknown>;
+    const balances = result['balances'] as Array<Record<string, unknown>>;
+    expect(balances[0]?.['available']).toBe('12345678901234567890'); // STRING, not number
+    // Also assert the deeply-nested field — proves the parse handled depth
+    // correctly, not just the top-level array. (No reviver coerces along the
+    // path.)
+    // JSON.parse returns `unknown`-shaped data; cast at each step rather than
+    // overpromising the leaf type.
+    const nested = result['nested'] as Record<string, unknown>;
+    const deep = nested['deep'] as Record<string, unknown>;
+    expect(deep['value']).toBe('99999999999999999999');
   });
 });
 

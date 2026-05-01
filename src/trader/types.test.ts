@@ -308,12 +308,17 @@ describe('validateIntentParams', () => {
 // validateDealTerms
 // ---------------------------------------------------------------------------
 
+// Steelman round-4 (M2): pubkey shape validation. Use real-shaped 64-hex
+// secp256k1 keys (x-only) so the validator's isValidPubkey gate passes.
+const VALID_PROPOSER_PUBKEY = 'a'.repeat(64);
+const VALID_ACCEPTOR_PUBKEY = 'b'.repeat(64);
+
 const validTerms: DealTerms = {
   deal_id: 'deal_01',
   proposer_intent_id: 'intent_01',
   acceptor_intent_id: 'intent_02',
-  proposer_pubkey: 'pub_01',
-  acceptor_pubkey: 'pub_02',
+  proposer_pubkey: VALID_PROPOSER_PUBKEY,
+  acceptor_pubkey: VALID_ACCEPTOR_PUBKEY,
   proposer_address: 'addr_01',
   acceptor_address: 'addr_02',
   base_asset: 'ALPHA',
@@ -354,5 +359,29 @@ describe('validateDealTerms', () => {
   it('rejects negative created_ms', () => {
     const err = validateDealTerms({ ...validTerms, created_ms: -1 });
     expect(err).toContain('created_ms');
+  });
+
+  // M2 — pubkey shape
+  it('rejects proposer_pubkey with invalid shape', () => {
+    const err = validateDealTerms({ ...validTerms, proposer_pubkey: 'pub_01' });
+    expect(err).toContain('proposer_pubkey');
+  });
+
+  it('rejects acceptor_pubkey with invalid shape', () => {
+    const err = validateDealTerms({ ...validTerms, acceptor_pubkey: 'not-hex' });
+    expect(err).toContain('acceptor_pubkey');
+  });
+
+  // M3 — rate / volume upper bound (2^128)
+  it('rejects rate > 2^128', () => {
+    const err = validateDealTerms({ ...validTerms, rate: 2n ** 128n + 1n });
+    expect(err).toContain('rate');
+    expect(err).toContain('maximum');
+  });
+
+  it('rejects volume > 2^128', () => {
+    const err = validateDealTerms({ ...validTerms, volume: 2n ** 128n + 1n });
+    expect(err).toContain('volume');
+    expect(err).toContain('maximum');
   });
 });

@@ -18,6 +18,59 @@ import {
   type ProvisionedTenant,
 } from './helpers/tenant-fixture.js';
 import { runTraderCtl } from './helpers/trader-ctl-driver.js';
+import { getControllerWallet } from './helpers/tenant-fixture.js';
+
+/**
+ * Wrapper that auto-attaches controller-wallet credentials so the trader
+ * accepts the ACP command. Without these, `runTraderCtl` falls back to
+ * `~/.trader-ctl/wallet/wallet.json` (the default user wallet), which can
+ * race + corrupt across parallel tests and is not in the trader's allow-list.
+ */
+async function runAuthedTraderCtl(
+  cmd: string,
+  args: ReadonlyArray<string>,
+  opts: { tenant: string; json?: boolean; timeoutMs?: number },
+): ReturnType<typeof runTraderCtl> {
+  const controller = await getControllerWallet();
+  return runTraderCtl(cmd, args, {
+    ...opts,
+    dataDir: controller.dataDir,
+    tokensDir: controller.tokensDir,
+  });
+}
+
+/**
+ * Pull an array field from a trader-ctl JSON response. Tolerates both the
+ * bare result object and the AcpResultPayload envelope (with the result
+ * nested under `result`).
+ */
+function arrayFieldFromOutput(
+  output: unknown,
+  field: string,
+): Array<Record<string, unknown>> {
+  if (typeof output !== 'object' || output === null) return [];
+  const obj = output as Record<string, unknown>;
+  if (Array.isArray(obj[field])) return obj[field] as Array<Record<string, unknown>>;
+  const inner = obj['result'];
+  if (typeof inner === 'object' && inner !== null) {
+    const innerObj = inner as Record<string, unknown>;
+    if (Array.isArray(innerObj[field])) return innerObj[field] as Array<Record<string, unknown>>;
+  }
+  return [];
+}
+
+/** Pull a string field from a trader-ctl JSON response, tolerating envelope shapes. */
+function stringFieldFromOutput(output: unknown, field: string): string | null {
+  if (typeof output !== 'object' || output === null) return null;
+  const obj = output as Record<string, unknown>;
+  if (typeof obj[field] === 'string') return obj[field] as string;
+  const inner = obj['result'];
+  if (typeof inner === 'object' && inner !== null) {
+    const innerObj = inner as Record<string, unknown>;
+    if (typeof innerObj[field] === 'string') return innerObj[field] as string;
+  }
+  return null;
+}
 import {
   runContainer,
   stopContainer,
@@ -66,17 +119,22 @@ async function provisionEscrow(label: string): Promise<EscrowFixture> {
 }
 
 async function cancelActiveIntents(tenant: ProvisionedTenant): Promise<void> {
-  const list = await runTraderCtl('list-intents', ['--state', 'active'], {
+  // List ALL intents and filter client-side: the trader-ctl CLI accepts
+  // `--state` but the trader's LIST_INTENTS handler reads `params.filter`
+  // (mismatched flag name — listed as a follow-up product fix), so the
+  // server-side filter is currently a no-op.
+  const list = await runAuthedTraderCtl('list-intents', [], {
     tenant: tenant.address,
     json: true,
   });
   if (list.exitCode !== 0) return;
-  const intents = ((list.output as Record<string, unknown>)['intents'] ??
-    []) as Array<Record<string, unknown>>;
+  const intents = arrayFieldFromOutput(list.output, 'intents');
   for (const intent of intents) {
-    const id = String(intent['intent_id']);
+    const id = stringFieldFromOutput(intent, 'intent_id');
+    const state = String(intent['state'] ?? '').toUpperCase();
     if (!id) continue;
-    await runTraderCtl('cancel-intent', ['--intent-id', id], {
+    if (state !== 'ACTIVE' && state !== 'MATCHING' && state !== 'PARTIALLY_FILLED') continue;
+    await runAuthedTraderCtl('cancel-intent', ['--intent-id', id], {
       tenant: tenant.address,
       json: true,
     }).catch(() => {
@@ -92,7 +150,7 @@ async function createIntent(
     rateMin: bigint;
     rateMax: bigint;
     volumeMin: bigint;
-    volumeTotal: bigint;
+    volumeMax: bigint;
     expiryMs?: number;
   },
 ): Promise<string> {
@@ -109,13 +167,13 @@ async function createIntent(
     args.rateMax.toString(),
     '--volume-min',
     args.volumeMin.toString(),
-    '--volume-total',
-    args.volumeTotal.toString(),
+    '--volume-max',
+    args.volumeMax.toString(),
   ];
   if (args.expiryMs !== undefined) {
     argv.push('--expiry-ms', String(args.expiryMs));
   }
-  const result = await runTraderCtl('create-intent', argv, {
+  const result = await runAuthedTraderCtl('create-intent', argv, {
     tenant: tenant.address,
     json: true,
   });
@@ -124,15 +182,28 @@ async function createIntent(
       `create-intent failed (exit=${result.exitCode}): ${result.stderr}`,
     );
   }
-  return String((result.output as Record<string, unknown>)['intent_id']);
+  const id = stringFieldFromOutput(result.output, 'intent_id');
+  if (!id) {
+    throw new Error(
+      `create-intent returned no intent_id: ${JSON.stringify(result.output)?.slice(0, 500)}`,
+    );
+  }
+  return id;
 }
 
 /**
- * Resolve true if both intent IDs are still ACTIVE on their respective
- * tenants AND no COMPLETED deals exist on either side. We check at a
- * single instant after waiting `quietWindowMs` for any settlement DMs to
- * have arrived — false positives from "match in flight" are mitigated by
- * the wait.
+ * Resolve true if neither tenant completed a deal WITH THE OTHER tenant for
+ * the named intents. We can't constrain global state because the testnet
+ * aggregator is shared — alice's sell-rate-100-200 intent might match
+ * unrelated stale buy intents from prior runs that happen to be live, and
+ * bob's buy-rate-1-50 intent is even more likely to find unrelated sellers.
+ * What we CAN guarantee is "no deal between alice and bob themselves" —
+ * verified by checking each tenant's deals for a COMPLETED record where the
+ * counterparty pubkey matches the OTHER test tenant's address/pubkey.
+ *
+ * volume_filled on the named intent is also asserted to be 0 — even if some
+ * unrelated peer matched, our intent shouldn't have actually completed a swap
+ * with them within the quiet window for the test to be meaningful.
  */
 async function intentsRemainUnmatched(
   tenantA: ProvisionedTenant,
@@ -145,30 +216,57 @@ async function intentsRemainUnmatched(
   // produce a deal or not.
   await new Promise((r) => setTimeout(r, quietWindowMs));
 
-  for (const [tenant, intentId] of [
-    [tenantA, intentIdA] as const,
-    [tenantB, intentIdB] as const,
+  for (const [tenant, , otherAddr] of [
+    [tenantA, intentIdA, tenantB.address] as const,
+    [tenantB, intentIdB, tenantA.address] as const,
   ]) {
-    const list = await runTraderCtl('list-intents', ['--state', 'active'], {
-      tenant: tenant.address,
-      json: true,
-    });
-    if (list.exitCode !== 0) return false;
-    const intents = ((list.output as Record<string, unknown>)['intents'] ??
-      []) as Array<Record<string, unknown>>;
-    const found = intents.find((i) => String(i['intent_id']) === intentId);
-    if (!found) return false;
-    if (String(found['state']) !== 'ACTIVE') return false;
-    if (BigInt(String(found['volume_filled'] ?? '0')) !== 0n) return false;
-
-    const deals = await runTraderCtl('list-deals', [], {
+    const deals = await runAuthedTraderCtl('list-deals', [], {
       tenant: tenant.address,
       json: true,
     });
     if (deals.exitCode !== 0) return false;
-    const dealRecs = ((deals.output as Record<string, unknown>)['deals'] ??
-      []) as Array<Record<string, unknown>>;
-    if (dealRecs.some((d) => String(d['state']) === 'COMPLETED')) return false;
+    const dealRecs = arrayFieldFromOutput(deals.output, 'deals');
+    // No deal between THIS tenant and the OTHER test tenant should have completed.
+    // The deal record's counterparty fields may be `proposer_address` /
+    // `acceptor_address` (DIRECT://hex) or `proposer_pubkey` / `acceptor_pubkey`.
+    // Match any of these against the other tenant's address.
+    const otherKey = otherAddr.startsWith('@')
+      ? otherAddr.slice(1)
+      : otherAddr.replace(/^DIRECT:\/\//, '');
+    const involvesOther = (d: Record<string, unknown>): boolean => {
+      const fields = ['proposer_address', 'acceptor_address', 'proposer_pubkey', 'acceptor_pubkey'];
+      for (const f of fields) {
+        const v = String(d[f] ?? '');
+        if (v.includes(otherKey) || v.includes(otherAddr)) return true;
+      }
+      return false;
+    };
+    if (
+      dealRecs.some(
+        (d) => String(d['state']) === 'COMPLETED' && involvesOther(d),
+      )
+    ) {
+      return false;
+    }
+  }
+
+  // Also verify the named intents have volume_filled=0 (they may have moved
+  // to MATCHING/PROPOSED with unrelated peers, but they shouldn't have
+  // actually swapped with the OTHER named tenant — and a 0 fill is the most
+  // direct evidence of "no swap occurred for THIS specific intent").
+  for (const [tenant, intentId] of [
+    [tenantA, intentIdA] as const,
+    [tenantB, intentIdB] as const,
+  ]) {
+    const list = await runAuthedTraderCtl('list-intents', [], {
+      tenant: tenant.address,
+      json: true,
+    });
+    if (list.exitCode !== 0) return false;
+    const intents = arrayFieldFromOutput(list.output, 'intents');
+    const found = intents.find((i) => String(i['intent_id']) === intentId);
+    if (!found) return false;
+    if (BigInt(String(found['volume_filled'] ?? '0')) !== 0n) return false;
   }
   return true;
 }
@@ -181,14 +279,14 @@ beforeAll(async () => {
       trustedEscrows: [escrow.address],
       relayUrls: [...TESTNET.RELAYS],
       waitForReady: true,
-      readyTimeoutMs: 90_000,
+      readyTimeoutMs: 180_000,
     }),
     provisionTrader({
       label: 'edge-bob',
       trustedEscrows: [escrow.address],
       relayUrls: [...TESTNET.RELAYS],
       waitForReady: true,
-      readyTimeoutMs: 90_000,
+      readyTimeoutMs: 180_000,
     }),
   ]);
 }, 600_000);
@@ -221,14 +319,14 @@ describe('Edge cases', () => {
         rateMin: 100n,
         rateMax: 200n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
       const bobId = await createIntent(bob, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 50n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
 
       const stillUnmatched = await intentsRemainUnmatched(
@@ -257,63 +355,125 @@ describe('Edge cases', () => {
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 50n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
       const buyId = await createIntent(alice, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 50n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
 
-      // Wait long enough for >1 scan cycle and assert nothing settled.
+      // Wait long enough for >1 scan cycle and assert no SELF-MATCH deal.
+      // Note: alice may match unrelated stale intents on the shared testnet
+      // aggregator; what we MUST guarantee is that alice doesn't trade with
+      // HERSELF. We verify by scanning for any deal where proposer_pubkey ===
+      // acceptor_pubkey (the self-match anti-invariant).
       await new Promise((r) => setTimeout(r, 45_000));
 
-      const dealsRes = await runTraderCtl('list-deals', [], {
+      const dealsRes = await runAuthedTraderCtl('list-deals', [], {
         tenant: alice.address,
         json: true,
       });
       expect(dealsRes.exitCode).toBe(0);
-      const deals = ((dealsRes.output as Record<string, unknown>)['deals'] ??
-        []) as Array<Record<string, unknown>>;
-      // No COMPLETED deal — the self-match guard has held.
-      expect(deals.some((d) => String(d['state']) === 'COMPLETED')).toBe(false);
+      const deals = arrayFieldFromOutput(dealsRes.output, 'deals');
+      // No deal where proposer == acceptor (== alice's own pubkey).
+      const selfMatchDeals = deals.filter((d) => {
+        const p = String(d['proposer_pubkey'] ?? '');
+        const a = String(d['acceptor_pubkey'] ?? '');
+        return p !== '' && p === a;
+      });
+      expect(
+        selfMatchDeals,
+        'self-match guard must prevent any deal with proposer===acceptor',
+      ).toEqual([]);
 
-      // Both intents remain ACTIVE with 0 filled.
-      const list = await runTraderCtl('list-intents', ['--state', 'active'], {
+      // Each named intent must have volume_filled === 0 (we don't constrain
+      // state — alice may legitimately be MATCHING with unrelated peers).
+      const list = await runAuthedTraderCtl('list-intents', [], {
         tenant: alice.address,
         json: true,
       });
       expect(list.exitCode).toBe(0);
-      const intents = ((list.output as Record<string, unknown>)['intents'] ??
-        []) as Array<Record<string, unknown>>;
+      const intents = arrayFieldFromOutput(list.output, 'intents');
       for (const id of [sellId, buyId]) {
         const intent = intents.find((i) => String(i['intent_id']) === id);
-        expect(intent, `${id} must still be ACTIVE`).toBeTruthy();
-        expect(String(intent!['state'])).toBe('ACTIVE');
+        expect(intent, `${id} should still be present in list`).toBeTruthy();
         expect(BigInt(String(intent!['volume_filled'] ?? '0'))).toBe(0n);
       }
     },
     5 * 60_000,
   );
 
-  it.skip(
-    'blocked counterparty: A.blocked_counterparties=[B] → B intents never proposed to A',
+  it(
+    'blocked counterparty: A.blocked_counterparties=[B] → no deal A↔B',
     async () => {
-      // SKIPPED: trader-ctl set-strategy does not yet expose a
-      // --blocked-counterparties flag. The runtime strategy engine
-      // (src/trader/intent-engine.ts) supports the criterion. Once the CLI
-      // surfaces it, replace this skip with the real assertion:
-      //   1. set-strategy --blocked-counterparties <bob.address> on alice
-      //   2. post matching intents on alice and bob
-      //   3. assert no deal reaches COMPLETED on either side after a
-      //      conservative quiet window
+      await cancelActiveIntents(alice);
+      await cancelActiveIntents(bob);
+
+      // 1. Alice blocks bob via the new CLI flag. The matcher's filter
+      //    (intent-engine.ts:matchesCriteria) reads strategy.blocked_counterparties
+      //    every scan cycle, so the next scan (within scan_interval_ms) will
+      //    skip bob's intent — but bob's matcher is still free to find alice
+      //    and propose to her. Alice's negotiation handler will then reject
+      //    the proposal because alice's own filter excludes bob.
+      const setStrategy = await runAuthedTraderCtl(
+        'set-strategy',
+        ['--blocked-counterparties', bob.address],
+        { tenant: alice.address, json: true },
+      );
+      expect(
+        setStrategy.exitCode,
+        // Pretty-print the structured AcpErrorPayload so error_code/message
+        // stay legible across line wraps; cap at 2000 chars (vs 500) so a full
+        // envelope + stderr can both fit without mid-token truncation.
+        `set-strategy failed: output=${JSON.stringify(setStrategy.output, null, 2)?.slice(0, 2000)} stderr=${(setStrategy.stderr || '<empty>').slice(0, 2000)}`,
+      ).toBe(0);
+
+      // 2. Post matching intents from both sides. Alice sells, bob buys, same
+      //    rate band — under normal conditions this would complete a deal.
+      const aliceId = await createIntent(alice, {
+        direction: 'sell',
+        rateMin: 1n,
+        rateMax: 1n,
+        volumeMin: 10n,
+        volumeMax: 100n,
+      });
+      const bobId = await createIntent(bob, {
+        direction: 'buy',
+        rateMin: 1n,
+        rateMax: 1n,
+        volumeMin: 10n,
+        volumeMax: 100n,
+      });
+
+      // 3. Wait for >= one full scan cycle on both sides + DM round-trips, then
+      //    assert no completed deal exists between the two of them. We use the
+      //    "no completed deal involving the other tenant" check (same as the
+      //    incompatible-rate-ranges scenario) so that unrelated stale intents
+      //    on the testnet aggregator can't false-positive the test.
+      const stillUnmatched = await intentsRemainUnmatched(
+        alice,
+        aliceId,
+        bob,
+        bobId,
+        45_000,
+      );
+      expect(stillUnmatched).toBe(true);
+
+      // 4. Restore alice's strategy so the next test starts clean.
+      await runAuthedTraderCtl(
+        'set-strategy',
+        ['--blocked-counterparties', ''],
+        { tenant: alice.address, json: true },
+      ).catch(() => undefined);
     },
+    5 * 60_000,
   );
 
   it(
-    'volume_min greater than counterparty volume_total → no match',
+    'volume_min greater than counterparty volume_max → no match',
     async () => {
       await cancelActiveIntents(alice);
       await cancelActiveIntents(bob);
@@ -325,14 +485,14 @@ describe('Edge cases', () => {
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 1000n,
-        volumeTotal: 5000n,
+        volumeMax: 5000n,
       });
       const bobId = await createIntent(bob, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
 
       const stillUnmatched = await intentsRemainUnmatched(

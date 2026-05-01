@@ -338,4 +338,139 @@ describe('SwapExecutor', () => {
       expect(executor.getActiveCount()).toBe(0);
     });
   });
+
+  // =========================================================================
+  // Round-5 audit fixes — registerSwapId escrow term-binding (H1, N2,
+  // CRITICAL wildcard skip) + EXECUTION_TIMEOUT rejectSwap (C3, N4)
+  // =========================================================================
+
+  describe('registerSwapId() — escrow term-binding (round-5 audit)', () => {
+    const ESCROW_DIRECT = 'DIRECT://' + 'e'.repeat(64);
+    const ESCROW_PUBKEY = 'e'.repeat(64);
+    const PROPOSER_PUBKEY = 'b'.repeat(64);
+
+    async function trackAcceptorDealWithEscrow(escrowAddr: string): Promise<DealRecord> {
+      const deal = makeDealRecord({
+        terms: {
+          proposer_pubkey: PROPOSER_PUBKEY,
+          acceptor_pubkey: AGENT_PUBKEY,
+          escrow_address: escrowAddr,
+        },
+      });
+      await executor.executeDeal(deal);
+      return deal;
+    }
+
+    it('CRITICAL — accepts proposal when negotiated escrow is "any" (wildcard)', async () => {
+      // The default escrow on intents is the wildcard sentinel 'any'.
+      // The trusted_escrows allowlist already enforced policy at NP-0
+      // negotiation time; the SDK-level binding should NOT reject the
+      // legitimate default-escrow flow.
+      await trackAcceptorDealWithEscrow('any');
+      const result = executor.registerSwapId('swap-1', {
+        partyACurrency: 'ALPHA',
+        partyAAmount: '10',
+        partyBCurrency: 'USDC',
+        partyBAmount: '500',
+        counterpartyPubkey: PROPOSER_PUBKEY,
+        escrowDirectAddress: ESCROW_DIRECT,
+        escrowPubkey: ESCROW_PUBKEY,
+      });
+      expect(result).toBe(true);
+    });
+
+    it('CRITICAL — accepts proposal when negotiated escrow is a nametag (@…)', async () => {
+      await trackAcceptorDealWithEscrow('@trusted-escrow');
+      const result = executor.registerSwapId('swap-2', {
+        partyACurrency: 'ALPHA',
+        partyAAmount: '10',
+        partyBCurrency: 'USDC',
+        partyBAmount: '500',
+        counterpartyPubkey: PROPOSER_PUBKEY,
+        escrowDirectAddress: ESCROW_DIRECT,
+        escrowPubkey: ESCROW_PUBKEY,
+      });
+      expect(result).toBe(true);
+    });
+
+    it('H1 — rejects proposal when concrete escrow does NOT match negotiated', async () => {
+      await trackAcceptorDealWithEscrow(ESCROW_DIRECT);
+      const result = executor.registerSwapId('swap-3', {
+        partyACurrency: 'ALPHA',
+        partyAAmount: '10',
+        partyBCurrency: 'USDC',
+        partyBAmount: '500',
+        counterpartyPubkey: PROPOSER_PUBKEY,
+        escrowDirectAddress: 'DIRECT://' + 'f'.repeat(64), // ROGUE
+        escrowPubkey: 'f'.repeat(64),
+      });
+      expect(result).toBe(false);
+    });
+
+    it('Round-5b — accepts when escrowDirectAddress matches regardless of escrowPubkey', async () => {
+      // Round-5b: the two SDK-reported fields (escrowDirectAddress AND
+      // escrowPubkey) come from the same getSwapStatus() call, NOT
+      // independent sources. They can't diverge under attacker
+      // manipulation. Once directMatches binds against the negotiated
+      // escrow, we've already detected any pivot. An earlier pass
+      // (round-5) wrongly required `DIRECT://${pubkey}` as a secondary
+      // clause via string concatenation — that's not how DIRECT
+      // addresses are derived (they're hashes via
+      // UnmaskedPredicateReference, not the raw pubkey). The earlier
+      // version false-rejected every legitimate proposal observed in
+      // basic-roundtrip 2026-04-29.
+      await trackAcceptorDealWithEscrow(ESCROW_DIRECT);
+      const result = executor.registerSwapId('swap-4', {
+        partyACurrency: 'ALPHA',
+        partyAAmount: '10',
+        partyBCurrency: 'USDC',
+        partyBAmount: '500',
+        counterpartyPubkey: PROPOSER_PUBKEY,
+        escrowDirectAddress: ESCROW_DIRECT,
+        escrowPubkey: 'f'.repeat(64), // raw bytes diff from DIRECT — fine
+      });
+      expect(result).toBe(true);
+    });
+
+    it('H1 — rejects on deposit_timeout_sec mismatch', async () => {
+      const deal = makeDealRecord({
+        terms: {
+          proposer_pubkey: PROPOSER_PUBKEY,
+          acceptor_pubkey: AGENT_PUBKEY,
+          escrow_address: ESCROW_DIRECT,
+          deposit_timeout_sec: 60,
+        },
+      });
+      await executor.executeDeal(deal);
+      const result = executor.registerSwapId('swap-5', {
+        partyACurrency: 'ALPHA',
+        partyAAmount: '10',
+        partyBCurrency: 'USDC',
+        partyBAmount: '500',
+        counterpartyPubkey: PROPOSER_PUBKEY,
+        escrowDirectAddress: ESCROW_DIRECT,
+        escrowPubkey: ESCROW_PUBKEY,
+        depositTimeoutSec: 300, // negotiated was 60
+      });
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('updateStrategy() — runtime strategy propagation (C1)', () => {
+    it('updates max_concurrent_swaps so subsequent executeDeal sees the new cap', async () => {
+      // Default deps.strategy.max_concurrent_swaps = 5; bring it to 1 so
+      // the 2nd executeDeal returns early.
+      executor.updateStrategy({ ...deps.strategy, max_concurrent_swaps: 1 });
+      const d1 = makeDealRecord({
+        terms: { deal_id: 'd-1', proposer_intent_id: 'i-1' },
+      });
+      const d2 = makeDealRecord({
+        terms: { deal_id: 'd-2', proposer_intent_id: 'i-2' },
+      });
+      await executor.executeDeal(d1);
+      await executor.executeDeal(d2);
+      // Only the first one progressed.
+      expect(executor.getActiveCount()).toBe(1);
+    });
+  });
 });

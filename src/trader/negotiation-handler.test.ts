@@ -202,7 +202,11 @@ describe('NegotiationHandler', () => {
 
       expect(deal.terms.proposer_pubkey).toBe(AGENT_PUBKEY);
       expect(deal.terms.acceptor_pubkey).toBe(COUNTERPARTY_PUBKEY);
-      expect(deal.terms.proposer_intent_id).toBe(ownIntent.intent.intent_id);
+      // DealTerms.proposer_intent_id carries the MARKET intent_id (UUID), not
+      // the local SHA-256 hash. Peers exchange the IDs they can see in market
+      // search results — the local intent_id is private to each side. The
+      // engine resolves either form via resolveIntentByEitherId.
+      expect(deal.terms.proposer_intent_id).toBe(ownIntent.intent.market_intent_id);
       expect(deal.terms.acceptor_intent_id).toBe(counterparty.id);
       expect(deal.terms.base_asset).toBe('ALPHA');
       expect(deal.terms.quote_asset).toBe('BRAVO');
@@ -363,6 +367,86 @@ describe('NegotiationHandler', () => {
       // No additional DM was sent — the rate-limited proposal was dropped
       // silently. Prevents 1:1 DoS amplification via this handler.
       expect((deps.sendDm as ReturnType<typeof vi.fn>).mock.calls.length).toBe(acceptCount);
+    });
+
+    // =====================================================================
+    // Global sybil-flood gate (basic-roundtrip flake fix, 2026-04-29)
+    //
+    // Per-peer rate-limit (3/60s/pubkey) prevents one peer from spamming,
+    // but does NOT bound a flood from N distinct sybil pubkeys each sending
+    // 1 propose_deal/min (under the per-peer cap). The new global gate
+    // (MAX_INBOUND_PROPOSALS_PER_MIN = 600) drops excess silently in the
+    // 60s rolling window, defending against the sybil scenario.
+    // =====================================================================
+
+    it('global gate caps inbound proposals from many distinct sybil pubkeys', async () => {
+      // 700 distinct sybil pubkeys, each sending exactly 1 proposal — well
+      // under the per-peer cap. Without the global gate, all 700 would
+      // pass validation. With the gate (cap=600), at most 600 are
+      // accepted; the remaining 100+ are dropped silently.
+      const ATTACK_COUNT = 700;
+      const baseSig = FIXED_SIGNATURE;
+      let processedCount = 0;
+
+      // Replace the dispatchToCallback hook so we can count successes.
+      // The simplest counter: count how many ACCEPTED deals exist after.
+      // Each unique acceptor_intent_id can hold ONE deal (duplicate-guard).
+      // To bypass duplicate-guard, give each sybil a distinct
+      // acceptor_intent_id-target via different proposer_intent_id values
+      // — wait, the duplicate-guard checks acceptor_intent_id. So each
+      // sybil targeting our SAME intent will be guard-rejected after the
+      // first. To isolate the rate-limit, count `verifySignature` calls
+      // (which run AFTER the rate-limit gate but BEFORE the duplicate
+      // guard). If the global gate works, verifySignature is called ≤600
+      // times; without it, 700 times.
+      (deps.verifySignature as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        processedCount++;
+        return true;
+      });
+
+      for (let i = 0; i < ATTACK_COUNT; i++) {
+        const sybilPubkey = '02' + i.toString(16).padStart(64, '0').slice(0, 64);
+        const sybilTerms = buildProposeDealTerms({
+          proposer_pubkey: sybilPubkey,
+          proposer_intent_id: `sybil-intent-${i}`,
+        });
+        // Build the message with sybilPubkey as sender directly (NpMessage
+        // properties are readonly so we can't reassign post-construction).
+        const sybilMsgBase = buildProposeDealMessage(sybilTerms);
+        const sybilMsg = {
+          ...sybilMsgBase,
+          sender_pubkey: sybilPubkey,
+          signature: baseSig,
+        };
+        await handler.handleIncomingDm(
+          sybilPubkey,
+          `direct-${i}`,
+          JSON.stringify(sybilMsg),
+        );
+      }
+
+      // The global gate caps verifySignature invocations to MAX (600). The
+      // signature check runs INSIDE handleIncomingDm BEFORE the global gate
+      // (envelope validation) — so verifySignature is called for every
+      // arriving message, not just accepted ones. Count instead the
+      // accepted-and-processed events: each sybil targets the same
+      // acceptor_intent_id, so duplicate-guard limits to 1 accepted plus
+      // (cap - 1) rejected-by-duplicate. Without global gate, 700
+      // duplicate-rejects + 1 accept. With gate, at most 600 reach the
+      // duplicate-guard logic; the remaining 100 are silently dropped.
+      // The simplest invariant: total dispatched (deps.sendDm) calls is
+      // bounded by the cap.
+      const sendDmCalls = (deps.sendDm as ReturnType<typeof vi.fn>).mock.calls.length;
+      // Each accepted-and-processed proposal sends 1 DM (accept or reject).
+      // So sendDm calls is ≤ MAX_INBOUND_PROPOSALS_PER_MIN (600).
+      expect(sendDmCalls).toBeLessThanOrEqual(600);
+      // Sanity: the count is also ≤ ATTACK_COUNT (no amplification).
+      expect(sendDmCalls).toBeLessThanOrEqual(ATTACK_COUNT);
+      // And note we did process SOMETHING (at least one accept) so the
+      // gate didn't shut everything down.
+      expect(sendDmCalls).toBeGreaterThan(0);
+      // Suppress unused-var warning for the counter.
+      void processedCount;
     });
   });
 

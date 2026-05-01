@@ -85,6 +85,16 @@ function okCreateIntentReply(intentId: string): TraderCtlResult {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default: getContainerLogs returns a sphere_initialized line AND an
+  // acp_listener_started line so both waitForReadyAddress() and
+  // waitForLogEvent('acp_listener_started') resolve on their first poll.
+  // Tests that need to exercise the timeout path override this with
+  // mockGetContainerLogs.
+  // Trader format: { event: '<name>', details: {...} }
+  mockGetContainerLogs.mockResolvedValue(
+    '{"event":"sphere_initialized","details":{"agent_address":"DIRECT://aa11bb22cc33dd44ee55ff6677889900112233445566778899aabbccddeeff00"}}\n' +
+    '{"event":"acp_listener_started"}\n',
+  );
 });
 
 // ===========================================================================
@@ -183,11 +193,15 @@ describe('provisionTrader', () => {
     mockWaitForContainerRunning.mockResolvedValue(true);
     // Always returns failure → poll exhausts
     mockRunTraderCtl.mockResolvedValue({ exitCode: 1, output: null, stderr: 'not ready' });
+    // Logs without sphere_initialized → waitForReadyAddress hits its timeout
+    // BEFORE probeReady is even reached. The cleanup invariant must hold for
+    // EITHER readiness failure mode (provisionTrader catches both into the
+    // same safeCleanup path). Accept either error message.
     mockGetContainerLogs.mockResolvedValue('boot logs here');
 
     await expect(
       provisionTrader({ label: 'ready-fail', readyTimeoutMs: 100 }),
-    ).rejects.toThrow(/did not become reachable/);
+    ).rejects.toThrow(/did not become reachable|did not log sphere_initialized/);
 
     expect(mockStopContainer).toHaveBeenCalledWith(container.id);
     expect(mockRemoveContainer).toHaveBeenCalledWith(container.id);
@@ -251,7 +265,7 @@ describe('createMatchingIntents', () => {
       rate_min: 100n,
       rate_max: 200n,
       volume_min: 10n,
-      volume_total: 1000n,
+      volume_max: 1000n,
     });
 
     expect(result.buyerIntentId).toBe('intent-buyer-1');
@@ -272,7 +286,7 @@ describe('createMatchingIntents', () => {
       '--rate-min', '100',
       '--rate-max', '200',
       '--volume-min', '10',
-      '--volume-total', '1000',
+      '--volume-max', '1000',
     ]);
     expect(buyerOpts.tenant).toBe(buyer.address);
     expect(buyerOpts.json).toBe(true);
@@ -291,7 +305,7 @@ describe('createMatchingIntents', () => {
       '--rate-min', '100',
       '--rate-max', '200',
       '--volume-min', '10',
-      '--volume-total', '1000',
+      '--volume-max', '1000',
     ]);
     expect(sellerOpts.tenant).toBe(seller.address);
     expect(sellerOpts.json).toBe(true);
@@ -314,7 +328,7 @@ describe('createMatchingIntents', () => {
         rate_min: 100n,
         rate_max: 200n,
         volume_min: 10n,
-        volume_total: 1000n,
+        volume_max: 1000n,
       }),
     ).rejects.toThrow(/buyer CREATE_INTENT not ok/);
   });
@@ -342,7 +356,7 @@ describe('createMatchingIntents', () => {
       rate_min: 100n,
       rate_max: 200n,
       volume_min: 10n,
-      volume_total: 1000n,
+      volume_max: 1000n,
     });
 
     expect(result.buyerIntentId).toBe('wrapped-buy');

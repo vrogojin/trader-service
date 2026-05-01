@@ -109,6 +109,30 @@ export interface TraderAgent {
   handleSwapFailed(swapId: string, reason: string): void;
   /** Get the current trading strategy. */
   getStrategy(): TraderStrategy;
+  /**
+   * Spec 7.9.3 (deposit idempotency): atomically mark a swapId as
+   * deposit-attempted and return whether this is the first time. The
+   * caller (swap:announced handler in main.ts) must check the result
+   * BEFORE calling sphere.swap.deposit() and skip the call if false.
+   *
+   * Persistence: the set is flushed to disk before the function returns,
+   * so a crash between the persist and the deposit() call (the only
+   * window the flag protects) results in the set knowing the deposit
+   * was attempted — on restart, swap:announced re-fires but markDepositAttempted
+   * returns false → deposit() not re-issued. The SDK's swap state is
+   * authoritative for deposit reception (so SWAP_WRONG_STATE catches the
+   * "already deposited" case from the SDK's side).
+   */
+  markDepositAttempted(swapId: string): Promise<boolean>;
+
+  /**
+   * Round-5: clear the deposit-attempted flag for a swap that has reached
+   * a terminal state (swap:completed / swap:failed / swap:cancelled).
+   * Called by the corresponding event handlers in main.ts so the
+   * persisted set doesn't grow without bound. Safe to call for swapIds
+   * that aren't in the set (no-op).
+   */
+  clearDepositAttempted(swapId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +167,13 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
   let negotiationHandler: NegotiationHandler | null = null;
   let swapExecutor: SwapExecutor | null = null;
   let acpListener: AcpListener | null = null;
+  /**
+   * Spec 7.9.3 deposit-attempted set. Loaded from disk at start(),
+   * persisted on every add via markDepositAttempted(). Surface for the
+   * caller (trader/main.ts swap:announced handler) which checks the
+   * boolean return from markDepositAttempted() before issuing deposit().
+   */
+  const depositAttempted: Set<string> = new Set();
 
   // Event unsubscribers collected during start()
   const unsubscribers: Array<() => void> = [];
@@ -254,6 +285,22 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         }
       }
 
+      // 3a. Spec 7.9.3: load the deposit-attempted set so the swap:announced
+      // handler doesn't re-issue deposit() for a swapId we already deposited
+      // on a previous lifetime. The SDK's SWAP_WRONG_STATE guard catches
+      // most cases, but defense-in-depth at the trader is the spec mandate.
+      try {
+        const persistedAttempts = await stateStore.loadDepositAttempted();
+        for (const swapId of persistedAttempts) {
+          depositAttempted.add(swapId);
+        }
+        logger.info('deposit_attempted_restored', { count: persistedAttempts.length });
+      } catch (err) {
+        logger.warn('deposit_attempted_restore_failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
       // 3. Create VolumeReservationLedger, restoring persisted reservations
       const getBalance = (coinId: string): bigint => payments.getConfirmedBalance(coinId);
       const serializedReservations = await stateStore.loadReservations();
@@ -303,16 +350,62 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         // intent engine as `__perCandidateVolume` (internal field).
         const withPerCandidate = counterparty as MarketSearchResult & { __perCandidateVolume?: bigint };
         const remainingVolume = ownIntent.intent.volume_max - ownIntent.intent.volume_filled;
-        const proposalVolume = withPerCandidate.__perCandidateVolume ?? remainingVolume;
-        if (proposalVolume <= 0n) {
-          logger.info('match_found_zero_volume_for_candidate', {
+        const myShare = withPerCandidate.__perCandidateVolume ?? remainingVolume;
+
+        // Cap to counterparty's [volume_min, volume_max] from the parsed
+        // description. The fan-out share is computed only from my own remaining
+        // capacity, so it can exceed the counterparty's max — which the
+        // receiver rejects as VOLUME_OUT_OF_RANGE. Take the intersection of
+        // both [vol_min, vol_max] ranges; if it's empty, abort the proposal.
+        const overlapMaxVol = myShare < parsed.volume_max ? myShare : parsed.volume_max;
+        const overlapMinVol = ownIntent.intent.volume_min > parsed.volume_min
+          ? ownIntent.intent.volume_min : parsed.volume_min;
+        if (overlapMaxVol < overlapMinVol || overlapMaxVol <= 0n) {
+          logger.info('match_found_no_volume_overlap', {
             intent_id: ownIntent.intent.intent_id,
             counterparty: counterparty.agentPublicKey,
-            remaining_volume: remainingVolume.toString(),
+            my_share: myShare.toString(),
+            cp_volume_min: parsed.volume_min.toString(),
+            cp_volume_max: parsed.volume_max.toString(),
+            own_volume_min: ownIntent.intent.volume_min.toString(),
           });
           return;
         }
-        const escrow = ownIntent.intent.escrow_address;
+        const proposalVolume = overlapMaxVol;
+        // Resolve a CONCRETE escrow address before proposing. Intents with
+        // escrow_address='any' (the default) advertise flexibility, but the
+        // np.propose_deal envelope MUST carry a real address: the receiver's
+        // trusted_escrows allowlist is matched as an exact string and 'any'
+        // never matches a real escrow's DIRECT://<pubkey>.
+        // Selection order:
+        //   1) own intent specifies a concrete escrow → use it
+        //   2) counterparty's intent specifies a concrete escrow that we also
+        //      trust → use it (maximises mutual-trust intersection)
+        //   3) fall back to our first trusted escrow
+        //   4) no trusted escrow at all → cannot propose, skip
+        let escrow = ownIntent.intent.escrow_address;
+        if (escrow === 'any' || escrow === '') {
+          const cpEscrow = parsed.escrow_address;
+          if (
+            cpEscrow !== '' &&
+            cpEscrow !== 'any' &&
+            strategy.trusted_escrows.includes(cpEscrow)
+          ) {
+            escrow = cpEscrow;
+          } else if (strategy.trusted_escrows.length > 0) {
+            const first = strategy.trusted_escrows[0];
+            if (first !== undefined) {
+              escrow = first;
+            }
+          }
+          if (escrow === 'any' || escrow === '') {
+            logger.warn('match_found_no_concrete_escrow', {
+              intent_id: ownIntent.intent.intent_id,
+              counterparty: counterparty.agentPublicKey,
+            });
+            return;
+          }
+        }
         await negotiationHandler.proposeDeal(
           ownIntent,
           counterparty,
@@ -322,6 +415,35 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         );
       };
 
+      // The DealRecord is symmetric across both peers — `proposer_intent_id`
+      // and `acceptor_intent_id` reference each side's own intent. When a
+      // callback runs locally we MUST update OUR intent, not always the
+      // proposer's, otherwise the acceptor's volume_filled never moves. The
+      // bug shows up most visibly in partial-fill scenarios where one side's
+      // intent should reflect a partial volume credit while the other side's
+      // intent fully fills.
+      //
+      // Returns null when neither pubkey matches ours — silently falling
+      // through to acceptor_intent_id on a malformed proposer_pubkey would
+      // re-introduce the silent-no-op bug this helper exists to fix
+      // (recordFill on a market_intent_id we don't own returns undefined,
+      // dropping the fill entirely). Callers must early-return on null.
+      const ourIntentId = (deal: DealRecord): string | null => {
+        const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
+        const weAreAcceptor = pubkeysEqual(deal.terms.acceptor_pubkey, agentPubkey);
+        if (!weAreProposer && !weAreAcceptor) {
+          logger.error('callback_unknown_role', {
+            deal_id: deal.terms.deal_id,
+            our_pubkey: agentPubkey,
+            proposer: deal.terms.proposer_pubkey,
+            acceptor: deal.terms.acceptor_pubkey,
+            note: 'malformed deal terms — neither pubkey matches us; cannot identify our intent',
+          });
+          return null;
+        }
+        return weAreProposer ? deal.terms.proposer_intent_id : deal.terms.acceptor_intent_id;
+      };
+
       const onDealAccepted: OnDealAccepted = async (deal: DealRecord) => {
         if (!swapExecutor || !ledger || !stateStore) return;
 
@@ -329,9 +451,25 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         // than proceed. Previously a failed reserve logged a warning and fell
         // through to proposeSwap, potentially over-committing volume across
         // concurrent deals. Now we cancel/fail the deal and release the intent.
+        // Reserve the asset we are obligated to DELIVER in this deal.
+        // Seller delivers base_asset; buyer delivers quote_asset.
+        const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
+        const proposerSells = deal.terms.proposer_direction === 'sell';
+        const weAreSeller =
+          (weAreProposer && proposerSells) || (!weAreProposer && !proposerSells);
+        const assetToReserve = weAreSeller ? deal.terms.base_asset : deal.terms.quote_asset;
+        // Seller delivers `volume` units of base; buyer delivers `volume*rate`
+        // units of quote. The previous reservation always used `volume` which
+        // under-reserved the quote side whenever rate>1 (e.g. rate=2 deal
+        // would reserve 100 USDU but actually owe 200 USDU on payout, leading
+        // to insufficient-funds failures during settlement).
+        const amountToReserve = weAreSeller
+          ? deal.terms.volume
+          : deal.terms.volume * deal.terms.rate;
+
         let reserved = false;
         try {
-          reserved = await ledger.reserve(deal.terms.base_asset, deal.terms.volume, deal.terms.deal_id);
+          reserved = await ledger.reserve(assetToReserve, amountToReserve, deal.terms.deal_id);
           if (reserved) {
             await stateStore.saveReservations(ledger.serialize());
           }
@@ -346,16 +484,17 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         if (!reserved) {
           logger.error('deal_volume_reservation_failed_aborting', {
             deal_id: deal.terms.deal_id,
-            base_asset: deal.terms.base_asset,
+            asset: assetToReserve,
             volume: deal.terms.volume.toString(),
           });
           // Fail the NP-0 deal so the counterparty sees it go terminal and the
           // intent is restored to ACTIVE rather than parked in MATCHING.
           if (negotiationHandler) {
-            negotiationHandler.failDeal(deal.terms.deal_id);
+            negotiationHandler.failDeal(deal.terms.deal_id, 'VOLUME_RESERVATION_FAILED');
           }
           if (intentEngine) {
-            intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+            const ourId = ourIntentId(deal);
+            if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
           return;
         }
@@ -392,10 +531,11 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
             }),
           );
           if (negotiationHandler) {
-            negotiationHandler.failDeal(deal.terms.deal_id);
+            negotiationHandler.failDeal(deal.terms.deal_id, `EXECUTE_DEAL_FAILED: ${msg}`);
           }
           if (intentEngine) {
-            intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+            const ourId = ourIntentId(deal);
+            if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
         }
       };
@@ -430,10 +570,11 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           );
           // Restore the intent so we can retry. Don't record the fill.
           if (intentEngine) {
-            intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+            const ourId = ourIntentId(deal);
+            if (ourId !== null) intentEngine.restoreToActive(ourId);
           }
           if (negotiationHandler) {
-            negotiationHandler.failDeal(deal.terms.deal_id);
+            negotiationHandler.failDeal(deal.terms.deal_id, 'PAYOUT_UNVERIFIED');
           }
           return;
         }
@@ -441,8 +582,28 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         ledger.release(deal.terms.deal_id);
         await stateStore.saveReservations(ledger.serialize());
 
+        // Record the fill on OUR intent. Wrapped in try/catch because
+        // recordFill -> transitionIntent -> assertTransition throws when the
+        // intent is in a state outside the allowed source list (e.g. user
+        // CANCELLED the intent mid-swap, or the intent already EXPIRED).
+        // Without the catch, the throw escapes onSwapCompleted before
+        // completeDeal can fire — the swap actually completed but the NP-0
+        // deal stays stuck in EXECUTING forever, surfacing as a "stuck deal"
+        // in LIST_SWAPS that operators can't reconcile.
         if (intentEngine) {
-          intentEngine.recordFill(deal.terms.proposer_intent_id, deal.terms.volume);
+          const ourId = ourIntentId(deal);
+          if (ourId !== null) {
+            try {
+              intentEngine.recordFill(ourId, deal.terms.volume);
+            } catch (err: unknown) {
+              logger.warn('record_fill_failed_post_complete', {
+                deal_id: deal.terms.deal_id,
+                intent_id: ourId,
+                error: err instanceof Error ? err.message : String(err),
+                note: 'intent in non-fillable state — proceeding with deal completion regardless',
+              });
+            }
+          }
         }
         // Transition the NP-0 deal to COMPLETED so LIST_SWAPS reflects it
         if (negotiationHandler) {
@@ -461,11 +622,15 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
 
         // Restore the intent to ACTIVE so it can be matched again
         if (intentEngine) {
-          intentEngine.restoreToActive(deal.terms.proposer_intent_id);
+          const ourId = ourIntentId(deal);
+          if (ourId !== null) intentEngine.restoreToActive(ourId);
         }
-        // Transition the NP-0 deal to FAILED so LIST_SWAPS reflects it
+        // Transition the NP-0 deal to FAILED so LIST_SWAPS reflects it,
+        // forwarding the reason from the swap-executor (e.g.
+        // EXECUTION_TIMEOUT, ESCROW_UNREACHABLE) so list-deals can show
+        // operators a distinguishing failure code without log archaeology.
         if (negotiationHandler) {
-          negotiationHandler.failDeal(deal.terms.deal_id);
+          negotiationHandler.failDeal(deal.terms.deal_id, reason);
         }
         logger.warn('swap_failed_reservation_released', { deal_id: deal.terms.deal_id, reason });
       };
@@ -528,15 +693,23 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         },
         getTrustedEscrows: () => strategy.trusted_escrows,
         onDealCancelled: (deal) => {
-          // When a deal is cancelled (e.g. proposal timeout to a dead counterparty),
-          // mark the counterparty as failed so the engine skips it on the next scan,
-          // then restore the intent to ACTIVE to try a different match.
-          // Detect which side we are to use the correct intent ID (steelman #5).
+          // Restore the intent to ACTIVE so the next scan cycle can re-match.
+          //
+          // We deliberately DO NOT call markCounterpartyFailed() on a plain
+          // CANCELLED deal. Cancellation reasons include:
+          //   - proposal timeout (counterparty unreachable — could be transient)
+          //   - AGENT_BUSY rejection (proposer-election race, fully recoverable)
+          //   - sibling-cancellation when another deal won proposer-election
+          // None of these justify permanently blacklisting the counterparty —
+          // and doing so caused a real deadlock when both sides happened to
+          // race fan-outs (carol's outgoing proposal got AGENT_BUSY-rejected
+          // because dave's incoming arrived first; carol then permanently
+          // blacklisted dave; carol's intent could never re-match dave). The
+          // 30s NP-0 PROPOSED-state timeout + spec 5.7 proposer-election are
+          // sufficient to break the race within one scan cycle. Permanent
+          // blacklisting belongs to higher-level signals (e.g. repeated
+          // verification failures) that aren't surfaced through this callback.
           if (!intentEngine) return;
-          // pubkeysEqual (not ===) because terms.*_pubkey may be in wire format
-          // (x-only from Nostr) while agentPubkey is SDK-canonical (compressed).
-          // A naive === misclassifies us as "unknown role" and the intent is
-          // never restored to ACTIVE — silent failure.
           const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
           const weAreAcceptor = pubkeysEqual(deal.terms.acceptor_pubkey, agentPubkey);
           if (!weAreProposer && !weAreAcceptor) {
@@ -551,10 +724,6 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           const ourIntentId = weAreProposer
             ? deal.terms.proposer_intent_id
             : deal.terms.acceptor_intent_id;
-          const theirPubkey = weAreProposer
-            ? deal.terms.acceptor_pubkey
-            : deal.terms.proposer_pubkey;
-          intentEngine.markCounterpartyFailed(ourIntentId, theirPubkey);
           intentEngine.restoreToActive(ourIntentId);
         },
         agentPubkey,
@@ -1088,15 +1257,20 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           strategy: capturedStrategy,
           agentPubkey,
           agentAddress,
-          // NOTE: Strategy mutation limitation — updating `strategy` here only
-          // affects the TraderCommandHandler's local copy and the persisted state.
-          // The IntentEngine and SwapExecutor capture the strategy reference at
-          // creation time and will NOT see runtime changes. An updateStrategy()
-          // method on IntentEngine/SwapExecutor would be needed for full propagation.
-          // This is out of scope for now but should be addressed in a future iteration.
+          // C1/W3 (steelman round-4): persist FIRST, then mutate. If the disk
+          // write fails, the in-memory strategy stays consistent with what's
+          // on disk — on restart the persisted (old) state loads cleanly. The
+          // previous order silently diverged in-memory from on-disk on
+          // partial-write failure. After successful persist, propagate to
+          // IntentEngine AND SwapExecutor so SET_STRATEGY actually takes
+          // effect at runtime (was: SwapExecutor's strategy was a frozen
+          // startup snapshot — `max_concurrent_swaps`/`trusted_escrows`
+          // changes never reached it).
           saveStrategy: async (s: TraderStrategy) => {
-            strategy = s;
             await capturedStateStore.saveStrategy(s);
+            strategy = s;
+            capturedIntentEngine.updateStrategy(s);
+            capturedSwapExecutor.updateStrategy(s);
           },
           withdraw,
           debugResolve: deps.debugResolve,
@@ -1272,6 +1446,59 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
 
     getStrategy(): TraderStrategy {
       return { ...strategy };
+    },
+
+    async markDepositAttempted(swapId: string): Promise<boolean> {
+      if (depositAttempted.has(swapId)) return false;
+      // Round-5: LRU cap on the in-memory set so a long-running tenant
+      // doesn't accumulate unbounded entries even if a code path forgets
+      // to call clearDepositAttempted on terminal states. The persisted
+      // file is also bounded by this cap (saveDepositAttempted dedups,
+      // load reads what was persisted).
+      const MAX_DEPOSIT_ATTEMPTED = 10_000;
+      if (depositAttempted.size >= MAX_DEPOSIT_ATTEMPTED) {
+        // Drop the oldest insertion (Set iteration order is insertion order).
+        const oldest = depositAttempted.values().next().value;
+        if (oldest !== undefined) depositAttempted.delete(oldest);
+      }
+      depositAttempted.add(swapId);
+      // Persist BEFORE returning so the caller (which is about to issue
+      // sphere.swap.deposit()) is guaranteed that a crash between mark and
+      // deposit() leaves the persisted set with this swapId.
+      try {
+        if (stateStore) {
+          await stateStore.saveDepositAttempted([...depositAttempted]);
+        }
+      } catch (err: unknown) {
+        // Persist failure is logged but doesn't block the deposit attempt.
+        // Worst case on crash: depositAttempted lost → swap:announced
+        // re-fires → deposit() retries → SDK's SWAP_WRONG_STATE guard
+        // prevents double-deposit. Same fallback as before, just less
+        // explicit.
+        logger.warn('deposit_attempted_persist_failed', {
+          swap_id: swapId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return true;
+    },
+
+    async clearDepositAttempted(swapId: string): Promise<void> {
+      if (!depositAttempted.has(swapId)) return;
+      depositAttempted.delete(swapId);
+      try {
+        if (stateStore) {
+          await stateStore.saveDepositAttempted([...depositAttempted]);
+        }
+      } catch (err: unknown) {
+        // Best-effort: even if the persist fails, the in-memory removal
+        // happened. The next markDepositAttempted call will rewrite the
+        // file with the corrected set.
+        logger.warn('deposit_attempted_clear_persist_failed', {
+          swap_id: swapId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   };
 }

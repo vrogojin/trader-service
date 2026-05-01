@@ -170,7 +170,13 @@ export interface NegotiationHandler {
   completeDeal(dealId: string): void;
 
   /** Transition a deal to FAILED (called when swap fails). */
-  failDeal(dealId: string): void;
+  /**
+   * Transition the deal to FAILED. Optional `errorCode` is persisted on
+   * the DealRecord so list-deals can surface a distinguishing reason
+   * (e.g. `EXECUTION_TIMEOUT`, `ESCROW_UNREACHABLE`, `PAYOUT_UNVERIFIED`,
+   * `PROPOSE_SWAP_FAILED: ...`).
+   */
+  failDeal(dealId: string, errorCode?: string): void;
 
   /** Get a deal record by ID. */
   getDeal(dealId: string): DealRecord | null;
@@ -402,6 +408,39 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
   // Per-counterparty rate limiting: pubkey → timestamps[]
   const rateLimits = new Map<string, number[]>();
 
+  // GLOBAL inbound propose_deal rate-limit (sybil-flood defense).
+  //
+  // The per-counterparty `rateLimits` Map prevents one peer from spamming us,
+  // but does NOT bound a flood of N distinct sybil identities each sending
+  // 1 propose_deal/minute (under the per-peer cap). At N=600+ pubkeys this
+  // saturates ECDSA verification CPU and bloats the DealRecord map.
+  //
+  // Defense: ring-buffer of recent inbound propose_deal arrival timestamps;
+  // before per-peer check, drop the message silently if we've already
+  // accepted MAX_INBOUND_PROPOSALS_PER_MIN in the trailing 60s window.
+  // 600/min = 10/sec — comfortably above any legitimate use (a busy trader
+  // with 10 active intents × 50 candidates × scan-interval-30s would see
+  // ~17/sec inbound; this cap is 60% above that worst-case legitimate
+  // scenario, with headroom for bursts).
+  const globalProposalTimestamps: number[] = [];
+  const MAX_INBOUND_PROPOSALS_PER_MIN = 600;
+  const GLOBAL_PROPOSAL_WINDOW_MS = 60_000;
+  let globalDropCount = 0;
+  function isGloballyRateLimited(): boolean {
+    const now = Date.now();
+    // Trim entries older than the window. Insertion order is ascending
+    // by arrival, so we can pop from the front.
+    while (globalProposalTimestamps.length > 0) {
+      const head = globalProposalTimestamps[0];
+      if (head === undefined || head >= now - GLOBAL_PROPOSAL_WINDOW_MS) break;
+      globalProposalTimestamps.shift();
+    }
+    return globalProposalTimestamps.length >= MAX_INBOUND_PROPOSALS_PER_MIN;
+  }
+  function recordGlobalProposal(): void {
+    globalProposalTimestamps.push(Date.now());
+  }
+
   // Round-13 F6: cap the number of reject DMs we send per deal_id. Without a
   // cap, a malicious counterparty can retry np.propose/accept/reject against
   // a CANCELLED deal many times and we'd send one reject DM per request — a
@@ -551,7 +590,11 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     return (allowed as readonly string[]).includes(to);
   }
 
-  async function transitionDeal(dealId: string, newState: DealState): Promise<DealRecord | null> {
+  async function transitionDeal(
+    dealId: string,
+    newState: DealState,
+    options?: { errorCode?: string },
+  ): Promise<DealRecord | null> {
     const deal = deals.get(dealId);
     if (!deal) return null;
     if (!isValidTransition(deal.state, newState)) {
@@ -566,6 +609,14 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       ...deal,
       state: newState,
       updated_at: Date.now(),
+      // Persist the failure reason ONLY on FAILED transitions. Other
+      // terminal states (CANCELLED, COMPLETED) carry their own
+      // counterparty-signed payloads (np.reject_deal / np.accept_deal +
+      // payout) which already encode the outcome; an error_code there
+      // would be redundant and possibly contradictory.
+      ...(newState === 'FAILED' && options?.errorCode !== undefined
+        ? { error_code: options.errorCode }
+        : {}),
     };
     deals.set(dealId, updated);
 
@@ -775,10 +826,13 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
   // Duplicate deal guard (spec Section 5.7)
   // -----------------------------------------------------------------------
 
-  function hasActiveDealForAcceptorIntent(acceptorIntentId: string): boolean {
+  // Check either role — the same intent must not participate in two concurrent
+  // non-terminal deals regardless of whether we are proposer or acceptor.
+  function hasActiveDealForIntent(ownIntentId: string): boolean {
     for (const deal of deals.values()) {
       if (
-        deal.terms.acceptor_intent_id === acceptorIntentId &&
+        (deal.terms.acceptor_intent_id === ownIntentId ||
+         deal.terms.proposer_intent_id === ownIntentId) &&
         !(TERMINAL_DEAL_STATES as readonly string[]).includes(deal.state)
       ) {
         return true;
@@ -867,6 +921,28 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       return;
     }
 
+    // GLOBAL sybil-flood gate (2026-04-29 fix): drop silently when the
+    // 60s rolling window has already accepted MAX_INBOUND_PROPOSALS_PER_MIN
+    // inbound proposals. Goes BEFORE the per-peer rate-limit so sybil
+    // pubkeys aren't recorded into the per-peer Map (which would consume
+    // memory under attack). Log every Nth drop to bound log volume.
+    if (isGloballyRateLimited()) {
+      globalDropCount++;
+      // Log every 50th drop, plus the first one in any sustained burst,
+      // to give operators a signal without flooding logs themselves.
+      if (globalDropCount === 1 || globalDropCount % 50 === 0) {
+        logger.warn('np_propose_deal_global_rate_limited', {
+          drop_count: globalDropCount,
+          window_ms: GLOBAL_PROPOSAL_WINDOW_MS,
+          cap: MAX_INBOUND_PROPOSALS_PER_MIN,
+          deal_id: msg.deal_id,
+          sender: msg.sender_pubkey,
+          note: 'global cap reached — sybil-flood defense triggered',
+        });
+      }
+      return;
+    }
+
     // F5: Rate-limit check FIRST, before any outbound response path (including
     // the UNKNOWN_INTENT reject DM below). Previously, a rate-limited attacker
     // could still trigger 1 inbound → 1 outbound amplification by supplying a
@@ -883,6 +959,15 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       return;
     }
     recordProposal(msg.sender_pubkey);
+    recordGlobalProposal();
+    // Reset the global drop counter on a successful accept — separates
+    // bursts from sustained attacks in the operator-visible log.
+    if (globalDropCount > 0) {
+      logger.info('np_propose_deal_global_rate_recovered', {
+        total_dropped: globalDropCount,
+      });
+      globalDropCount = 0;
+    }
 
     // Verify deal_id matches canonical JSON of terms
     const computedId = computeDealId(terms);
@@ -1008,8 +1093,8 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     // F5: rate-limit gate was moved to the top of handleProposeDeal so it
     // applies BEFORE any outbound reject DM can be emitted. Nothing to do here.
 
-    // Duplicate deal guard (spec 5.7)
-    if (hasActiveDealForAcceptorIntent(terms.acceptor_intent_id)) {
+    // Duplicate deal guard (spec 5.7) — reject if our intent is already live in any role
+    if (hasActiveDealForIntent(terms.acceptor_intent_id)) {
       logger.info('np_propose_deal_duplicate_guard', {
         deal_id: msg.deal_id,
         acceptor_intent_id: terms.acceptor_intent_id,
@@ -1428,7 +1513,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
 
     const terms: DealTerms = {
       deal_id: '', // placeholder, computed below
-      proposer_intent_id: ownIntent.intent.intent_id,
+      proposer_intent_id: ownIntent.intent.market_intent_id,
       acceptor_intent_id: counterparty.id,
       proposer_pubkey: agentPubkey,
       acceptor_pubkey: counterparty.agentPublicKey,
@@ -2043,11 +2128,13 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
         logger.warn('complete_deal_transition_failed', { deal_id: dealId, error: message });
       });
     },
-    failDeal(dealId: string): void {
-      transitionDeal(dealId, 'FAILED').catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.warn('fail_deal_transition_failed', { deal_id: dealId, error: message });
-      });
+    failDeal(dealId: string, errorCode?: string): void {
+      transitionDeal(dealId, 'FAILED', errorCode !== undefined ? { errorCode } : undefined).catch(
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn('fail_deal_transition_failed', { deal_id: dealId, error: message });
+        },
+      );
     },
     hydrateDeal(deal: DealRecord): void {
       // Round-21 F1: thin wrapper over hydrateDealAttempt for backwards

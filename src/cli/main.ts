@@ -162,8 +162,10 @@ function addCreateIntent(parent: Command): Command {
     .requiredOption('--rate-min <bigint>', 'Minimum acceptable rate (string-encoded bigint)')
     .requiredOption('--rate-max <bigint>', 'Maximum acceptable rate (string-encoded bigint)')
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
-    .requiredOption('--volume-total <bigint>', 'Total intent volume')
+    .requiredOption('--volume-max <bigint>', 'Maximum volume the intent will accept')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
+    .option('--escrow-address <address>', 'Escrow address for this intent (default: "any")')
+    .option('--deposit-timeout-sec <sec>', 'Override deposit timeout in seconds (default: 300). Lower for tests; production should keep the default.')
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -178,10 +180,18 @@ function addCreateIntent(parent: Command): Command {
         rate_min: local['rateMin'],
         rate_max: local['rateMax'],
         volume_min: local['volumeMin'],
-        volume_total: local['volumeTotal'],
+        volume_max: local['volumeMax'],
       };
-      if (local['expiryMs'] !== undefined) {
-        params['expiry_ms'] = Number.parseInt(local['expiryMs'], 10);
+      const expiryMs =
+        local['expiryMs'] !== undefined
+          ? Number.parseInt(local['expiryMs'], 10)
+          : 24 * 60 * 60 * 1000; // default 24h
+      params['expiry_sec'] = Math.floor(expiryMs / 1000);
+      if (local['escrowAddress'] !== undefined) {
+        params['escrow_address'] = local['escrowAddress'];
+      }
+      if (local['depositTimeoutSec'] !== undefined) {
+        params['deposit_timeout_sec'] = Number.parseInt(local['depositTimeoutSec'], 10);
       }
       await runCommand(opts, 'CREATE_INTENT', params);
     });
@@ -258,6 +268,12 @@ function addSetStrategy(parent: Command): Command {
     .option('--rate-strategy <strategy>', 'Rate strategy: aggressive|moderate|conservative')
     .option('--max-concurrent <n>', 'Max concurrent negotiations')
     .option('--trusted-escrows <list>', 'Comma-separated escrow addresses (overwrites)')
+    .option(
+      '--blocked-counterparties <list>',
+      'Comma-separated counterparty addresses or pubkeys to block (overwrites). ' +
+        'Pass empty string to clear. Engine filters matched intents whose ' +
+        'agent_pubkey is on this list before fan-out.',
+    )
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -268,6 +284,15 @@ function addSetStrategy(parent: Command): Command {
       }
       if (local['trustedEscrows'] !== undefined) {
         params['trusted_escrows'] = local['trustedEscrows'].split(',').map((s) => s.trim()).filter((s) => s !== '');
+      }
+      if (local['blockedCounterparties'] !== undefined) {
+        // Empty string is a valid "clear the list" signal — split('') on ''
+        // gives [''], which we filter out, leaving []. The handler accepts
+        // [] and replaces the strategy field.
+        params['blocked_counterparties'] = local['blockedCounterparties']
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '');
       }
       await runCommand(opts, 'SET_STRATEGY', params);
     });

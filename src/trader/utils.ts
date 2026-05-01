@@ -7,6 +7,7 @@
 
 import { createHash } from 'node:crypto';
 import type { CreateIntentParams } from './acp-types.js';
+import { isValidPubkey } from '../shared/crypto.js';
 import type { DealTerms, TradingIntent } from './types.js';
 export { hasDangerousKeys } from '../protocols/envelope.js';
 
@@ -224,18 +225,41 @@ export function validateIntentParams(params: CreateIntentParams): string | null 
 // Validation: DealTerms
 // ---------------------------------------------------------------------------
 
+/**
+ * Maximum rate / volume bigint accepted in DealTerms. 2^128 is well above
+ * any realistic monetary value (>3.4×10^38) yet far below where downstream
+ * SDK uint256 arithmetic risks truncation skew. Defends against a hostile
+ * counterparty proposing absurd values that pass the rate-range check on
+ * an intent with unbounded rate_max (legacy intent).
+ */
+const MAX_RATE = 2n ** 128n;
+const MAX_VOLUME = 2n ** 128n;
+
 export function validateDealTerms(terms: DealTerms): string | null {
   if (!terms.deal_id || typeof terms.deal_id !== 'string') return 'deal_id is required';
   if (!terms.proposer_intent_id) return 'proposer_intent_id is required';
   if (!terms.acceptor_intent_id) return 'acceptor_intent_id is required';
   if (!terms.proposer_pubkey) return 'proposer_pubkey is required';
   if (!terms.acceptor_pubkey) return 'acceptor_pubkey is required';
+  // SECURITY (M2): pubkey-shape validation. Defense-in-depth — downstream
+  // pubkeysEqual() returns false on non-hex which makes a passed-through
+  // garbage pubkey functionally inert today, but a refactor that loses
+  // pubkeysEqual on any callsite would silently restore the gap. Validate
+  // shape at the deal-terms boundary so this can't regress.
+  if (!isValidPubkey(terms.proposer_pubkey)) return 'proposer_pubkey has invalid shape';
+  if (!isValidPubkey(terms.acceptor_pubkey)) return 'acceptor_pubkey has invalid shape';
   if (!terms.proposer_address) return 'proposer_address is required';
   if (!terms.acceptor_address) return 'acceptor_address is required';
   if (!terms.base_asset) return 'base_asset is required';
   if (!terms.quote_asset) return 'quote_asset is required';
   if (terms.rate <= 0n) return 'rate must be positive';
+  // SECURITY (M3): upper bound on rate / volume. Hostile proposals with
+  // 2^256 values pass intent-range checks on legacy unbounded intents and
+  // produce 2^512 in downstream `rate * volume` arithmetic, where uint256
+  // truncation may corrupt the actual transferred amount.
+  if (terms.rate > MAX_RATE) return `rate exceeds maximum (${MAX_RATE})`;
   if (terms.volume <= 0n) return 'volume must be positive';
+  if (terms.volume > MAX_VOLUME) return `volume exceeds maximum (${MAX_VOLUME})`;
   if (terms.proposer_direction !== 'buy' && terms.proposer_direction !== 'sell') {
     return 'proposer_direction must be "buy" or "sell"';
   }
