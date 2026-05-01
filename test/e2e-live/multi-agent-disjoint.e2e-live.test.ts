@@ -32,6 +32,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   provisionTrader,
+  provisionTradersStaggered,
   provisionEscrow,
   type ProvisionedTenant,
 } from './helpers/tenant-fixture.js';
@@ -148,41 +149,44 @@ beforeAll(async () => {
     relayUrls: [...TESTNET.RELAYS],
     readyTimeoutMs: 180_000,
   });
-  // Sequential provisioning: 4 parallel nametag registrations against the same
-  // aggregator + relay set has tripped its rate-limit in prior runs (the third
-  // trader times out). Cost per trader is ~5–10s real time once warmed.
-  alice = await provisionTrader({
-    label: 'disjoint-alice',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
-  bob = await provisionTrader({
-    label: 'disjoint-bob',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
-  carol = await provisionTrader({
-    label: 'disjoint-carol',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
-  dave = await provisionTrader({
-    label: 'disjoint-dave',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
+  // Staggered-parallel provisioning — concurrent with a small kickoff delay
+  // between traders to avoid simultaneous nametag-registration hits on the
+  // aggregator (pure Promise.all has been observed to hang one of N traders
+  // at sphere init for ~3 minutes).
+  [alice, bob, carol, dave] = await provisionTradersStaggered([
+    () => provisionTrader({
+      label: 'disjoint-alice',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+    () => provisionTrader({
+      label: 'disjoint-bob',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+    () => provisionTrader({
+      label: 'disjoint-carol',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+    () => provisionTrader({
+      label: 'disjoint-dave',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+  ]);
 }, 900_000);
 
 afterAll(async () => {

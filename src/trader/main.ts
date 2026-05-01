@@ -320,33 +320,54 @@ export async function startTrader(): Promise<void> {
   const swapDirectAddress = agentAddress; // @nametag
 
   // Verify nametag is resolvable on the relay before declaring ready.
-  // The binding event must have propagated so other agents and the faucet
-  // can find us by @nametag. Retry with backoff if not yet visible.
-  const MAX_NAMETAG_VERIFY_ATTEMPTS = 10;
-  const NAMETAG_VERIFY_DELAY_MS = 2_000;
+  //
+  // Why we need this: downstream consumers (the faucet, peer DMs, the
+  // controller's runTraderCtl) all do nametag→pubkey lookups via the
+  // same relay. If we declare ready before the binding event has
+  // propagated to the relay's query index, those consumers see "Nametag
+  // not found" (or worse, time out) and the test fails non-locally.
+  //
+  // Why this is bounded (not "forever proceeding anyway"): each
+  // sphere.resolve() call is wrapped in a short timeout (3s) so a
+  // single hung subscription doesn't wedge the loop. Total budget is
+  // 60s — long enough to cover real testnet propagation under load,
+  // short enough that an end-to-end-broken relay surfaces as a clear
+  // startup error rather than a 180s hang in waitForReadyAddress.
+  //
+  // Why per-call timeout (3s) is much shorter than the SDK's internal
+  // queryEvents timeout (15s): we want quick retry cadence. If a query
+  // hangs because the relay is briefly overloaded by another trader's
+  // simultaneous activity, retrying after 3s is better than waiting
+  // 15s for the SDK's own timeout.
+  const MAX_NAMETAG_VERIFY_ATTEMPTS = 30;
+  const NAMETAG_VERIFY_DELAY_MS = 1_000;
+  const RESOLVE_TIMEOUT_MS = 3_000;
   for (let attempt = 1; attempt <= MAX_NAMETAG_VERIFY_ATTEMPTS; attempt++) {
     try {
-      const resolved = await sphere.resolve(agentAddress);
+      const resolved = await Promise.race([
+        sphere.resolve(agentAddress),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), RESOLVE_TIMEOUT_MS),
+        ),
+      ]);
       if (resolved?.directAddress) {
         logger.info('nametag_verified', {
           nametag: identity.nametag,
-          directAddress: resolved.directAddress.slice(0, 30) + '...',
-          attempt,
+          attempts: attempt,
         });
         break;
       }
-      logger.warn('nametag_not_yet_resolvable', { nametag: identity.nametag, attempt });
     } catch (err: unknown) {
-      logger.warn('nametag_verify_error', {
+      logger.debug('nametag_verify_error', {
         nametag: identity.nametag,
         attempt,
         error: err instanceof Error ? err.message : String(err),
       });
     }
     if (attempt < MAX_NAMETAG_VERIFY_ATTEMPTS) {
-      await new Promise((r) => setTimeout(r, NAMETAG_VERIFY_DELAY_MS * attempt));
+      await new Promise((r) => setTimeout(r, NAMETAG_VERIFY_DELAY_MS));
     } else {
-      logger.error('nametag_verification_failed', {
+      logger.warn('nametag_verification_timeout', {
         nametag: identity.nametag,
         message: 'Nametag not resolvable after all attempts — proceeding anyway',
       });

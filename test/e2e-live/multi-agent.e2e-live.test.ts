@@ -16,6 +16,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   provisionTrader,
+  provisionTradersStaggered,
   provisionEscrow,
   type ProvisionedTenant,
 } from './helpers/tenant-fixture.js';
@@ -159,34 +160,36 @@ beforeAll(async () => {
     relayUrls: [...TESTNET.RELAYS],
     readyTimeoutMs: 180_000,
   });
-  // Serialize trader provisioning: 3 parallel nametag registrations against the
-  // same aggregator+relay set tripped a rate limit (carol timing out at 180s while
-  // alice+bob completed in ~5s). Sequential adds ~30s for the third trader and
-  // is comfortably within the 600s beforeAll budget.
-  alice = await provisionTrader({
-    label: 'multi-alice',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
-  bob = await provisionTrader({
-    label: 'multi-bob',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
-  carol = await provisionTrader({
-    label: 'multi-carol',
-    trustedEscrows: [escrow.address],
-    relayUrls: [...TESTNET.RELAYS],
-    waitForReady: true,
-    readyTimeoutMs: 180_000,
-    fundFromFaucet: true,
-  });
+  // Staggered-parallel provisioning — concurrent with a small kickoff delay
+  // between traders to avoid simultaneous nametag-registration hits on the
+  // aggregator (pure Promise.all has been observed to hang one of N traders
+  // at sphere init for ~3 minutes).
+  [alice, bob, carol] = await provisionTradersStaggered([
+    () => provisionTrader({
+      label: 'multi-alice',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+    () => provisionTrader({
+      label: 'multi-bob',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+    () => provisionTrader({
+      label: 'multi-carol',
+      trustedEscrows: [escrow.address],
+      relayUrls: [...TESTNET.RELAYS],
+      waitForReady: true,
+      readyTimeoutMs: 180_000,
+      fundFromFaucet: true,
+    }),
+  ]);
 }, 600_000);
 
 afterAll(async () => {

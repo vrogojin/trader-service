@@ -105,8 +105,9 @@ const READY_POLL_INTERVAL_MS = 2_000;
 const READY_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_SCAN_INTERVAL_MS = 30_000;
 const DEFAULT_MAX_ACTIVE_INTENTS = 10;
-const FAUCET_RETRY_BASE_MS = 500;
-const FAUCET_MAX_ATTEMPTS = 3;
+const FAUCET_RETRY_BASE_MS = 1_000;
+const FAUCET_RETRY_CAP_MS = 8_000;
+const FAUCET_MAX_ATTEMPTS = 10;
 
 // ---------------------------------------------------------------------------
 // Controller wallet — shared across all provisionTrader / provisionEscrow
@@ -266,15 +267,26 @@ async function fundWithRetry(
     } catch (err) {
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
-      // Heuristic: only retry transient (5xx / network) errors. The peer
-      // worktree's funding.ts is expected to surface 4xx with a stable
-      // message we can pattern-match — for now, retry on any error short
-      // of an explicit 4xx string in the message.
-      if (/4\d\d/.test(msg)) {
+      // Retry transient errors (5xx, network, faucet nametag-resolution
+      // timeouts) but fast-fail on real 4xx client errors.
+      //
+      // Anchor the status detection to "Faucet returned <code>" — without
+      // anchoring, /4\d\d/ matches arbitrary "4xx" patterns inside random
+      // instance_ids surfaced in faucet error bodies (e.g. the substring
+      // `4909` in `tradere2eea4909558`), incorrectly classifying 5xx as
+      // 4xx and short-circuiting all retries.
+      const statusMatch = msg.match(/Faucet returned (\d{3})/);
+      const status = statusMatch ? Number(statusMatch[1]) : 0;
+      const isNametagPropagationRace =
+        /Nametag not found/i.test(msg) ||
+        /Nametag resolution timed out/i.test(msg);
+      const isClientError = status >= 400 && status < 500;
+      if (isClientError && !isNametagPropagationRace) {
         throw err;
       }
       if (attempt < FAUCET_MAX_ATTEMPTS) {
-        const backoff = FAUCET_RETRY_BASE_MS * 2 ** (attempt - 1);
+        const backoffRaw = FAUCET_RETRY_BASE_MS * 2 ** (attempt - 1);
+        const backoff = Math.min(backoffRaw, FAUCET_RETRY_CAP_MS);
         await new Promise((resolve) => setTimeout(resolve, backoff));
       }
     }
@@ -452,6 +464,46 @@ async function waitForReadyAddress(
 }
 
 /**
+ * Polls container logs for a JSON event line matching the given event name.
+ * Trader uses { event: '<name>' }; escrow uses pino { msg: '<name>' }. Returns
+ * true on first match, false on timeout.
+ */
+async function waitForLogEvent(
+  containerId: string,
+  eventName: string,
+  opts: { timeoutMs?: number; intervalMs?: number; logsLines?: number } = {},
+): Promise<boolean> {
+  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const intervalMs = opts.intervalMs ?? 1_500;
+  const logsLines = opts.logsLines ?? 500;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    let logs = '';
+    try {
+      logs = (await getContainerLogs(containerId, logsLines)) ?? '';
+    } catch {
+      /* container exited; fall through to retry */
+    }
+    for (const line of logs.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '' || trimmed[0] !== '{') continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (parsed['event'] === eventName || parsed['msg'] === eventName) {
+        return true;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+/**
  * End-to-end provision: wallet → optional faucet → docker run → wait for
  * RUNNING → optional readiness probe. See module docstring for invariants.
  */
@@ -502,14 +554,26 @@ export async function provisionTrader(
       timeoutMs: opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,
     });
 
-    // 6. Optional readiness probe
+    // 6. Optional readiness check.
+    //
+    // We previously did a DM-based probe (`runTraderCtl list-intents`) that
+    // bounced through Nostr. With multiple traders provisioning concurrently
+    // against a SINGLE testnet relay, the probe consumed precious relay
+    // subscription bandwidth — each probe spawned a fresh subprocess with
+    // its own Nostr connection, polled every 2s for 180s = up to 90 fresh
+    // subscriptions per trader. This was a major contributor to the
+    // observed relay "appears stale" warnings and provisioning timeouts.
+    //
+    // Now we read the container log for `acp_listener_started` — that's
+    // the trader's own canonical "I'm fully up" signal. The Nostr
+    // dependency is removed from the readiness check entirely. Downstream
+    // test ops (createIntent, list-intents, etc.) still use DMs and have
+    // their own retry budgets.
     const shouldWaitReady = internal.waitForReady ?? opts.waitForReady ?? true;
     if (shouldWaitReady) {
       const readyTimeout = opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
-      const ready = await pollUntil(() => probeReady(tenantAddress, controller), {
+      const ready = await waitForLogEvent(container.id, 'acp_listener_started', {
         timeoutMs: readyTimeout,
-        intervalMs: READY_POLL_INTERVAL_MS,
-        description: `trader ${opts.label} ready`,
       });
       if (!ready) {
         let logs = '';
@@ -519,7 +583,7 @@ export async function provisionTrader(
           /* best effort */
         }
         throw new Error(
-          `provisionTrader: trader ${opts.label} did not become reachable within ` +
+          `provisionTrader: trader ${opts.label} did not log acp_listener_started within ` +
             `${readyTimeout}ms. Logs: ${logs.slice(-2000)}`,
         );
       }
@@ -650,6 +714,40 @@ export async function provisionTrader(
     await safeCleanup({ walletDir, container });
     throw err;
   }
+}
+
+// ============================================================================
+// provisionTradersStaggered — concurrent provisioning with kickoff stagger
+// ============================================================================
+
+/**
+ * Provisions multiple traders sequentially.
+ *
+ * **Why sequential, not parallel:** the testnet's single Nostr relay is
+ * the bottleneck. When N traders run `Sphere.init` concurrently, all of
+ * them publish nametag binding events and then each does a self-verify
+ * `sphere.resolve()` query. The relay's queryEvents subscription queue
+ * serializes — under N>=3 concurrent load, queries time out at 15s and
+ * each trader's verify loop runs out of budget. We've seen all 3 traders
+ * hang at sphere_initialized for 180s under pure Promise.all.
+ *
+ * Sequential gives each trader's binding event time to propagate to the
+ * relay's query index before the next trader starts hitting it. Cost is
+ * ~30-60s per trader (dominated by sphere.init + verify); total wall
+ * time scales linearly with N.
+ *
+ * If the testnet relay's subscription throughput improves, this can be
+ * revisited as parallel-with-stagger.
+ */
+export async function provisionTradersStaggered(
+  factories: Array<() => Promise<ProvisionedTenant>>,
+): Promise<ProvisionedTenant[]> {
+  const results: ProvisionedTenant[] = [];
+  for (const factory of factories) {
+    if (factory === undefined) continue;
+    results.push(await factory());
+  }
+  return results;
 }
 
 // ============================================================================
