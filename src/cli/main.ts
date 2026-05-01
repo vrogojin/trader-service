@@ -165,6 +165,7 @@ function addCreateIntent(parent: Command): Command {
     .requiredOption('--volume-max <bigint>', 'Maximum volume the intent will accept')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
     .option('--escrow-address <address>', 'Escrow address for this intent (default: "any")')
+    .option('--deposit-timeout-sec <sec>', 'Override deposit timeout in seconds (default: 300). Lower for tests; production should keep the default.')
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -188,6 +189,9 @@ function addCreateIntent(parent: Command): Command {
       params['expiry_sec'] = Math.floor(expiryMs / 1000);
       if (local['escrowAddress'] !== undefined) {
         params['escrow_address'] = local['escrowAddress'];
+      }
+      if (local['depositTimeoutSec'] !== undefined) {
+        params['deposit_timeout_sec'] = Number.parseInt(local['depositTimeoutSec'], 10);
       }
       await runCommand(opts, 'CREATE_INTENT', params);
     });

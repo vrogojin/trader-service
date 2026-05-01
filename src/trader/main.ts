@@ -563,6 +563,21 @@ export async function startTrader(): Promise<void> {
       logger.warn('swap_deposit_no_swap_module', { swap_id: swapId, trigger });
       return;
     }
+    // Fault injection: skip deposit on BOTH event and poll triggers when
+    // TRADER_FAULT_SKIP_DEPOSITS=1 is set. Pre-2026-05-01 the check lived
+    // only in the swap:announced event handler; the poll-loop fallback
+    // (`trigger='poll'`) bypassed it and the fault was effectively a no-op
+    // for the acceptor side (where the SDK doesn't always fire
+    // swap:announced and the poll path is the canonical dispatcher).
+    // Hoisting the check here makes the fault honor both code paths.
+    if (process.env['TRADER_FAULT_SKIP_DEPOSITS'] === '1') {
+      logger.warn('fault_inject_deposit_skipped', {
+        swap_id: swapId,
+        trigger,
+        note: 'TRADER_FAULT_SKIP_DEPOSITS=1 — deposit() not called; counterparty will time out',
+      });
+      return;
+    }
     const swapMod = sphere.swap;
     if (depositInFlight.has(swapId)) {
       logger.debug('swap_deposit_already_in_flight', { swap_id: swapId, trigger });
@@ -1277,10 +1292,9 @@ export async function startTrader(): Promise<void> {
         );
       }
     }
-    const FAULT_SKIP_DEPOSITS = FAULT_SKIP_DEPOSITS_ENV;
-    if (FAULT_SKIP_DEPOSITS) {
+    if (FAULT_SKIP_DEPOSITS_ENV) {
       logger.warn('fault_inject_deposit_skip_enabled', {
-        note: 'trader will NOT deposit on swap:announced; downstream swaps will EXECUTION_TIMEOUT. Production deployments must NOT set TRADER_FAULT_SKIP_DEPOSITS.',
+        note: 'trader will NOT call deposit() (event OR poll trigger); downstream swaps will EXECUTION_TIMEOUT. Production deployments must NOT set TRADER_FAULT_SKIP_DEPOSITS.',
         network: NETWORK,
       });
     }
@@ -1291,13 +1305,9 @@ export async function startTrader(): Promise<void> {
     // gate dedups across both paths).
     sphereUnsubscribers.push(sphere.on('swap:announced' as SphereEventType, ((data: { swapId: string }) => {
       logger.info('swap_announced', { swap_id: data.swapId });
-      if (FAULT_SKIP_DEPOSITS) {
-        logger.warn('fault_inject_deposit_skipped', {
-          swap_id: data.swapId,
-          note: 'TRADER_FAULT_SKIP_DEPOSITS=1 — deposit() not called; counterparty will time out',
-        });
-        return;
-      }
+      // Fault-injection (TRADER_FAULT_SKIP_DEPOSITS=1) is enforced inside
+      // tryDepositForSwap — the check lives in one place to cover both
+      // event and poll triggers.
       void tryDepositForSwap(data.swapId, 'event').catch(() => {
         /* tryDepositForSwap logs internally */
       });
@@ -1423,12 +1433,20 @@ export async function startTrader(): Promise<void> {
       agent.handleSwapFailed(data.swapId, data.error);
     }) as Parameters<typeof sphere.on>[1]));
 
-    // Round-5: also subscribe swap:cancelled so the deposit-attempted set
-    // gets cleared on every terminal state.
+    // swap:cancelled — escrow declared the swap cancelled (typically because
+    // a counterparty's deposit didn't arrive within deposit_timeout_sec, but
+    // also for explicit escrow-side cancels). This is a terminal failure
+    // from the deal's perspective: we need to release the volume reservation
+    // and mark the deal FAILED so the intent can be re-matched. Without
+    // calling handleSwapFailed, the deal would stay in EXECUTING forever
+    // and the intent stuck in NEGOTIATING — the deposit-timeout e2e
+    // scenario hung at exactly this point pre-fix (alice's swap got
+    // cancelled, payout refund arrived, but deal record never transitioned).
     sphereUnsubscribers.push(sphere.on('swap:cancelled' as SphereEventType, ((data: { swapId: string }) => {
       logger.info('swap_cancelled', { swap_id: data.swapId });
       depositInFlight.delete(data.swapId);
       void agent.clearDepositAttempted(data.swapId).catch(() => {});
+      agent.handleSwapFailed(data.swapId, 'SWAP_CANCELLED');
     }) as Parameters<typeof sphere.on>[1]));
   }
 
