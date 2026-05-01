@@ -216,7 +216,7 @@ async function intentsRemainUnmatched(
   // produce a deal or not.
   await new Promise((r) => setTimeout(r, quietWindowMs));
 
-  for (const [tenant, intentId, otherAddr] of [
+  for (const [tenant, , otherAddr] of [
     [tenantA, intentIdA, tenantB.address] as const,
     [tenantB, intentIdB, tenantA.address] as const,
   ]) {

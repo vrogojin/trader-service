@@ -101,8 +101,6 @@ export interface InternalProvisionOptions extends ProvisionTraderOptions {
 }
 
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
-const READY_POLL_INTERVAL_MS = 2_000;
-const READY_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_SCAN_INTERVAL_MS = 30_000;
 const DEFAULT_MAX_ACTIVE_INTENTS = 10;
 const FAUCET_RETRY_BASE_MS = 1_000;
@@ -354,31 +352,6 @@ function buildContainerEnv(
         }
       : {}),
   };
-}
-
-/**
- * Probe the trader by sending a `list-intents` command via trader-ctl. Returns
- * true once the trader replies ok; false on any error or non-ok response. The
- * outer loop interprets false as "not yet" and keeps polling.
- *
- * Why list-intents and not status: STATUS is in the trader's
- * SYSTEM_ONLY_COMMANDS allowlist (manager-only — see acp-listener.ts:367).
- * Controllers like trader-ctl get UNAUTHORIZED on STATUS by design. We use
- * LIST_INTENTS as a controller-accessible "is the engine alive?" probe.
- */
-async function probeReady(tenantAddress: string, controller: ControllerWallet): Promise<boolean> {
-  try {
-    const result = await runTraderCtl('list-intents', [], {
-      tenant: tenantAddress,
-      timeoutMs: READY_PROBE_TIMEOUT_MS,
-      json: true,
-      dataDir: controller.dataDir,
-      tokensDir: controller.tokensDir,
-    });
-    return result.exitCode === 0;
-  } catch {
-    return false;
-  }
 }
 
 /**

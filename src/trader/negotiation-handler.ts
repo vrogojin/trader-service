@@ -430,7 +430,9 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     const now = Date.now();
     // Trim entries older than the window. Insertion order is ascending
     // by arrival, so we can pop from the front.
-    while (globalProposalTimestamps.length > 0 && globalProposalTimestamps[0]! < now - GLOBAL_PROPOSAL_WINDOW_MS) {
+    while (globalProposalTimestamps.length > 0) {
+      const head = globalProposalTimestamps[0];
+      if (head === undefined || head >= now - GLOBAL_PROPOSAL_WINDOW_MS) break;
       globalProposalTimestamps.shift();
     }
     return globalProposalTimestamps.length >= MAX_INBOUND_PROPOSALS_PER_MIN;
