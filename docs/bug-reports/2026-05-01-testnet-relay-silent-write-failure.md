@@ -19,6 +19,24 @@
 
 The testnet Nostr relay accepts WebSocket connections and serves historical queries normally, but **silently drops every event publish** without sending an `OK` or `NOTICE` response. Clients see no error and assume the publish succeeded; the events never appear in subsequent queries. This breaks all flows that depend on freshly-published events propagating to the relay (most notably nametag binding events, kind:30078).
 
+## NOT a capacity issue
+
+The relay degrades severely under **trivial load** — empirically, ~25 trader containers + 5 escrows (i.e. ~30 long-lived WebSocket connections) is enough to cause:
+- Silent publish failures (events never indexed)
+- Query response time blowing up from ~150ms baseline to 5-7+ seconds, or no response at all
+- Subscriptions that go silent without a `CLOSED`/`NOTICE` notification
+
+Public Nostr relays (e.g. `nostr.wine`, `relay.damus.io`, `relay.nostr.band`) routinely handle **hundreds to thousands** of concurrent connections without these symptoms. nostr-rs-relay is generally capable of the same. **30 connections is not "load"** — it's three orders of magnitude below normal Nostr relay capacity.
+
+This points to one of:
+- Internal database write/index bug (events accepted at the protocol layer but not persisted/indexed)
+- Subscription handler that doesn't clean up dead subs and runs out of slots
+- Resource limit set to an unreasonably low value in the relay's config (e.g. `max_subscriptions = 1`)
+- DB lock contention in v0.9.0 (this is an old version — current nostr-rs-relay is significantly later)
+- Underlying VM I/O / memory / file-descriptor exhaustion that's not surfaced in any client-visible error
+
+The version exposed in NIP-11 is `nostr-rs-relay v0.9.0`. Current upstream is several minor versions ahead with bug fixes and config improvements.
+
 ## Impact
 
 - **Trader/escrow provisioning fails** in `trader-service` e2e-live tests — published `nametag_binding` events are dropped, faucet returns `400 "Nametag not found"` when looking up the trader.
