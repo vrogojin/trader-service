@@ -5,7 +5,13 @@
 **Software:** `nostr-rs-relay v0.9.0`
 **Severity:** P0 — blocks all testnet e2e flows that depend on Nostr (trader/escrow provisioning, faucet nametag resolution, peer DMs requiring nametag binding)
 **First observed:** 2026-04-30 ~21:31 UTC (last accepted kind:30078 event timestamp)
-**Confirmed still broken:** 2026-05-01 07:39 UTC (~10 hours later)
+
+## Status timeline
+
+- **2026-04-30 ~21:31 UTC** — relay stopped accepting writes. Silent: no `OK`/`NOTICE` returned to publishers. Reads still served.
+- **2026-05-01 ~10:45 UTC** — writes start succeeding again. `OK ... true` returned. Reads remain healthy. Partial-fill e2e passes in 45s as expected.
+- **2026-05-01 ~13:00 UTC** — second degradation begins. Reads work but slowly: queries that returned in 177ms earlier now take 5–7 seconds for a single event. The SDK's 5s `queryWithFirstSeenWins` default timeout fires before the response arrives → `resolveNametag()` returns null → `sendDM()` throws `INVALID_RECIPIENT` → every `np.propose_deal` fails. Tests that retry indefinitely (25-min budgets) eventually succeed; tighter-budget tests hit the wall.
+- **2026-05-01 ~15:50 UTC** — third degradation. Relay no longer responds to queries within 8s at all. End-to-end blocked again.
 
 ---
 
