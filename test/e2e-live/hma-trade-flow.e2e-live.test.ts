@@ -55,6 +55,8 @@ import {
   setStrategy,
   portfolio,
   listIntents,
+  createIntent,
+  cancelIntent,
 } from './helpers/sphere-trader.js';
 
 const cliProbe: SphereCliProbe = probeSphereCli();
@@ -212,28 +214,61 @@ describe.skipIf(skip)('HMA-orchestrated trade-flow control plane (live testnet)'
     //    (newly-spawned trader has no intents yet). This exercises
     //    the read path on a known state.
     console.log('[hma-trade-flow] list-intents on Alice (empty)…');
-    const aliceIntents = listIntents({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: aliceAddr });
-    expect(aliceIntents).toEqual([]);
+    const aliceIntentsBefore = listIntents({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: aliceAddr });
+    expect(aliceIntentsBefore).toEqual([]);
 
-    // create-intent / cancel-intent / list-deals would round out
-    // this test, but sphere-cli's `handleCreateIntent` currently
-    // sends `expiry_ms` over the wire while trader-service's ACP
-    // schema requires `expiry_sec`. The trader rejects with
-    // INVALID_PARAM ("expiry_sec must be a finite number"). This
-    // is a one-line fix in sphere-cli (divide by 1000 + rename the
-    // wire param) — tracked as a follow-up sphere-cli PR. Once
-    // that lands, extend this test to:
-    //   - createIntent on Alice (buy) → intent_id captured
-    //   - createIntent on Bob (sell, matching) → intent_id captured
-    //   - listIntents on each — verify both are visible and
-    //     non-terminal
-    //   - cancelIntent on Alice
-    //   - listIntents on Alice — verify state=CANCELLED
+    // 5. Alice posts a buy intent. Use small bigint values so we
+    //    don't accidentally match any real testnet activity (this
+    //    test isn't asserting settlement — just that the trader
+    //    accepts and records the intent).
+    console.log('[hma-trade-flow] Alice posts buy intent…');
+    const aliceIntent = createIntent({
+      cliPath: s.cliPath, cliHome: s.cliHome, tenant: aliceAddr,
+      direction: 'buy',
+      baseAsset: 'UCT',
+      quoteAsset: 'USDU',
+      rateMin: 100n,
+      rateMax: 200n,
+      volumeMin: 10n,
+      volumeMax: 100n,
+      expiryMs: 60_000, // 1-minute expiry
+    });
+    expect(aliceIntent.intentId).toMatch(/^[a-zA-Z0-9_-]+$/);
+    console.log(`[hma-trade-flow] Alice intent: ${aliceIntent.intentId}`);
+
+    // 6. list-intents on Alice — the just-posted intent must be
+    //    visible. State could be CREATED / MATCHING / NEGOTIATING;
+    //    just check it's NOT yet a terminal state.
+    console.log('[hma-trade-flow] list-intents on Alice (after post)…');
+    const aliceIntentsAfter = listIntents({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: aliceAddr });
+    const aliceMatch = aliceIntentsAfter.find((i) => i.intent_id === aliceIntent.intentId);
+    expect(aliceMatch).toBeDefined();
+    expect(aliceMatch!.state).not.toBe('CANCELLED');
+    expect(aliceMatch!.state).not.toBe('EXPIRED');
+
+    // 7. Cancel Alice's intent.
+    console.log('[hma-trade-flow] cancel-intent on Alice…');
+    cancelIntent({
+      cliPath: s.cliPath, cliHome: s.cliHome, tenant: aliceAddr,
+      intentId: aliceIntent.intentId,
+    });
+
+    // 8. list-intents on Alice again — the intent is now CANCELLED.
+    console.log('[hma-trade-flow] verifying Alice intent CANCELLED…');
+    const aliceIntentsCancelled = listIntents({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: aliceAddr });
+    const aliceCancelMatch = aliceIntentsCancelled.find((i) => i.intent_id === aliceIntent.intentId);
+    expect(aliceCancelMatch).toBeDefined();
+    expect(aliceCancelMatch!.state).toBe('CANCELLED');
+
     // A separate file `hma-trade-settlement.e2e-live.test.ts`
-    // would add the swap-completion flow (faucet-fund both
-    // traders, post matching intents, wait for COMPLETED on both
-    // sides, assert balances reflect the swap).
+    // (future) will cover the full swap-completion flow:
+    // faucet-fund both traders, post matching intents, wait for
+    // both sides to reach COMPLETED, assert balances reflect the
+    // swap. That requires testnet faucet quota + ~5-10 minutes
+    // of real-time settlement and is intentionally out of scope
+    // for this test, which validates the create/list/cancel
+    // CLI surface on its own.
 
-    console.log('[hma-trade-flow] CLI surfaces verified (set-strategy, portfolio, list-intents)');
+    console.log('[hma-trade-flow] CLI surfaces verified (set-strategy, portfolio, list-intents, create-intent, cancel-intent)');
   }, 600_000); // 10 min — 9 sequential CLI round-trips on testnet
 });
