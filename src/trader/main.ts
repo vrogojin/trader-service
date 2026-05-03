@@ -383,6 +383,26 @@ export async function startTrader(): Promise<void> {
     accounting: sphere.accounting !== null,
   });
 
+  // Enable global auto-return on every terminated invoice this wallet is a
+  // target of. The SDK's AccountingModule tracks each payer's contribution to
+  // an invoice independently and, on `closeInvoice`, refunds any surplus
+  // (`coveredAmount > requestedAmount`) back to each over-paying party at
+  // either their `refundAddress` or `senderAddress`. Without this flag set,
+  // surplus stays orphaned on our wallet until manually reconciled.
+  //
+  // Why global: the trader receives many payout invoices over its lifetime
+  // (one per completed deal). Setting per-invoice would require us to call
+  // `setAutoReturn(invoiceId, true)` on every imported payout invoice — a
+  // brittle contract. Global is fire-and-forget.
+  //
+  // Why fail-fast: if AccountingModule can't persist auto-return settings,
+  // its storage layer is broken and downstream invoice operations would also
+  // fail in unpredictable ways. Better to surface the failure at startup.
+  if (sphere.accounting) {
+    await sphere.accounting.setAutoReturn('*', true);
+    logger.info('accounting_auto_return_enabled');
+  }
+
   // ---------------------------------------------------------------------------
   // PaymentsAdapter — wraps sphere.payments
   // ---------------------------------------------------------------------------
