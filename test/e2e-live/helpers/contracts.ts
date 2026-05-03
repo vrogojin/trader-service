@@ -1,24 +1,47 @@
 /**
  * E2E-live test infrastructure contracts.
  *
- * Five worktrees are filling in the helper modules in parallel; this file
- * pins down their EXPORTED shapes so each can compile and test against the
- * contract while peer impls land. Once all impls are in, this file becomes
- * a stable interface registry — useful for understanding the harness without
+ * This file pins the EXPORTED shapes of the helper modules so each can
+ * compile and test against the contract independently. It's a stable
+ * interface registry — useful for understanding the harness without
  * reading every helper.
  *
- * Architecture (the model the user actually wants for partner demos):
+ * Two architectures coexist in this directory during the in-progress
+ * migration to HMA-orchestrated tests (see SPHERE-CLI-EXTRACTION-PLAN
+ * §6.4 in agentic-hosting):
  *
- *   Test                 → uses --                              docker-helpers
- *     │                                                              │
- *     ├── tenant-fixture (provisions traders) ─── docker run ────────┘
- *     │
- *     └── trader-ctl-driver (drives commands) ─── DM ──→ trader tenant
+ *   ARCHITECTURE A — direct-docker (legacy, scheduled for removal):
  *
- *   Crucially: NO host-manager, NO HMCP. Tests provision containers
- *   directly via the Docker daemon and drive trading via trader-ctl. This
- *   matches the production architecture where agentic-hosting only
- *   orchestrates LIFECYCLE; trading happens controller ↔ tenant directly.
+ *     Test
+ *       ├── tenant-fixture (provisions traders) ─── docker run ─→ container
+ *       └── trader-ctl-driver (drives commands)  ─── ACP DM ────→ tenant
+ *
+ *     The tests in this flavor (basic-roundtrip, multi-agent, surplus-
+ *     refund, etc.) bypass the Host Manager Agent (HMA) and call the
+ *     local Docker daemon directly. This was correct before
+ *     agentic-hosting Phase 5 shipped DM transport for the HMA — the
+ *     HMA simply couldn't be driven over DMs. As of agentic-hosting
+ *     PR #22 (merged 2026-05-03), it can.
+ *
+ *   ARCHITECTURE B — HMA-orchestrated (target architecture):
+ *
+ *     Test
+ *       ├── manager-process (spawns HMA)            ─── subprocess ─→ HMA
+ *       ├── hma-spawn (sphere host spawn|list|stop) ─── HMCP DM ────→ HMA
+ *       │                                                              │
+ *       │                                                  docker create
+ *       │                                                              ↓
+ *       │                                                          tenant
+ *       └── trader-ctl-driver / sphere trader …     ─── ACP DM ────→ tenant
+ *
+ *     The HMA owns lifecycle; trade ops still go controller→tenant
+ *     directly so tenants stay host-agnostic. Existing direct-docker
+ *     tests are migrated to this flavor incrementally; new tests
+ *     should follow Architecture B (see hma-orchestrated.e2e-live.test.ts).
+ *
+ * The interfaces declared in this file (DockerContainer, runContainer,
+ * etc.) are part of Architecture A and will be deprecated once all
+ * direct-docker tests are migrated.
  */
 
 // ============================================================================

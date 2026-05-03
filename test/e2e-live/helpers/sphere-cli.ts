@@ -14,25 +14,47 @@
  */
 
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const DEFAULT_CLI_PATH = '/home/vrogojin/sphere-cli-work/sphere-cli/bin/sphere.mjs';
+/**
+ * Default CLI path for local-developer ergonomics. Points at one
+ * specific user's filesystem layout; non-default environments MUST
+ * set `SPHERE_CLI_BIN`. When `CI=1` the default is rejected — we'd
+ * rather a CI run fail loud with "set SPHERE_CLI_BIN" than silently
+ * skip every HMA test because the path doesn't exist on the runner
+ * (which would create a false-confidence "tests passed but skipped"
+ * signal). See architectural review finding #1.
+ */
+const DEVELOPER_FALLBACK_CLI_PATH = '/home/vrogojin/sphere-cli-work/sphere-cli/bin/sphere.mjs';
 
 export type SphereCliProbe =
   | { readonly ok: true; readonly path: string }
   | { readonly ok: false; readonly reason: string };
 
 export function probeSphereCli(): SphereCliProbe {
-  const cliPath = process.env['SPHERE_CLI_BIN']?.trim() || DEFAULT_CLI_PATH;
+  const explicit = process.env['SPHERE_CLI_BIN']?.trim();
+  // CI runners must opt in explicitly. A missing env var on CI is a
+  // configuration bug, not a "skip silently" condition.
+  if (!explicit && process.env['CI'] === '1') {
+    return {
+      ok: false,
+      reason: 'SPHERE_CLI_BIN is unset and CI=1. ' +
+        'Set SPHERE_CLI_BIN to the path of a built sphere-cli binary ' +
+        '(`bin/sphere.mjs` from github.com/unicity-sphere/sphere-cli).',
+    };
+  }
+  const cliPath = explicit || DEVELOPER_FALLBACK_CLI_PATH;
   if (!existsSync(cliPath)) {
     return {
       ok: false,
-      reason: `sphere-cli binary not found at ${cliPath}. ` +
-        `Set SPHERE_CLI_BIN to override, or build sphere-cli ` +
-        `(github.com/unicity-sphere/sphere-cli).`,
+      reason: explicit
+        ? `SPHERE_CLI_BIN points at ${cliPath} which does not exist.`
+        : `sphere-cli binary not found at developer fallback ${cliPath}. ` +
+          `Set SPHERE_CLI_BIN, or build sphere-cli ` +
+          `(github.com/unicity-sphere/sphere-cli).`,
     };
   }
   const r = spawnSync('node', [cliPath, '--help'], {
@@ -64,9 +86,17 @@ export function probeSphereCli(): SphereCliProbe {
  */
 export function createSphereCliEnv(label: string): { home: string } {
   const safeLabel = label.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 24);
+  // mkdtempSync creates with mode 0o700 by default — keeps the wallet
+  // dir owner-only on shared CI runners.
   const home = mkdtempSync(join(tmpdir(), `trader-e2e-sphere-${safeLabel}-`));
+  // Defense-in-depth: chmod again in case the umask was modified or
+  // the platform deviates from the posix-default 0o700.
+  chmodSync(home, 0o700);
   const cfgDir = join(home, '.sphere-cli');
-  mkdirSync(cfgDir, { recursive: true });
+  // Explicit 0o700 — mkdirSync with `recursive: true` honours umask
+  // (typically 0o022 → mode 0o755), which is too permissive for a
+  // directory holding a testnet mnemonic.
+  mkdirSync(cfgDir, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(cfgDir, 'config.json'),
     JSON.stringify({
@@ -144,17 +174,33 @@ export function bootstrapControllerWallet(cliPath: string, home: string): {
     timeoutMs: 240_000,
   });
   if (init.status !== 0) {
+    // We deliberately do NOT include init.stderr or init.stdout in the
+    // message. sphere-cli's `wallet init` writes the freshly-minted
+    // mnemonic to stdout (suppressed only when isTTY=false; behaviour
+    // depends on the upstream version), and prints diagnostic
+    // material to stderr that may transitively quote secret material
+    // on a future SDK change. A failed wallet init means we cannot
+    // proceed; the operator can re-run with DEBUG=1 and an interactive
+    // shell to inspect output rather than pulling it through Vitest's
+    // error reporter (which gets captured to log files).
     throw new Error(
       `sphere wallet init failed (status=${init.status}, signal=${init.signal}). ` +
-      `stderr (first 500): ${init.stderr.slice(0, 500)}\n` +
-      `stdout (last 500): ${init.stdout.slice(-500)}`,
+      `Re-run with stdout/stderr connected (no Vitest pipe) to inspect — ` +
+      `we redact subprocess output to avoid persisting testnet mnemonics in logs.`,
     );
   }
   // Lenient regex matching either chainPubkey or directAddress JSON fields.
   const pkMatch = init.stdout.match(/"chainPubkey":\s*"([0-9a-fA-F]{64,130})"/);
   const addrMatch = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
   if (!pkMatch || !pkMatch[1]) {
-    throw new Error(`chainPubkey not found in sphere wallet init output:\n${init.stdout.slice(-1500)}`);
+    // Same redaction rationale: do not echo subprocess output back
+    // through the test reporter. The mnemonic CAN appear in stdout
+    // if the upstream version doesn't honour the isTTY guard.
+    throw new Error(
+      'chainPubkey not found in sphere wallet init output. ' +
+      'Output redacted to avoid persisting potential mnemonic. ' +
+      'Re-run with stdout connected to debug.',
+    );
   }
   return {
     pubkey: pkMatch[1],

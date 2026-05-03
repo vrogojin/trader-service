@@ -210,5 +210,17 @@ export function hostList(
     throw new Error(`sphere host list --json: no JSON object found. stdout: ${result.stdout.slice(0, 500)}`);
   }
   const obj = JSON.parse(result.stdout.slice(start, end + 1)) as { payload?: { instances?: HostListInstance[] } };
-  return obj.payload?.instances ?? [];
+  // Throw on a structurally-malformed payload rather than silently
+  // returning []. A list_result missing `payload.instances` is a
+  // protocol contract violation (or a future field rename); pretending
+  // it means "zero instances" would let an asserts-3-RUNNING test
+  // pass with a misleading "expected 3, got 0" instead of pointing at
+  // the real fault. Mirrors hostSpawn's strict parsing.
+  if (!obj.payload || !Array.isArray(obj.payload.instances)) {
+    throw new Error(
+      `sphere host list --json: response missing payload.instances. ` +
+      `Got: ${JSON.stringify(obj).slice(0, 500)}`,
+    );
+  }
+  return obj.payload.instances;
 }

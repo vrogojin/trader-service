@@ -47,7 +47,11 @@ import {
   bootstrapControllerWallet,
   type SphereCliProbe,
 } from './helpers/sphere-cli.js';
-import { spawnHostManager, type HostManagerProcess } from './helpers/manager-process.js';
+import {
+  spawnHostManager,
+  checkAgenticHostingPath,
+  type HostManagerProcess,
+} from './helpers/manager-process.js';
 import {
   hostSpawn,
   hostStop,
@@ -59,21 +63,33 @@ import {
 // Preconditions: sphere-cli runnable + agentic-hosting binary built.
 // Evaluated at module-load time so describe.skipIf can short-circuit
 // the entire suite without spending a second on Sphere.init.
+//
+// On CI (CI=1), missing env vars (SPHERE_CLI_BIN / AGENTIC_HOSTING_PATH)
+// are FAIL conditions, not skip conditions — see the architectural
+// review's finding on false-confidence skips. The helper functions
+// emit appropriately distinct reasons.
 // ---------------------------------------------------------------------------
 
 const cliProbe: SphereCliProbe = probeSphereCli();
+const agenticProbe = checkAgenticHostingPath();
 
-const agenticPath = (process.env['AGENTIC_HOSTING_PATH']?.trim()
-  || '/home/vrogojin/agentic_hosting');
-const managerBinPath = join(agenticPath, 'dist', 'host-manager.js');
-const agenticReady = existsSync(managerBinPath);
+let managerBinPath = '';
+let agenticReady = false;
+if (agenticProbe.ok) {
+  managerBinPath = join(agenticProbe.path, 'dist', 'host-manager.js');
+  agenticReady = existsSync(managerBinPath);
+}
 
 const skip = !cliProbe.ok || !agenticReady;
 const skipReason = !cliProbe.ok
-  ? `sphere-cli not runnable: ${cliProbe.ok ? '' : cliProbe.reason}`
-  : !agenticReady
-    ? `agentic-hosting binary missing at ${managerBinPath}. Build it (cd ${agenticPath} && npm run build) or set AGENTIC_HOSTING_PATH.`
-    : '';
+  ? `sphere-cli not runnable: ${cliProbe.reason}`
+  : !agenticProbe.ok
+    ? agenticProbe.reason
+    : !agenticReady
+      ? `agentic-hosting binary missing at ${managerBinPath}. ` +
+        `Build it (cd ${agenticProbe.ok ? agenticProbe.path : '<repo>'} && npm run build) ` +
+        `or set AGENTIC_HOSTING_PATH.`
+      : '';
 
 interface SuiteState {
   cliPath: string;

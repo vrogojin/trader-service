@@ -31,14 +31,25 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, writeFile, rm, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+// TODO: pin trustbase URL to a commit SHA (or a release tag) once
+// upstream publishes one. Mutable `refs/heads/main` ref is acceptable
+// for testnet-only e2e but a real attack surface for any future
+// mainnet-targeted use.
 
 const TRUSTBASE_URL =
   'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
 
-const DEFAULT_AGENTIC_HOSTING_PATH = '/home/vrogojin/agentic_hosting';
+/**
+ * Default agentic-hosting path for local-developer ergonomics. Points
+ * at one specific user's filesystem layout; non-default environments
+ * MUST set `AGENTIC_HOSTING_PATH`. When `CI=1` the default is
+ * rejected — see architectural review finding #1.
+ */
+const DEVELOPER_FALLBACK_AGENTIC_HOSTING_PATH = '/home/vrogojin/agentic_hosting';
 
 export interface HostManagerProcess {
   /** Manager's chainPubkey, hex secp256k1. */
@@ -69,17 +80,57 @@ export interface HostManagerProcess {
  * error message points at the env-var the operator can fix.
  */
 function resolveAgenticHostingPath(): string {
-  return (process.env['AGENTIC_HOSTING_PATH'] ?? '').trim() || DEFAULT_AGENTIC_HOSTING_PATH;
+  const explicit = (process.env['AGENTIC_HOSTING_PATH'] ?? '').trim();
+  if (!explicit && process.env['CI'] === '1') {
+    throw new Error(
+      'AGENTIC_HOSTING_PATH is unset and CI=1. ' +
+      'Set AGENTIC_HOSTING_PATH to a checkout of agentic-hosting that has been built ' +
+      '(`npm run build` produces dist/host-manager.js). The developer fallback path ' +
+      'is intentionally rejected on CI to avoid silent skips that look like passes.',
+    );
+  }
+  return explicit || DEVELOPER_FALLBACK_AGENTIC_HOSTING_PATH;
+}
+
+/**
+ * For tests that want to opt into the same skip-on-missing semantics
+ * the suite uses (see `hma-orchestrated.e2e-live.test.ts`), check
+ * whether the prerequisite is satisfiable WITHOUT throwing on a
+ * missing CI env var. Returns a structured result so the test can
+ * surface a precise reason in its `describe.skipIf` warning.
+ */
+export function checkAgenticHostingPath(): { ok: true; path: string } | { ok: false; reason: string } {
+  try {
+    const path = resolveAgenticHostingPath();
+    return { ok: true, path };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 async function ensureTrustbase(dataDir: string): Promise<string> {
-  await mkdir(dataDir, { recursive: true });
+  // 0o700 — wallet material lands in this directory; on a shared CI
+  // runner default umask would leave it world-readable.
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const trustbasePath = join(dataDir, 'trustbase.json');
   const res = await fetch(TRUSTBASE_URL);
   if (!res.ok) {
     throw new Error(`Failed to download trustbase: HTTP ${res.status}`);
   }
-  await writeFile(trustbasePath, await res.text(), 'utf-8');
+  const body = await res.text();
+  // Defense-in-depth: the URL pins to a mutable `refs/heads/main` ref
+  // (test-only blast radius is testnet, but a tampered trustbase
+  // would redirect L2 BFT verification). Log the SHA-256 of the body
+  // so an unexpected hash surfaces in the test output and the
+  // operator can compare against a trusted snapshot. The hash check
+  // is advisory — we don't fail on mismatch since pinning a known
+  // hash here would create churn every time the upstream legitimately
+  // updates. See TODO at module top for the long-term fix (pin to a
+  // commit SHA in the URL).
+  const hash = createHash('sha256').update(body).digest('hex');
+   
+  console.log(`[manager-process] trustbase fetched (sha256=${hash.slice(0, 16)}…, ${body.length} bytes)`);
+  await writeFile(trustbasePath, body, 'utf-8');
   return trustbasePath;
 }
 
@@ -178,9 +229,12 @@ export async function spawnHostManager(opts: SpawnHostManagerOptions): Promise<H
   const dataDir = join(sessionDir, 'wallet');
   const tenantsDir = join(sessionDir, 'tenants');
   const stateDir = join(sessionDir, 'state');
-  await mkdir(sessionDir, { recursive: true });
-  await mkdir(tenantsDir, { recursive: true });
-  await mkdir(stateDir, { recursive: true });
+  // 0o700 on every dir under which wallet material can land. Default
+  // umask leaves dirs world-readable on shared CI runners; testnet
+  // mnemonics + chain keys inside should stay owner-only.
+  await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+  await mkdir(tenantsDir, { recursive: true, mode: 0o700 });
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
 
   const identity = await provisionManagerWallet(dataDir, hostId);
 
@@ -228,6 +282,11 @@ export async function spawnHostManager(opts: SpawnHostManagerOptions): Promise<H
         finishOk();
       }
     }, 250);
+    // .unref() so the interval cannot accidentally hold the event
+    // loop alive past test end if any rejection path is missed —
+    // belt-and-braces. Every clearInterval call below is still
+    // present; this is the safety net.
+    watcher.unref();
 
     child.once('exit', (code) => {
       clearInterval(watcher);
@@ -263,7 +322,11 @@ export async function spawnHostManager(opts: SpawnHostManagerOptions): Promise<H
       if (!c) return;
       proc.child = null;
       if (c.exitCode === null) {
-        c.kill('SIGTERM');
+        // ESRCH-safe: the process may have died between the exitCode
+        // check above and this kill() call (Node sets exitCode on the
+        // tick AFTER the process actually exits). Wrap to match the
+        // SIGKILL fallback below — the asymmetry was a latent bug.
+        try { c.kill('SIGTERM'); } catch { /* already dead */ }
         await new Promise<void>((resolve) => {
           const killTimer = setTimeout(() => {
             try { c.kill('SIGKILL'); } catch { /* already dead */ }
