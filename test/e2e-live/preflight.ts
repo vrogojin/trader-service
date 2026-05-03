@@ -87,11 +87,34 @@ export async function runPreflight(): Promise<void> {
     return;
   }
 
-  const network = (process.env['TRADER_E2E_PREFLIGHT_NETWORK'] ?? 'testnet') as
-    | 'testnet'
-    | 'mainnet'
-    | 'dev';
-  const timeoutMs = Number(process.env['TRADER_E2E_PREFLIGHT_TIMEOUT_MS'] ?? '30000');
+  // Validate network enum locally rather than blind-cast. The upstream
+  // `runProbes` would also throw on an unknown network, but tightening here
+  // makes the contract local and immune to upstream silent enum extensions.
+  const VALID_NETWORKS = ['testnet', 'mainnet', 'dev'] as const;
+  type Network = (typeof VALID_NETWORKS)[number];
+  const rawNetwork = process.env['TRADER_E2E_PREFLIGHT_NETWORK'] ?? 'testnet';
+  if (!(VALID_NETWORKS as readonly string[]).includes(rawNetwork)) {
+    throw new Error(
+      `Preflight: invalid TRADER_E2E_PREFLIGHT_NETWORK="${rawNetwork}". ` +
+        `Must be one of: ${VALID_NETWORKS.join(', ')}.`,
+    );
+  }
+  const network = rawNetwork as Network;
+
+  // Validate timeoutMs. `Number('abc')` returns NaN; `Number('-1')` returns -1;
+  // `Number('0')` returns 0. All of these would propagate to the upstream
+  // probe's setTimeout and either fire immediately (NaN coerces to 1ms in Node)
+  // or never fire (0 = no timeout in setTimeout's contract). Both produce
+  // misleading "preflight failed" results from a typo. Reject loudly.
+  const rawTimeoutMs = process.env['TRADER_E2E_PREFLIGHT_TIMEOUT_MS'] ?? '30000';
+  const timeoutMs = Number(rawTimeoutMs);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(
+      `Preflight: invalid TRADER_E2E_PREFLIGHT_TIMEOUT_MS="${rawTimeoutMs}". ` +
+        `Must be a positive finite number (milliseconds).`,
+    );
+  }
+
   const strict = process.env['TRADER_E2E_PREFLIGHT_STRICT'] === '1';
 
   console.log(
