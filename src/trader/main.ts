@@ -1497,7 +1497,22 @@ export async function startTrader(): Promise<void> {
         logger.warn('test_fund_invalid_amount', { entry });
         continue;
       }
-      const result = await sphere.payments.mintFungibleToken(coinIdHex, amount);
+      // mintFungibleToken was added in sphere-sdk's `refactor/extract-cli-to-sphere-cli`
+      // branch which has not landed in main. Guarded shim — the e2e suite uses the
+      // faucet path, not TRADER_TEST_FUND, so this guard never trips in production CI.
+      type MintFungibleApi = {
+        mintFungibleToken?: (
+          coinId: string,
+          amount: bigint,
+        ) => Promise<{ success: boolean; tokenId: string; error?: string }>;
+      };
+      const paymentsApi = sphere.payments as unknown as MintFungibleApi;
+      if (!paymentsApi.mintFungibleToken) {
+        throw new Error(
+          'TRADER_TEST_FUND requires sphere-sdk with mintFungibleToken (only on refactor/extract-cli-to-sphere-cli branch).',
+        );
+      }
+      const result = await paymentsApi.mintFungibleToken(coinIdHex, amount);
       if (!result.success) {
         logger.error('test_fund_mint_failed', {
           coin_id: coinIdHex.slice(0, 16) + '...',
