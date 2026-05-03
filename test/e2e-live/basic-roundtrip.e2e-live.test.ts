@@ -148,7 +148,7 @@ describe('Basic round-trip trading', () => {
         rate_min: 1n,
         rate_max: 1n,
         volume_min: 100n,
-        volume_total: 1000n,
+        volume_max: 1000n,
       });
 
       expect(intents.buyerIntentId).toBeTruthy();
@@ -190,7 +190,7 @@ describe('Basic round-trip trading', () => {
         '5',
         '--volume-min',
         '50',
-        '--volume-total',
+        '--volume-max',
         '500',
         '--expiry-ms',
         String(10 * 60_000),
@@ -246,7 +246,7 @@ describe('Basic round-trip trading', () => {
         '7',
         '--volume-min',
         '10',
-        '--volume-total',
+        '--volume-max',
         '100',
         '--expiry-ms',
         String(expiryMs),

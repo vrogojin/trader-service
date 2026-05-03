@@ -32,7 +32,7 @@ interface MatchingIntentsTerms {
   rate_min: bigint;
   rate_max: bigint;
   volume_min: bigint;
-  volume_total: bigint;
+  volume_max: bigint;
 }
 
 /**
@@ -50,7 +50,7 @@ function createIntentArgv(
     '--rate-min', terms.rate_min.toString(),
     '--rate-max', terms.rate_max.toString(),
     '--volume-min', terms.volume_min.toString(),
-    '--volume-total', terms.volume_total.toString(),
+    '--volume-max', terms.volume_max.toString(),
   ];
 }
 
