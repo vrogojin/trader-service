@@ -208,7 +208,8 @@ export function runSphere(
  * Mirrors `runSphere`'s contract: non-zero exit codes are returned
  * (not thrown); only subprocess launch failures reject the promise.
  *
- * Output bounded by `MAX_BUFFER_BYTES` (10 MiB per stream). Async
+ * Output bounded by `MAX_BUFFER_BYTES` PER STREAM (10 MiB stdout +
+ * 10 MiB stderr = 20 MiB worst case before overflow fires). Async
  * `child_process.spawn` has no maxBuffer (spawnSync does), so a
  * misbehaving subprocess flooding stdout could OOM the test process.
  * On overflow we kill the child and reject with a descriptive error.
@@ -257,10 +258,14 @@ export function runSphereAsync(
     });
     let timedOut = false;
     const timer = setTimeout(() => {
-      // Race-safe: if the process already exited cleanly between the
-      // last event-loop tick and now, exitCode is non-null. Don't
-      // misreport a clean exit as a timeout — that creates a
-      // misleading false-timeout in the caller's logs.
+      // Narrows the race window: if Node has already populated
+      // exitCode/signalCode, we know the process is dead and we
+      // shouldn't report a false-timeout. There is still a tiny
+      // window between OS-level exit and Node processing SIGCHLD
+      // where both fields are null — a timer firing in that window
+      // (microseconds wide) will still misreport a clean exit as a
+      // timeout. Empirically rare; the guard reduces it to a
+      // theoretical edge case but does not eliminate it.
       if (child.exitCode !== null || child.signalCode !== null) return;
       timedOut = true;
       try { child.kill('SIGKILL'); } catch { /* already dead */ }
@@ -268,6 +273,12 @@ export function runSphereAsync(
     timer.unref();
     child.once('error', (err) => {
       clearTimeout(timer);
+      // Mirror the overflow guard in 'close': if the overflow path
+      // already rejected, don't double-settle. Node's Promise
+      // resolution is idempotent so this is more about consistency
+      // and clarity than correctness — but it removes the
+      // inconsistency between the two settle paths.
+      if (overflowed) return;
       reject(err);
     });
     child.once('close', (code, signal) => {
