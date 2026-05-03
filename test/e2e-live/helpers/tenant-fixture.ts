@@ -717,7 +717,22 @@ function readProvisionConcurrency(): number {
   const raw = process.env['TRADER_E2E_PROVISION_CONCURRENCY'];
   if (raw === undefined || raw === '') return DEFAULT_PROVISION_CONCURRENCY;
   const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return DEFAULT_PROVISION_CONCURRENCY;
+  // Per PR-10 review W5: silently floor invalid values to the default mask
+  // typos. A user setting `TRADER_E2E_PROVISION_CONCURRENCY=0` (intent:
+  // "force sequential, cc=1") got cc=3 instead — surprising. Reject loudly
+  // for invalid forms so the operator notices the typo. We DO honor cc=1
+  // explicitly as "sequential" and cc=0 is now an explicit error.
+  if (!Number.isFinite(n) || Number.isNaN(n)) {
+    throw new Error(
+      `Invalid TRADER_E2E_PROVISION_CONCURRENCY="${raw}": must be a positive integer.`,
+    );
+  }
+  if (n < 1) {
+    throw new Error(
+      `Invalid TRADER_E2E_PROVISION_CONCURRENCY="${raw}" (parsed as ${n}): must be >= 1. ` +
+        `Use TRADER_E2E_PROVISION_CONCURRENCY=1 to force sequential provisioning.`,
+    );
+  }
   return n;
 }
 

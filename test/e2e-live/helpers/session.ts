@@ -31,15 +31,27 @@ import { randomBytes } from 'node:crypto';
 function readSessionOverride(): string | null {
   const raw = process.env['TRADER_E2E_SESSION_ID'];
   if (typeof raw !== 'string') return null;
-  // Sanitize: lowercase, hex-only, max 16 chars. Refuse exotic characters
-  // because the value gets concatenated into Docker container names which
-  // have a strict allowed-character class ([a-zA-Z0-9_.-]).
-  const cleaned = raw.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 16);
+  // Sanitize: lowercase, [a-z0-9-] (hex + dash), max 32 chars. We accept `-`
+  // because Docker container names allow it and CI drivers commonly tag with
+  // values like "ci-job-1234-abc" — silently stripping the dashes would mangle
+  // a meaningful identifier into an indecipherable hex blob (review feedback
+  // PR-10 W6). Stripping characters that ARE invalid for Docker names (e.g.
+  // `/`, `:`, spaces) is still required to prevent injection through the
+  // value into the docker argv.
+  const cleaned = raw.toLowerCase().replace(/[^0-9a-z-]/g, '').slice(0, 32);
   return cleaned.length > 0 ? cleaned : null;
 }
 
-/** 8-hex-char session id (32 bits ≈ 4.3 billion distinct sessions). */
-export const SESSION_ID: string = readSessionOverride() ?? randomBytes(4).toString('hex');
+/**
+ * 16-hex-char session id (64 bits ≈ 1.8e19 distinct sessions).
+ *
+ * Increased from 32 bits per PR-10 review (W4): with 100-shard CI matrices the
+ * birthday-bound collision probability at 32 bits (~1.2e-6) was small but
+ * non-zero. 64 bits drops it to ~5e-15 even at thousands of concurrent runs —
+ * effectively impossible for any realistic deployment. The cost is 4 additional
+ * random bytes; trivial.
+ */
+export const SESSION_ID: string = readSessionOverride() ?? randomBytes(8).toString('hex');
 
 /**
  * Common prefix for every container/tmp-dir name produced by this run.

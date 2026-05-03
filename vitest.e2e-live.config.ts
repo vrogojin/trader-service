@@ -29,13 +29,35 @@ import { defineConfig } from 'vitest/config';
  * shared testnet Nostr relay is the bottleneck. Don't raise this above
  * what the relay can handle (empirically 2-3 today).
  *
+ * Note: each fork spawns its own controller wallet via `Sphere.init`,
+ * which performs a relay handshake. With N forks you do N concurrent
+ * Sphere.init calls against the same relay during startup. If the relay
+ * sustains 2-3 concurrent inits today, plan accordingly.
+ *
  * The session-isolation work in test/e2e-live/helpers/session.ts is what
  * makes cross-fork (and cross-process) parallelism safe — see that file
  * for the per-resource analysis.
+ *
+ * Per PR-10 review W5: validate explicitly rather than silently floor on
+ * NaN/0/negative — typos used to be hidden by `|| 1`, now they fail loudly.
  */
-const MAX_FORKS = process.env['VITEST_MAX_FORKS']
-  ? Math.max(1, Number.parseInt(process.env['VITEST_MAX_FORKS'], 10) || 1)
-  : 1;
+function readMaxForks(): number {
+  const raw = process.env['VITEST_MAX_FORKS'];
+  if (raw === undefined || raw === '') return 1;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || Number.isNaN(n)) {
+    throw new Error(
+      `Invalid VITEST_MAX_FORKS="${raw}": must be a positive integer.`,
+    );
+  }
+  if (n < 1) {
+    throw new Error(
+      `Invalid VITEST_MAX_FORKS="${raw}" (parsed as ${n}): must be >= 1.`,
+    );
+  }
+  return n;
+}
+const MAX_FORKS = readMaxForks();
 
 export default defineConfig({
   test: {
