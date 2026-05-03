@@ -136,18 +136,22 @@ describe.skipIf(skip)('HMA-orchestrated tenant lifecycle (live testnet)', () => 
 
   afterAll(async () => {
     if (!state) return;
-    // Stop all tenants in parallel — best-effort. The manager will
-    // also force-remove on its own shutdown, but explicit stop keeps
-    // tenants from leaking into the next run if the manager hangs.
+    // Stop all tenants concurrently — best-effort. hostStop is now
+    // genuinely async (uses spawn, not spawnSync), so the three
+    // requests fan out as concurrent DM round-trips and the budget
+    // is bounded by the SLOWEST tenant, not the SUM of all of them.
+    // The manager would also force-remove on its own shutdown, but
+    // explicit stop keeps tenants from leaking into the next run
+    // if the manager hangs.
     await Promise.allSettled(
       state.spawned.map((t) =>
-        Promise.resolve(hostStop({
+        hostStop({
           cliPath: state!.cliPath,
           cliHome: state!.cliHome,
           managerAddress: state!.manager.pubkey,
           target: t.instanceName,
           timeoutMs: 60_000,
-        })),
+        }),
       ),
     );
     await state.manager.stop();

@@ -103,8 +103,11 @@ export type WaitForContainerRunning = (id: string, timeoutMs?: number) => Promis
 
 // ============================================================================
 // trader-ctl-driver.ts — owns: invoke the canonical CLI as a subprocess
+// (Architecture A — direct ACP DM. Use `sphere trader …` from sphere-cli
+//  via `runSphere()` from `helpers/sphere-cli.ts` once PR-C lands.)
 // ============================================================================
 
+/** @deprecated Architecture A. PR-C migrates trade-ops to `sphere trader …`. */
 export interface TraderCtlOptions {
   /** Tenant address: @nametag, DIRECT://hex, or 64-char hex pubkey. */
   tenant: string;
@@ -118,6 +121,7 @@ export interface TraderCtlOptions {
   json?: boolean;
 }
 
+/** @deprecated Architecture A. PR-C migrates trade-ops to `sphere trader …`. */
 export interface TraderCtlResult {
   /** Always 0 on success; see `error` field on non-zero. */
   exitCode: number;
@@ -131,6 +135,7 @@ export interface TraderCtlResult {
  * Run `trader-ctl <command> [args]` as a subprocess. Uses the bundled
  * trader-ctl from this repo (../bin/trader-ctl). Throws ONLY on subprocess
  * launch failure; non-zero exit codes are returned as `result.exitCode`.
+ * @deprecated Architecture A. PR-C migrates trade-ops to `sphere trader …`.
  */
 export type RunTraderCtl = (
   command: string,

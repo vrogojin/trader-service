@@ -131,8 +131,12 @@ async function ensureTrustbase(dataDir: string): Promise<string> {
   const hash = createHash('sha256').update(body).digest('hex');
   // Log the full 64-char hash so an operator can paste it into a
   // verification check or compare against a known-good snapshot.
-  // 16-char prefix collisions are not a real attack but provide
-  // marginal verification value for a security-relevant log line.
+  //
+  // TODO: maintain a known-good snapshot. Currently NO BASELINE
+  // EXISTS — this log is decorative until one is established. Once
+  // the upstream unicity-ids repo publishes a canonical hash for
+  // each release tag, either pin the URL to that tag (preferred) or
+  // store the expected hash in this repo and assert on it.
   console.log(`[manager-process] trustbase fetched (sha256=${hash}, ${body.length} bytes)`);
   await writeFile(trustbasePath, body, 'utf-8');
   return trustbasePath;

@@ -13,7 +13,7 @@
  * with `describe.skipIf(!probe.ok)` if sphere-cli isn't runnable.
  */
 
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawnSync, spawn, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,20 +31,29 @@ import { join } from 'node:path';
 const DEVELOPER_FALLBACK_CLI_PATH = '/home/vrogojin/sphere-cli-work/sphere-cli/bin/sphere.mjs';
 
 /**
- * Detect a CI runner. Different providers use different conventions:
- *   - GitHub Actions / GitLab CI / CircleCI / Travis / Jenkins: `CI=true`
- *   - Custom runners or `CI=1` (mostly local fakes / Drone CI)
- *   - Azure Pipelines: `TF_BUILD=True` (no `CI` set) — also covered
+ * Detect a CI runner across the common providers our team uses:
+ *   - GitHub Actions / GitLab CI / CircleCI / Travis / Buildkite: `CI=true`
+ *   - Drone CI / local fakes: `CI=1`
+ *   - Azure Pipelines: `TF_BUILD=True` (often without `CI` set)
  *
- * `Boolean(process.env.CI)` catches every truthy value except a literal
- * empty string, which is the only "set but disabled" idiom in
- * widespread use. The `TF_BUILD` clause picks up Azure where `CI` may
- * be unset entirely.
+ * Falsy idioms (explicit "off") are honoured: empty string, `0`,
+ * `false`, `False`, `no` (case-insensitive) all mean "not on CI." Any
+ * other non-empty value enables CI mode.
+ *
+ * Other CI providers (Jenkins via JENKINS_HOME, Bamboo via
+ * BAMBOO_BUILDNUMBER, etc.) are NOT covered. If we add a CI provider
+ * that doesn't set CI / TF_BUILD, extend this function rather than
+ * re-implementing the check inline.
  */
 export function isCi(): boolean {
-  const ci = process.env['CI'];
-  if (ci !== undefined && ci !== '' && ci !== '0' && ci.toLowerCase() !== 'false') return true;
-  if (process.env['TF_BUILD']) return true;
+  const isTruthy = (v: string | undefined): boolean => {
+    if (v === undefined || v === '') return false;
+    const lower = v.toLowerCase();
+    if (lower === '0' || lower === 'false' || lower === 'no') return false;
+    return true;
+  };
+  if (isTruthy(process.env['CI'])) return true;
+  if (isTruthy(process.env['TF_BUILD'])) return true;
   return false;
 }
 
@@ -153,6 +162,17 @@ export interface SphereRunResult {
  * is intentionally minimal (PATH + UNICITY_API_KEY if set) — we don't
  * leak the parent's env into the CLI's logs.
  */
+function buildEnv(opts?: { extraEnv?: Record<string, string> }, cwd?: string): Record<string, string> {
+  return {
+    PATH: process.env['PATH'] ?? '',
+    HOME: process.env['HOME'] ?? cwd ?? '/',
+    ...(process.env['UNICITY_API_KEY'] ? { UNICITY_API_KEY: process.env['UNICITY_API_KEY'] } : {}),
+    CI: '1',
+    FORCE_COLOR: '0',
+    ...(opts?.extraEnv ?? {}),
+  };
+}
+
 export function runSphere(
   cliPath: string,
   cwd: string,
@@ -164,14 +184,7 @@ export function runSphere(
     encoding: 'utf8',
     timeout: opts?.timeoutMs ?? 180_000,
     killSignal: 'SIGKILL',
-    env: {
-      PATH: process.env['PATH'] ?? '',
-      HOME: process.env['HOME'] ?? cwd,
-      ...(process.env['UNICITY_API_KEY'] ? { UNICITY_API_KEY: process.env['UNICITY_API_KEY'] } : {}),
-      CI: '1',
-      FORCE_COLOR: '0',
-      ...(opts?.extraEnv ?? {}),
-    },
+    env: buildEnv(opts, cwd),
   });
   return {
     stdout: r.stdout?.toString() ?? '',
@@ -179,6 +192,57 @@ export function runSphere(
     status: r.status,
     signal: r.signal,
   };
+}
+
+/**
+ * Async variant of `runSphere`. Use this when callers want true
+ * parallelism (e.g., stopping N tenants concurrently in `afterAll`
+ * via `Promise.all`/`Promise.allSettled`). The sync `runSphere`
+ * blocks the event loop, so a `.map(runSphere)` followed by
+ * `Promise.allSettled` actually runs sequentially — no parallelism.
+ *
+ * Mirrors `runSphere`'s contract: non-zero exit codes are returned
+ * (not thrown); only subprocess launch failures reject the promise.
+ */
+export function runSphereAsync(
+  cliPath: string,
+  cwd: string,
+  args: readonly string[],
+  opts?: { timeoutMs?: number; extraEnv?: Record<string, string> },
+): Promise<SphereRunResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', [cliPath, ...args], {
+      cwd,
+      env: buildEnv(opts, cwd),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout?.on('data', (c: Buffer) => stdoutChunks.push(c));
+    child.stderr?.on('data', (c: Buffer) => stderrChunks.push(c));
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+    }, opts?.timeoutMs ?? 180_000);
+    timer.unref();
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
+        stderr: Buffer.concat(stderrChunks).toString('utf-8'),
+        // `timedOut` short-circuits to a recognizable status: SIGKILL'd
+        // by our timer ⇒ status null + signal 'SIGKILL'. Caller can
+        // distinguish that from a normal exit.
+        status: timedOut ? null : code,
+        signal: signal as NodeJS.Signals | null,
+      });
+    });
+  });
 }
 
 /**

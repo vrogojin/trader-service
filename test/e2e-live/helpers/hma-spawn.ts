@@ -19,7 +19,7 @@
  * `trader-ctl-driver.ts` (and will gain a `sphere trader` mode in PR-C).
  */
 
-import { runSphere, type SphereRunResult } from './sphere-cli.js';
+import { runSphere, runSphereAsync, type SphereRunResult } from './sphere-cli.js';
 
 /** Timeout passed to sphere-cli's `--timeout` flag (DM request budget). */
 const DEFAULT_HMCP_TIMEOUT_MS = 120_000;
@@ -156,9 +156,16 @@ export interface HostStopOpts {
  * Issue `sphere host stop` for a tenant. Best-effort: tolerates
  * already-stopped tenants and missing-instance errors so it's safe to
  * call from afterAll() without precise lifecycle bookkeeping.
+ *
+ * Async (returns a Promise) so callers can run multiple stops in
+ * parallel via `Promise.all`/`Promise.allSettled`. The previous sync
+ * implementation made parallelism impossible (each spawnSync blocked
+ * the event loop, so .map(hostStop)+Promise.allSettled ran
+ * sequentially), and three sequential 75s budgets approached the 240s
+ * afterAll hookTimeout under any tenant slowdown.
  */
-export function hostStop(opts: HostStopOpts): SphereRunResult {
-  return runSphere(
+export async function hostStop(opts: HostStopOpts): Promise<SphereRunResult> {
+  return runSphereAsync(
     opts.cliPath,
     opts.cliHome,
     [
