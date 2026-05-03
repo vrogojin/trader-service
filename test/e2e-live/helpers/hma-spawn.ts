@@ -217,9 +217,17 @@ export function hostList(
   // pass with a misleading "expected 3, got 0" instead of pointing at
   // the real fault. Mirrors hostSpawn's strict parsing.
   if (!obj.payload || !Array.isArray(obj.payload.instances)) {
+    // Echo only the top-level keys, not the full payload body — the
+    // response could include peer pubkeys, instance IDs, or other
+    // identifiers that don't belong in test logs (especially with
+    // vitest's --reporter=json which captures errors to disk).
+    const topKeys = Object.keys(obj);
+    const payloadKeys = obj.payload && typeof obj.payload === 'object'
+      ? Object.keys(obj.payload as Record<string, unknown>)
+      : [];
     throw new Error(
       `sphere host list --json: response missing payload.instances. ` +
-      `Got: ${JSON.stringify(obj).slice(0, 500)}`,
+      `Top-level keys: [${topKeys.join(', ')}]. payload keys: [${payloadKeys.join(', ')}].`,
     );
   }
   return obj.payload.instances;

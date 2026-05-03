@@ -22,13 +22,31 @@ import { join } from 'node:path';
 /**
  * Default CLI path for local-developer ergonomics. Points at one
  * specific user's filesystem layout; non-default environments MUST
- * set `SPHERE_CLI_BIN`. When `CI=1` the default is rejected — we'd
- * rather a CI run fail loud with "set SPHERE_CLI_BIN" than silently
- * skip every HMA test because the path doesn't exist on the runner
+ * set `SPHERE_CLI_BIN`. On CI the default is rejected — we'd rather
+ * a CI run fail loud with "set SPHERE_CLI_BIN" than silently skip
+ * every HMA test because the path doesn't exist on the runner
  * (which would create a false-confidence "tests passed but skipped"
  * signal). See architectural review finding #1.
  */
 const DEVELOPER_FALLBACK_CLI_PATH = '/home/vrogojin/sphere-cli-work/sphere-cli/bin/sphere.mjs';
+
+/**
+ * Detect a CI runner. Different providers use different conventions:
+ *   - GitHub Actions / GitLab CI / CircleCI / Travis / Jenkins: `CI=true`
+ *   - Custom runners or `CI=1` (mostly local fakes / Drone CI)
+ *   - Azure Pipelines: `TF_BUILD=True` (no `CI` set) — also covered
+ *
+ * `Boolean(process.env.CI)` catches every truthy value except a literal
+ * empty string, which is the only "set but disabled" idiom in
+ * widespread use. The `TF_BUILD` clause picks up Azure where `CI` may
+ * be unset entirely.
+ */
+export function isCi(): boolean {
+  const ci = process.env['CI'];
+  if (ci !== undefined && ci !== '' && ci !== '0' && ci.toLowerCase() !== 'false') return true;
+  if (process.env['TF_BUILD']) return true;
+  return false;
+}
 
 export type SphereCliProbe =
   | { readonly ok: true; readonly path: string }
@@ -38,10 +56,10 @@ export function probeSphereCli(): SphereCliProbe {
   const explicit = process.env['SPHERE_CLI_BIN']?.trim();
   // CI runners must opt in explicitly. A missing env var on CI is a
   // configuration bug, not a "skip silently" condition.
-  if (!explicit && process.env['CI'] === '1') {
+  if (!explicit && isCi()) {
     return {
       ok: false,
-      reason: 'SPHERE_CLI_BIN is unset and CI=1. ' +
+      reason: 'SPHERE_CLI_BIN is unset on a CI runner. ' +
         'Set SPHERE_CLI_BIN to the path of a built sphere-cli binary ' +
         '(`bin/sphere.mjs` from github.com/unicity-sphere/sphere-cli).',
     };
@@ -86,11 +104,18 @@ export function probeSphereCli(): SphereCliProbe {
  */
 export function createSphereCliEnv(label: string): { home: string } {
   const safeLabel = label.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 24);
-  // mkdtempSync creates with mode 0o700 by default — keeps the wallet
-  // dir owner-only on shared CI runners.
+  // mkdtempSync calls mkdtemp(3), which is mandated by POSIX to
+  // create the directory with mode 0700 (umask is irrelevant). On
+  // Linux/macOS this is reliable. The chmodSync below is paranoia
+  // for non-POSIX platforms (Windows) where Node's mkdtempSync
+  // emulation may use the native CreateDirectory call which respects
+  // an inherited DACL rather than POSIX mode bits. Redundant but
+  // cheap on POSIX.
   const home = mkdtempSync(join(tmpdir(), `trader-e2e-sphere-${safeLabel}-`));
-  // Defense-in-depth: chmod again in case the umask was modified or
-  // the platform deviates from the posix-default 0o700.
+  // IMPORTANT: nothing must be written to `home` between mkdtempSync
+  // and this chmodSync. If a future contributor adds a writeFileSync
+  // here, a non-POSIX platform's brief world-readable window would
+  // become a TOCTOU disclosure of whatever was just written.
   chmodSync(home, 0o700);
   const cfgDir = join(home, '.sphere-cli');
   // Explicit 0o700 — mkdirSync with `recursive: true` honours umask

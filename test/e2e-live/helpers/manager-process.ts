@@ -34,6 +34,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { isCi } from './sphere-cli.js';
 
 // TODO: pin trustbase URL to a commit SHA (or a release tag) once
 // upstream publishes one. Mutable `refs/heads/main` ref is acceptable
@@ -81,9 +82,9 @@ export interface HostManagerProcess {
  */
 function resolveAgenticHostingPath(): string {
   const explicit = (process.env['AGENTIC_HOSTING_PATH'] ?? '').trim();
-  if (!explicit && process.env['CI'] === '1') {
+  if (!explicit && isCi()) {
     throw new Error(
-      'AGENTIC_HOSTING_PATH is unset and CI=1. ' +
+      'AGENTIC_HOSTING_PATH is unset on a CI runner. ' +
       'Set AGENTIC_HOSTING_PATH to a checkout of agentic-hosting that has been built ' +
       '(`npm run build` produces dist/host-manager.js). The developer fallback path ' +
       'is intentionally rejected on CI to avoid silent skips that look like passes.',
@@ -128,8 +129,11 @@ async function ensureTrustbase(dataDir: string): Promise<string> {
   // updates. See TODO at module top for the long-term fix (pin to a
   // commit SHA in the URL).
   const hash = createHash('sha256').update(body).digest('hex');
-   
-  console.log(`[manager-process] trustbase fetched (sha256=${hash.slice(0, 16)}…, ${body.length} bytes)`);
+  // Log the full 64-char hash so an operator can paste it into a
+  // verification check or compare against a known-good snapshot.
+  // 16-char prefix collisions are not a real attack but provide
+  // marginal verification value for a security-relevant log line.
+  console.log(`[manager-process] trustbase fetched (sha256=${hash}, ${body.length} bytes)`);
   await writeFile(trustbasePath, body, 'utf-8');
   return trustbasePath;
 }
@@ -321,20 +325,36 @@ export async function spawnHostManager(opts: SpawnHostManagerOptions): Promise<H
       const c = proc.child;
       if (!c) return;
       proc.child = null;
-      if (c.exitCode === null) {
-        // ESRCH-safe: the process may have died between the exitCode
-        // check above and this kill() call (Node sets exitCode on the
-        // tick AFTER the process actually exits). Wrap to match the
-        // SIGKILL fallback below — the asymmetry was a latent bug.
-        try { c.kill('SIGTERM'); } catch { /* already dead */ }
-        await new Promise<void>((resolve) => {
-          const killTimer = setTimeout(() => {
-            try { c.kill('SIGKILL'); } catch { /* already dead */ }
-          }, 12_000);
-          killTimer.unref();
-          c.once('exit', () => { clearTimeout(killTimer); resolve(); });
-        });
+      // Race fix: if the manager already exited (crash, SIGTERM from
+      // earlier signal, etc.), `c.exitCode` is non-null AND the
+      // 'exit' event has ALREADY fired. Attaching `c.once('exit')`
+      // now would never fire and `stop()` would hang for 12s until
+      // the (unref'd) killTimer resolved on its own. Check exitCode
+      // BEFORE attaching the listener, then short-circuit if dead.
+      // This also subsumes the previous null-check.
+      if (c.exitCode !== null || c.signalCode !== null) {
+        await rm(sessionDir, { recursive: true, force: true }).catch(() => { /* ignore */ });
+        return;
       }
+      // ESRCH-safe: the process may have died between the exitCode
+      // check and this kill() call. Wrap to match the SIGKILL
+      // fallback below.
+      try { c.kill('SIGTERM'); } catch { /* already dead */ }
+      await new Promise<void>((resolve) => {
+        // If the exit event ALREADY raced ahead of us between the
+        // exitCode check and this listener attach, settle immediately.
+        // Vanishingly rare, but the deadlock cost is high (12s × N
+        // tenants in afterAll under cascading test failures).
+        if (c.exitCode !== null || c.signalCode !== null) {
+          resolve();
+          return;
+        }
+        const killTimer = setTimeout(() => {
+          try { c.kill('SIGKILL'); } catch { /* already dead */ }
+        }, 12_000);
+        killTimer.unref();
+        c.once('exit', () => { clearTimeout(killTimer); resolve(); });
+      });
       await rm(sessionDir, { recursive: true, force: true }).catch(() => { /* ignore */ });
     },
   };

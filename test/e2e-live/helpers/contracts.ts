@@ -46,8 +46,10 @@
 
 // ============================================================================
 // docker-helpers.ts — owns: provisioning + lifecycle of a single container
+// (Architecture A — direct-docker, deprecated. Use hma-spawn.ts instead.)
 // ============================================================================
 
+/** @deprecated Architecture A. Use `SpawnedTenant` from `hma-spawn.ts`. */
 export interface DockerRunOptions {
   /** Fully-qualified image ref, e.g. ghcr.io/vrogojin/agentic-hosting/trader:v0.1 */
   image: string;
@@ -65,6 +67,7 @@ export interface DockerRunOptions {
   startTimeoutMs?: number;
 }
 
+/** @deprecated Architecture A. Use `SpawnedTenant` from `hma-spawn.ts`. */
 export interface DockerContainer {
   /** Docker container ID (sha256-ish, 64 chars). */
   id: string;
@@ -78,22 +81,24 @@ export interface DockerContainer {
  * Spawn a container with the given options. Returns once the daemon has
  * accepted the run (NOT once the app inside is ready — provisioning code
  * upstream polls for that).
+ * @deprecated Architecture A. Use `hostSpawn` from `hma-spawn.ts`.
  */
 export type RunContainer = (opts: DockerRunOptions) => Promise<DockerContainer>;
 
 /**
  * Stop with SIGTERM, fall back to SIGKILL after `timeoutMs`. Idempotent —
  * stopping an already-stopped container is a no-op.
+ * @deprecated Architecture A. Use `hostStop` from `hma-spawn.ts`.
  */
 export type StopContainer = (id: string, timeoutMs?: number) => Promise<void>;
 
-/** Remove the container record. Throws if container is still running. */
+/** @deprecated Architecture A. Use `hostStop` from `hma-spawn.ts`. */
 export type RemoveContainer = (id: string) => Promise<void>;
 
-/** Read the last `lines` of stdout+stderr for diagnostic output on failure. */
+/** @deprecated Architecture A. Read tenant logs via the HMA's `hm.inspect` instead. */
 export type GetContainerLogs = (id: string, lines?: number) => Promise<string>;
 
-/** Resolve true once container is RUNNING per `docker inspect`, else false on `timeoutMs` elapse. */
+/** @deprecated Architecture A. Use `hostList` from `hma-spawn.ts`. */
 export type WaitForContainerRunning = (id: string, timeoutMs?: number) => Promise<boolean>;
 
 // ============================================================================
@@ -135,8 +140,10 @@ export type RunTraderCtl = (
 
 // ============================================================================
 // tenant-fixture.ts — owns: provision N trader tenants ready to trade
+// (Architecture A — direct-docker, deprecated. Use hma-spawn.ts instead.)
 // ============================================================================
 
+/** @deprecated Architecture A. Use `HostSpawnOpts` from `hma-spawn.ts`. */
 export interface ProvisionTraderOptions {
   /** Operator-friendly label, used in container name and logs. */
   label: string;
@@ -154,6 +161,7 @@ export interface ProvisionTraderOptions {
   readyTimeoutMs?: number;
 }
 
+/** @deprecated Architecture A. Use `SpawnedTenant` from `hma-spawn.ts`. */
 export interface ProvisionedTenant {
   /** trader-ctl-targetable address. Either DIRECT://hex or 64-char hex. */
   address: string;
@@ -170,6 +178,7 @@ export interface ProvisionedTenant {
  * wait until reachable. Returns a fully-armed tenant.
  *
  * On any step failure, partial resources are cleaned up before throwing.
+ * @deprecated Architecture A. Use `hostSpawn` from `hma-spawn.ts`.
  */
 export type ProvisionTrader = (opts: ProvisionTraderOptions) => Promise<ProvisionedTenant>;
 
