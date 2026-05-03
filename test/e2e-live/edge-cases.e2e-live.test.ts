@@ -92,7 +92,7 @@ async function createIntent(
     rateMin: bigint;
     rateMax: bigint;
     volumeMin: bigint;
-    volumeTotal: bigint;
+    volumeMax: bigint;
     expiryMs?: number;
   },
 ): Promise<string> {
@@ -109,8 +109,8 @@ async function createIntent(
     args.rateMax.toString(),
     '--volume-min',
     args.volumeMin.toString(),
-    '--volume-total',
-    args.volumeTotal.toString(),
+    '--volume-max',
+    args.volumeMax.toString(),
   ];
   if (args.expiryMs !== undefined) {
     argv.push('--expiry-ms', String(args.expiryMs));
@@ -221,14 +221,14 @@ describe('Edge cases', () => {
         rateMin: 100n,
         rateMax: 200n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
       const bobId = await createIntent(bob, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 50n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
 
       const stillUnmatched = await intentsRemainUnmatched(
@@ -257,14 +257,14 @@ describe('Edge cases', () => {
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 50n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
       const buyId = await createIntent(alice, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 50n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
 
       // Wait long enough for >1 scan cycle and assert nothing settled.
@@ -313,7 +313,7 @@ describe('Edge cases', () => {
   );
 
   it(
-    'volume_min greater than counterparty volume_total → no match',
+    'volume_min greater than counterparty volume_max → no match',
     async () => {
       await cancelActiveIntents(alice);
       await cancelActiveIntents(bob);
@@ -325,14 +325,14 @@ describe('Edge cases', () => {
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 1000n,
-        volumeTotal: 5000n,
+        volumeMax: 5000n,
       });
       const bobId = await createIntent(bob, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
 
       const stillUnmatched = await intentsRemainUnmatched(

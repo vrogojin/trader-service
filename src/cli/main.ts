@@ -162,8 +162,15 @@ function addCreateIntent(parent: Command): Command {
     .requiredOption('--rate-min <bigint>', 'Minimum acceptable rate (string-encoded bigint)')
     .requiredOption('--rate-max <bigint>', 'Maximum acceptable rate (string-encoded bigint)')
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
-    .requiredOption('--volume-total <bigint>', 'Total intent volume')
-    .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
+    // Wire shape aligned with src/trader/acp-types.ts:23 (volume_max)
+    // and trader-command-handler.ts:331 (expiry_sec). The CLI flag
+    // stays in milliseconds for ergonomic consistency with other
+    // timeout flags; we convert at the wire boundary via
+    // floor(ms/1000). See sphere-cli PR #7 for the equivalent fix
+    // in the canonical CLI; this trader-ctl shim mirrors the same
+    // wire shape so direct-docker e2e tests don't break either.
+    .requiredOption('--volume-max <bigint>', 'Total intent volume')
+    .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h, must be ≥1000ms and ≤7 days)')
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -178,10 +185,24 @@ function addCreateIntent(parent: Command): Command {
         rate_min: local['rateMin'],
         rate_max: local['rateMax'],
         volume_min: local['volumeMin'],
-        volume_total: local['volumeTotal'],
+        volume_max: local['volumeMax'],
       };
       if (local['expiryMs'] !== undefined) {
-        params['expiry_ms'] = Number.parseInt(local['expiryMs'], 10);
+        const n = Number.parseInt(local['expiryMs'], 10);
+        if (!Number.isFinite(n) || n <= 0) {
+          fail(`--expiry-ms must be a positive integer (got "${local['expiryMs']}")`, 2);
+        }
+        if (n < 1000) {
+          // Sub-second expiries floor to 0 and would be rejected by
+          // the trader with an opaque "expiry_sec must be positive"
+          // error. Catch at the CLI layer with a clear message.
+          fail(`--expiry-ms must be at least 1000 (1 second); got ${n}`, 2);
+        }
+        const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+        if (n > sevenDaysMs) {
+          fail(`--expiry-ms must not exceed 7 days (${sevenDaysMs}ms); got ${n}`, 2);
+        }
+        params['expiry_sec'] = Math.floor(n / 1000);
       }
       await runCommand(opts, 'CREATE_INTENT', params);
     });

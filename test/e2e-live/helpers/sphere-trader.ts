@@ -206,7 +206,7 @@ export interface IntentSummary {
   readonly base_asset: string;
   readonly quote_asset: string;
   readonly volume_filled?: string;
-  readonly volume_total?: string;
+  readonly volume_max?: string;
 }
 
 export function listIntents(opts: TraderInvocationOpts): readonly IntentSummary[] {

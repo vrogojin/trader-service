@@ -3,7 +3,7 @@
  *
  * Three traders + 1 escrow; observe convergence under contention.
  *   1. Three pairwise-compatible intents → three distinct deals → all COMPLETE.
- *   2. Partial fill: A's volume_total=100, B's volume_total=30 → A's
+ *   2. Partial fill: A's volume_max=100, B's volume_max=30 → A's
  *      volume_filled=30 with the remaining 70 still ACTIVE on A.
  *   3. Concurrent matching: 3 traders all post matching intents at once;
  *      each intent must fill at most once per spec 5.7 (proposer election).
@@ -96,7 +96,7 @@ async function createIntent(
     rateMin: bigint;
     rateMax: bigint;
     volumeMin: bigint;
-    volumeTotal: bigint;
+    volumeMax: bigint;
     expiryMs?: number;
   },
 ): Promise<string> {
@@ -113,8 +113,8 @@ async function createIntent(
     args.rateMax.toString(),
     '--volume-min',
     args.volumeMin.toString(),
-    '--volume-total',
-    args.volumeTotal.toString(),
+    '--volume-max',
+    args.volumeMax.toString(),
   ];
   if (args.expiryMs !== undefined) {
     argv.push('--expiry-ms', String(args.expiryMs));
@@ -192,21 +192,21 @@ describe('Multi-agent trading', () => {
           rateMin: 1n,
           rateMax: 1n,
           volumeMin: 100n,
-          volumeTotal: 500n,
+          volumeMax: 500n,
         }),
         createIntent(bob, {
           direction: 'buy',
           rateMin: 1n,
           rateMax: 1n,
           volumeMin: 100n,
-          volumeTotal: 500n,
+          volumeMax: 500n,
         }),
         createIntent(carol, {
           direction: 'sell',
           rateMin: 2n,
           rateMax: 2n,
           volumeMin: 50n,
-          volumeTotal: 200n,
+          volumeMax: 200n,
         }),
         // Bob also wants to be carol's counterparty
         createIntent(bob, {
@@ -214,7 +214,7 @@ describe('Multi-agent trading', () => {
           rateMin: 2n,
           rateMax: 2n,
           volumeMin: 50n,
-          volumeTotal: 200n,
+          volumeMax: 200n,
         }),
       ]);
 
@@ -232,7 +232,7 @@ describe('Multi-agent trading', () => {
   );
 
   it(
-    'partial fill: A volume_total=100, B volume_total=30 → A volume_filled=30 with 70 remaining ACTIVE',
+    'partial fill: A volume_max=100, B volume_max=30 → A volume_filled=30 with 70 remaining ACTIVE',
     async () => {
       for (const t of [alice, bob, carol]) {
         await cancelActiveIntents(t);
@@ -243,14 +243,14 @@ describe('Multi-agent trading', () => {
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 10n,
-        volumeTotal: 100n,
+        volumeMax: 100n,
       });
       await createIntent(bob, {
         direction: 'buy',
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 10n,
-        volumeTotal: 30n,
+        volumeMax: 30n,
       });
 
       // Wait until bob sees a completed deal — one settlement happened.
@@ -277,12 +277,12 @@ describe('Multi-agent trading', () => {
             return {
               state: String(found['state']),
               volumeFilled: BigInt(String(found['volume_filled'] ?? '0')),
-              volumeTotal: BigInt(String(found['volume_total'] ?? '0')),
+              volumeMax: BigInt(String(found['volume_max'] ?? '0')),
             };
           },
           { timeout: 60_000, interval: 2_000 },
         )
-        .toEqual({ state: 'ACTIVE', volumeFilled: 30n, volumeTotal: 100n });
+        .toEqual({ state: 'ACTIVE', volumeFilled: 30n, volumeMax: 100n });
     },
     TESTNET.SWAP_TIMEOUT_MS + 90_000,
   );
@@ -297,7 +297,7 @@ describe('Multi-agent trading', () => {
       // alice sells; bob and carol both want to buy. Per spec 5.7 the
       // deterministic proposer election picks ONE counterparty per fan-out
       // round, so alice's intent must end up filled exactly once
-      // (volume_total=200 → volume_filled=200) and the OTHER buyer's intent
+      // (volume_max=200 → volume_filled=200) and the OTHER buyer's intent
       // must remain ACTIVE with volume_filled=0.
       await Promise.all([
         createIntent(alice, {
@@ -305,21 +305,21 @@ describe('Multi-agent trading', () => {
           rateMin: 1n,
           rateMax: 1n,
           volumeMin: 200n,
-          volumeTotal: 200n,
+          volumeMax: 200n,
         }),
         createIntent(bob, {
           direction: 'buy',
           rateMin: 1n,
           rateMax: 1n,
           volumeMin: 200n,
-          volumeTotal: 200n,
+          volumeMax: 200n,
         }),
         createIntent(carol, {
           direction: 'buy',
           rateMin: 1n,
           rateMax: 1n,
           volumeMin: 200n,
-          volumeTotal: 200n,
+          volumeMax: 200n,
         }),
       ]);
 
