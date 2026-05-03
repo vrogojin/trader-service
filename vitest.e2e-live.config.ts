@@ -21,6 +21,12 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['test/e2e-live/**/*.test.ts'],
+    // Run @unicitylabs/infra-probe before any test file. Aborts the run
+    // up-front if the testnet Nostr relay / aggregator / IPFS / Fulcrum /
+    // market is unreachable, instead of consuming a 10-15-minute container
+    // spawn cycle to discover the same failure as an opaque timeout.
+    // Bypass: TRADER_E2E_SKIP_PREFLIGHT=1.
+    globalSetup: ['./test/e2e-live/global-setup.ts'],
     testTimeout: 180_000,
     hookTimeout: 300_000,
     pool: 'forks',
