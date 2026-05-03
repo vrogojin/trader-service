@@ -23,12 +23,22 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
-  generatePrivateKey,
   getPublicKey,
   Sphere,
 } from '@unicitylabs/sphere-sdk';
+
+/**
+ * A secp256k1 private key is 32 random bytes (any value < curve order; the
+ * probability of generating an invalid one is ~2^-128, vanishingly small).
+ * Inlined so the test fixture doesn't depend on sphere-sdk's internal L1
+ * helper, which has been moved into the L1 sub-namespace and is no longer
+ * exported at the package root.
+ */
+function generatePrivateKey(): string {
+  return randomBytes(32).toString('hex');
+}
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 import type {
@@ -47,6 +57,7 @@ import { runTraderCtl } from './trader-ctl-driver.js';
 import { RELAYS, TRADER_IMAGE, ESCROW_IMAGE } from './constants.js';
 import { pollUntil } from './polling.js';
 import { fundWallet } from './funding.js';
+import { SESSION_ID } from './session.js';
 
 // ---------------------------------------------------------------------------
 // Local extensions to ProvisionTraderOptions
@@ -141,7 +152,9 @@ let controllerCache: Promise<ControllerWallet> | null = null;
 export async function getControllerWallet(): Promise<ControllerWallet> {
   if (controllerCache !== null) return controllerCache;
   controllerCache = (async () => {
-    const root = mkdtempSync(join(tmpdir(), 'trader-e2e-controller-'));
+    // Per-session prefix so two concurrent test runs don't share a cache dir
+    // and so `ls /tmp/trader-e2e-controller-<sid>-*` scopes cleanly.
+    const root = mkdtempSync(join(tmpdir(), `trader-e2e-controller-${SESSION_ID}-`));
     const dataDir = join(root, 'wallet');
     const tokensDir = join(root, 'tokens');
     mkdirSync(dataDir, { recursive: true });
@@ -228,7 +241,8 @@ function realSecp256k1Pubkey(): string {
  */
 function materializeWalletDir(label: string): string {
   const safeLabel = label.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 24);
-  const root = mkdtempSync(join(tmpdir(), `trader-e2e-${safeLabel}-`));
+  // Per-session prefix isolates two concurrent runs' wallet dirs in /tmp.
+  const root = mkdtempSync(join(tmpdir(), `trader-e2e-${SESSION_ID}-${safeLabel}-`));
   const walletDir = join(root, 'wallet');
   const tokensDir = join(root, 'tokens');
   mkdirSync(walletDir, { recursive: true });
@@ -694,35 +708,118 @@ export async function provisionTrader(
 }
 
 // ============================================================================
-// provisionTradersStaggered — concurrent provisioning with kickoff stagger
+// provisionTradersStaggered — bounded-parallel provisioning
 // ============================================================================
 
+const DEFAULT_PROVISION_CONCURRENCY = 3;
+
+function readProvisionConcurrency(): number {
+  const raw = process.env['TRADER_E2E_PROVISION_CONCURRENCY'];
+  if (raw === undefined || raw === '') return DEFAULT_PROVISION_CONCURRENCY;
+  const n = Number.parseInt(raw, 10);
+  // Per PR-10 review W5: silently floor invalid values to the default mask
+  // typos. A user setting `TRADER_E2E_PROVISION_CONCURRENCY=0` (intent:
+  // "force sequential, cc=1") got cc=3 instead — surprising. Reject loudly
+  // for invalid forms so the operator notices the typo. We DO honor cc=1
+  // explicitly as "sequential" and cc=0 is now an explicit error.
+  if (!Number.isFinite(n) || Number.isNaN(n)) {
+    throw new Error(
+      `Invalid TRADER_E2E_PROVISION_CONCURRENCY="${raw}": must be a positive integer.`,
+    );
+  }
+  if (n < 1) {
+    throw new Error(
+      `Invalid TRADER_E2E_PROVISION_CONCURRENCY="${raw}" (parsed as ${n}): must be >= 1. ` +
+        `Use TRADER_E2E_PROVISION_CONCURRENCY=1 to force sequential provisioning.`,
+    );
+  }
+  return n;
+}
+
 /**
- * Provisions multiple traders sequentially.
+ * Provision multiple traders with bounded parallelism.
  *
- * **Why sequential, not parallel:** the testnet's single Nostr relay is
- * the bottleneck. When N traders run `Sphere.init` concurrently, all of
- * them publish nametag binding events and then each does a self-verify
- * `sphere.resolve()` query. The relay's queryEvents subscription queue
- * serializes — under N>=3 concurrent load, queries time out at 15s and
- * each trader's verify loop runs out of budget. We've seen all 3 traders
- * hang at sphere_initialized for 180s under pure Promise.all.
+ * **Why bounded, not unbounded Promise.all:** the testnet's single Nostr
+ * relay is the bottleneck. Under unbounded concurrency we have observed
+ * (N≥4) one trader hanging at `sphere_initialized` for 3 minutes while its
+ * `sphere.resolve()` self-verify times out. Bounded parallelism with a
+ * small cap keeps the simultaneous nametag-publish + self-verify load
+ * within the relay's serving budget.
  *
- * Sequential gives each trader's binding event time to propagate to the
- * relay's query index before the next trader starts hitting it. Cost is
- * ~30-60s per trader (dominated by sphere.init + verify); total wall
- * time scales linearly with N.
+ * Concurrency is configurable via `TRADER_E2E_PROVISION_CONCURRENCY` (env
+ * var, default 3). Set to 1 to fall back to fully sequential behavior on
+ * a degraded relay; set higher when the relay is healthy and you want to
+ * cut wall-clock provisioning time. The 2026-04-30 measurement in
+ * `provisioning-load-investigation.e2e-live.test.ts` validates 3-way
+ * parallel provisioning is reliable on a healthy relay.
  *
- * If the testnet relay's subscription throughput improves, this can be
- * revisited as parallel-with-stagger.
+ * **Result ordering** matches the input order regardless of completion
+ * order — callers commonly destructure `[alice, bob, carol] = await ...`
+ * and rely on positional alignment with the factory list.
  */
 export async function provisionTradersStaggered(
   factories: Array<() => Promise<ProvisionedTenant>>,
 ): Promise<ProvisionedTenant[]> {
-  const results: ProvisionedTenant[] = [];
-  for (const factory of factories) {
-    if (factory === undefined) continue;
-    results.push(await factory());
+  const tasks = factories.filter((f): f is () => Promise<ProvisionedTenant> => f !== undefined);
+  const concurrency = Math.min(readProvisionConcurrency(), Math.max(tasks.length, 1));
+  const results: ProvisionedTenant[] = new Array(tasks.length);
+  const errors: unknown[] = [];
+
+  let nextIndex = 0;
+  // Worker pool: each worker pulls the next task index and runs it. When the
+  // index pointer crosses the task list, the worker exits. With `concurrency`
+  // workers we cap simultaneous in-flight provisions.
+  //
+  // CRITICAL: workers MUST NOT abort on first error — sequential provisioning's
+  // failure semantics are that earlier-completed tenants stay alive for the
+  // caller's afterAll to dispose. With Promise.all-style fail-fast, in-flight
+  // workers continue spawning containers AFTER the function rejects, and those
+  // containers never reach `results` so afterAll never sees them. The leak is
+  // strictly worse than sequential. We catch each task's error, record it, and
+  // let every started worker drain to completion. Once all workers settle, we
+  // dispose any tenants that did succeed (caller's afterAll won't see them
+  // through the rejected promise either) and re-throw the FIRST recorded error.
+  async function worker(): Promise<void> {
+    for (;;) {
+      const i = nextIndex++;
+      if (i >= tasks.length) return;
+      try {
+        // Non-null assertion is safe: i < tasks.length guarantees defined.
+        results[i] = await tasks[i]!();
+      } catch (err) {
+        errors.push(err);
+        // Continue — let other workers drain so we can clean up any
+        // late-arriving tenants below.
+      }
+    }
+  }
+
+  const workers: Array<Promise<void>> = [];
+  for (let i = 0; i < concurrency; i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  if (errors.length > 0) {
+    // Dispose every tenant that DID succeed before re-throwing — they are
+    // unreachable to the caller through the rejected promise.
+    for (let i = 0; i < results.length; i++) {
+      const tenant = results[i];
+      if (tenant !== undefined) {
+        try {
+          await tenant.dispose();
+        } catch {
+          // Best-effort cleanup; don't mask the original error.
+        }
+      }
+    }
+    // Re-throw the first error. If multiple workers failed, the rest are
+    // captured via `cause` so they aren't silently swallowed.
+    const primary = errors[0];
+    if (errors.length > 1 && primary instanceof Error) {
+      (primary as Error & { otherErrors?: unknown[] }).otherErrors = errors.slice(1);
+    }
+    throw primary;
   }
   return results;
 }
