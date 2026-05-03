@@ -66,6 +66,28 @@ commands.
 - [docs/configuration.md](docs/configuration.md) — env vars + strategy file layout
 - [docs/test-specification.md](docs/test-specification.md) — test plan (236 tests)
 
+## E2E live tests — preflight gate
+
+`npm run test:e2e-live` runs against the testnet Nostr relay, L3 aggregator,
+IPFS gateway, Fulcrum, and Market API. Before any container is spawned, the
+suite probes those services via `@unicitylabs/infra-probe` and aborts up-front
+if any are unreachable — saving 10–15-minute container-spawn cycles that would
+otherwise surface infra outages as opaque test timeouts.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `TRADER_E2E_SKIP_PREFLIGHT` | unset | Set to `1` to bypass the gate entirely (escape hatch when iterating on TS/test-only changes that don't need infra) |
+| `TRADER_E2E_PREFLIGHT_STRICT` | unset | Set to `1` to also fail on `degraded` (default warns and proceeds — e2e timeouts absorb mild slowness) |
+| `TRADER_E2E_PREFLIGHT_NETWORK` | `testnet` | One of `testnet`, `mainnet`, `dev`. Other values throw at startup |
+| `TRADER_E2E_PREFLIGHT_TIMEOUT_MS` | `30000` | Per-probe ceiling. Must be a positive finite number; NaN/0/negative throw at startup |
+
+Ad-hoc probing without invoking vitest:
+
+```sh
+npm run preflight           # pretty-printed
+npm run preflight:json      # one-line JSON for scripting
+```
+
 ## Status
 
 Restored from `pre-trader-cut-v1` tag of agentic-hosting (Phase b decoupling).
