@@ -29,6 +29,7 @@ import type {
   StopContainer,
   WaitForContainerRunning,
 } from './contracts.js';
+import { sessionContainerPrefix } from './session.js';
 
 // ----------------------------------------------------------------------------
 // Errors
@@ -170,8 +171,13 @@ export function buildRunArgs(opts: DockerRunOptions, name: string): string[] {
 function buildName(label: string | undefined): string {
   // Docker container names: [a-zA-Z0-9][a-zA-Z0-9_.-]+
   // Label has already been validated against LABEL_RE if provided.
+  //
+  // Stem includes the per-process SESSION_ID so two concurrent invocations
+  // of `npm run test:e2e-live` produce disjoint name spaces. See
+  // session.ts for the rationale.
   const suffix = Math.random().toString(36).slice(2, 8);
-  const stem = label ? `trader-e2e-${label}` : 'trader-e2e';
+  const sessionPrefix = sessionContainerPrefix();
+  const stem = label ? `${sessionPrefix}-${label}` : sessionPrefix;
   return `${stem}-${suffix}`;
 }
 
@@ -375,9 +381,15 @@ export async function listContainersByNamePrefix(
     );
   }
   try {
+    // Docker's `name=` filter is a SUBSTRING match by default — `name=foo`
+    // matches any container whose name CONTAINS "foo", not just those that
+    // START with "foo". For our session-isolation guarantee (where another
+    // test run's session ID could in theory share leading hex digits with
+    // ours), we anchor the regex with `^` to force prefix semantics.
+    // Docker passes the value through to its regexp matcher, so `^` is honored.
     const { stdout } = await execFileImpl('docker', [
       'ps',
-      '--filter', `name=${namePrefix}`,
+      '--filter', `name=^${namePrefix}`,
       '--format', '{{.ID}}',
     ]);
     return stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
