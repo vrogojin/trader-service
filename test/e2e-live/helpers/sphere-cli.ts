@@ -46,10 +46,14 @@ const DEVELOPER_FALLBACK_CLI_PATH = '/home/vrogojin/sphere-cli-work/sphere-cli/b
  * re-implementing the check inline.
  */
 export function isCi(): boolean {
-  const isTruthy = (v: string | undefined): boolean => {
-    if (v === undefined || v === '') return false;
+  const isTruthy = (raw: string | undefined): boolean => {
+    if (raw === undefined) return false;
+    const v = raw.trim();
+    if (v === '') return false;
     const lower = v.toLowerCase();
-    if (lower === '0' || lower === 'false' || lower === 'no') return false;
+    // Cover the common "set but disabled" idioms across npm,
+    // shell-script convention, and most config systems.
+    if (lower === '0' || lower === 'false' || lower === 'no' || lower === 'off') return false;
     return true;
   };
   if (isTruthy(process.env['CI'])) return true;
@@ -203,7 +207,14 @@ export function runSphere(
  *
  * Mirrors `runSphere`'s contract: non-zero exit codes are returned
  * (not thrown); only subprocess launch failures reject the promise.
+ *
+ * Output bounded by `MAX_BUFFER_BYTES` (10 MiB per stream). Async
+ * `child_process.spawn` has no maxBuffer (spawnSync does), so a
+ * misbehaving subprocess flooding stdout could OOM the test process.
+ * On overflow we kill the child and reject with a descriptive error.
  */
+const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+
 export function runSphereAsync(
   cliPath: string,
   cwd: string,
@@ -218,10 +229,39 @@ export function runSphereAsync(
     });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
-    child.stdout?.on('data', (c: Buffer) => stdoutChunks.push(c));
-    child.stderr?.on('data', (c: Buffer) => stderrChunks.push(c));
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let overflowed = false;
+    const checkOverflow = (which: 'stdout' | 'stderr', total: number): boolean => {
+      if (overflowed) return true;
+      if (total > MAX_BUFFER_BYTES) {
+        overflowed = true;
+        try { child.kill('SIGKILL'); } catch { /* already dead */ }
+        reject(new Error(
+          `runSphereAsync: ${which} exceeded MAX_BUFFER_BYTES=${MAX_BUFFER_BYTES} ` +
+          `(${total} bytes). Killed child to bound memory; partial output discarded.`,
+        ));
+        return true;
+      }
+      return false;
+    };
+    child.stdout?.on('data', (c: Buffer) => {
+      stdoutBytes += c.length;
+      if (checkOverflow('stdout', stdoutBytes)) return;
+      stdoutChunks.push(c);
+    });
+    child.stderr?.on('data', (c: Buffer) => {
+      stderrBytes += c.length;
+      if (checkOverflow('stderr', stderrBytes)) return;
+      stderrChunks.push(c);
+    });
     let timedOut = false;
     const timer = setTimeout(() => {
+      // Race-safe: if the process already exited cleanly between the
+      // last event-loop tick and now, exitCode is non-null. Don't
+      // misreport a clean exit as a timeout — that creates a
+      // misleading false-timeout in the caller's logs.
+      if (child.exitCode !== null || child.signalCode !== null) return;
       timedOut = true;
       try { child.kill('SIGKILL'); } catch { /* already dead */ }
     }, opts?.timeoutMs ?? 180_000);
@@ -232,6 +272,10 @@ export function runSphereAsync(
     });
     child.once('close', (code, signal) => {
       clearTimeout(timer);
+      // If we already rejected via the overflow path, the resolve
+      // below is a no-op (Promise resolution is idempotent), but
+      // skip the buffer concat to avoid extra allocation.
+      if (overflowed) return;
       resolve({
         stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
         stderr: Buffer.concat(stderrChunks).toString('utf-8'),
