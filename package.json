@@ -15,10 +15,13 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e-live": "vitest run --config vitest.e2e-live.config.ts",
+    "preflight": "unicity-infra-probe --network testnet",
+    "preflight:json": "unicity-infra-probe --network testnet --format json",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
+    "@unicitylabs/infra-probe": "^0.3.0",
     "@unicitylabs/sphere-sdk": "file:../sphere-sdk",
     "commander": "^12.1.0",
     "uuid": "^11.1.0"
