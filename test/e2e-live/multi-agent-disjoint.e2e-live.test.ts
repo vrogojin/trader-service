@@ -40,6 +40,10 @@ import { waitForDealInState } from './helpers/scenario-helpers.js';
 import { runTraderCtl } from './helpers/trader-ctl-driver.js';
 import { getControllerWallet } from './helpers/tenant-fixture.js';
 import { TESTNET } from './helpers/constants.js';
+import {
+  snapshotPortfolio,
+  expectBalanceDelta,
+} from './helpers/portfolio-assertions.js';
 
 async function runAuthedTraderCtl(
   cmd: string,
@@ -214,6 +218,15 @@ describe('Multi-agent disjoint pairs', () => {
         await cancelActiveIntents(t);
       }
 
+      // Snapshot balances — Audit Claim 4: with two pairs swapping through
+      // the same escrow, exact deltas are computable:
+      //   Pair 1 (rate=1, vol=200): alice -200 UCT +200 USDU; bob +200 UCT -200 USDU
+      //   Pair 2 (rate=2, vol=100): carol -100 UCT +200 USDU; dave +100 UCT -200 USDU
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
+      const bobBalBefore = await snapshotPortfolio(bob.address);
+      const carolBalBefore = await snapshotPortfolio(carol.address);
+      const daveBalBefore = await snapshotPortfolio(dave.address);
+
       // Pair 1 — alice (sell @ 1) ↔ bob (buy @ 1), 200 UCT
       // Pair 2 — carol (sell @ 2) ↔ dave (buy @ 2), 100 UCT
       // Posting sequentially (not Promise.all) — parallel trader-ctl invocations
@@ -270,6 +283,20 @@ describe('Multi-agent disjoint pairs', () => {
       expect(aliceDeal['deal_id']).toBe(bobDeal['deal_id']);
       expect(carolDeal['deal_id']).toBe(daveDeal['deal_id']);
       expect(aliceDeal['deal_id']).not.toBe(carolDeal['deal_id']);
+
+      // Wait for inbound payouts to finalize (15s receive loop + margin).
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+
+      // Exact balance assertions — both pairs swapped through the same escrow
+      // with no cross-contamination.
+      const aliceBalAfter = await snapshotPortfolio(alice.address);
+      const bobBalAfter = await snapshotPortfolio(bob.address);
+      const carolBalAfter = await snapshotPortfolio(carol.address);
+      const daveBalAfter = await snapshotPortfolio(dave.address);
+      expectBalanceDelta(aliceBalBefore, aliceBalAfter, { UCT: -200n, USDU: 200n });
+      expectBalanceDelta(bobBalBefore, bobBalAfter, { UCT: 200n, USDU: -200n });
+      expectBalanceDelta(carolBalBefore, carolBalAfter, { UCT: -100n, USDU: 200n });
+      expectBalanceDelta(daveBalBefore, daveBalAfter, { UCT: 100n, USDU: -200n });
     },
     TESTNET.SWAP_TIMEOUT_MS + 120_000,
   );

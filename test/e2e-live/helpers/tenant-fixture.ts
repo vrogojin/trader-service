@@ -23,12 +23,19 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
-  generatePrivateKey,
   getPublicKey,
   Sphere,
 } from '@unicitylabs/sphere-sdk';
+
+// `@unicitylabs/sphere-sdk` no longer exports `generatePrivateKey` at the
+// package root (moved to the L1 sub-namespace). A secp256k1 private key is
+// just 32 random bytes — inline here so this fixture compiles against current
+// sphere-sdk regardless of which adjacent PR lands first.
+function generatePrivateKey(): string {
+  return randomBytes(32).toString('hex');
+}
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 import type {

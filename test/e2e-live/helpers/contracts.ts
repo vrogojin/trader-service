@@ -176,6 +176,8 @@ export interface TestnetConstants {
   readonly IPFS_GATEWAY: string;
   /** Faucet endpoint. */
   readonly FAUCET_URL: string;
+  /** Market API endpoint (intent database for counterparty discovery). */
+  readonly MARKET_API_URL: string;
   /** Default trader image (matches templates.json shortcut). */
   readonly TRADER_IMAGE: string;
   /** Default escrow image. */

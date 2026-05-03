@@ -337,6 +337,15 @@ describe('Edge cases', () => {
         45_000, // quiet window — at least one full scan_interval cycle
       );
       expect(stillUnmatched).toBe(true);
+
+      // Note: a strict `expectBalanceUnchanged` would be incorrect here. The
+      // testnet aggregator is shared with other concurrent tests / live peers,
+      // and Alice's `sell at 100-200` could legitimately match an unrelated
+      // peer's `buy at >= 100` during the quiet window. The intent-level
+      // assertion above (volume_filled === 0 on the named intents inside
+      // intentsRemainUnmatched) is the right granularity: it proves the named
+      // intents stayed unmatched while accepting that Alice's wallet may
+      // legitimately have moved through a parallel match.
     },
     5 * 60_000,
   );

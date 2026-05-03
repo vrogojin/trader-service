@@ -1,20 +1,20 @@
 /**
  * Live e2e test configuration — opt-in via `npm run test:e2e-live`.
  *
- * IMPORTANT: These tests are NOT runnable in trader-service standalone.
- * They depend on the Host Manager Agent (HMA) — `createHostManager`,
- * `hm.spawn` over HMCP-0, the Dockerode adapter, and the agentic-hosting
- * tenant template registry — none of which live in this repo.
+ * Tests run against REAL Unicity testnet infrastructure (Nostr relay at
+ * `wss://nostr-relay.testnet.unicity.network`, L3 aggregator at
+ * `goggregator-test.unicity.network`, IPFS gateway, Market API). The
+ * infra-probe preflight gate aborts the run if any of those services
+ * are unreachable so a 10-15-minute container-spawn cycle isn't wasted
+ * on a known-down service.
  *
- * The tests are preserved here at the same shape they had in the
- * agentic-hosting `pre-trader-cut-v1` tag so that they can be ported to
- * (or run from) the agentic-hosting repository's nightly integration CI
- * once the host-manager half of the stack is decoupled too. See
- * `test/e2e-live/README.md` for the full rationale and the runbook for
- * the manual scenarios these tests describe.
- *
- * Running this config in trader-service today will fail at module
- * resolution — the missing host-manager source files are the signal.
+ * Trader and escrow containers are spawned **directly via the local
+ * Docker daemon** — NOT through the Host Manager Agent (HMA) / HMCP-0.
+ * The trader-ctl driver talks to each tenant over Sphere DM. This
+ * matches the production architecture where agentic-hosting only
+ * orchestrates lifecycle; trading happens controller ↔ tenant directly.
+ * See `test/e2e-live/helpers/contracts.ts` and
+ * `test/e2e-live/helpers/tenant-fixture.ts` for the rationale.
  */
 import { defineConfig } from 'vitest/config';
 
