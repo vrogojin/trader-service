@@ -381,9 +381,15 @@ export async function listContainersByNamePrefix(
     );
   }
   try {
+    // Docker's `name=` filter is a SUBSTRING match by default — `name=foo`
+    // matches any container whose name CONTAINS "foo", not just those that
+    // START with "foo". For our session-isolation guarantee (where another
+    // test run's session ID could in theory share leading hex digits with
+    // ours), we anchor the regex with `^` to force prefix semantics.
+    // Docker passes the value through to its regexp matcher, so `^` is honored.
     const { stdout } = await execFileImpl('docker', [
       'ps',
-      '--filter', `name=${namePrefix}`,
+      '--filter', `name=^${namePrefix}`,
       '--format', '{{.ID}}',
     ]);
     return stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);

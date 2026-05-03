@@ -23,12 +23,22 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
-  generatePrivateKey,
   getPublicKey,
   Sphere,
 } from '@unicitylabs/sphere-sdk';
+
+/**
+ * A secp256k1 private key is 32 random bytes (any value < curve order; the
+ * probability of generating an invalid one is ~2^-128, vanishingly small).
+ * Inlined so the test fixture doesn't depend on sphere-sdk's internal L1
+ * helper, which has been moved into the L1 sub-namespace and is no longer
+ * exported at the package root.
+ */
+function generatePrivateKey(): string {
+  return randomBytes(32).toString('hex');
+}
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 import type {
@@ -738,17 +748,34 @@ export async function provisionTradersStaggered(
   const tasks = factories.filter((f): f is () => Promise<ProvisionedTenant> => f !== undefined);
   const concurrency = Math.min(readProvisionConcurrency(), Math.max(tasks.length, 1));
   const results: ProvisionedTenant[] = new Array(tasks.length);
+  const errors: unknown[] = [];
 
   let nextIndex = 0;
-  // Worker pool: each worker pulls the next task index and runs it. When
-  // the index pointer crosses the task list, the worker exits. With
-  // `concurrency` workers we cap simultaneous in-flight provisions.
+  // Worker pool: each worker pulls the next task index and runs it. When the
+  // index pointer crosses the task list, the worker exits. With `concurrency`
+  // workers we cap simultaneous in-flight provisions.
+  //
+  // CRITICAL: workers MUST NOT abort on first error — sequential provisioning's
+  // failure semantics are that earlier-completed tenants stay alive for the
+  // caller's afterAll to dispose. With Promise.all-style fail-fast, in-flight
+  // workers continue spawning containers AFTER the function rejects, and those
+  // containers never reach `results` so afterAll never sees them. The leak is
+  // strictly worse than sequential. We catch each task's error, record it, and
+  // let every started worker drain to completion. Once all workers settle, we
+  // dispose any tenants that did succeed (caller's afterAll won't see them
+  // through the rejected promise either) and re-throw the FIRST recorded error.
   async function worker(): Promise<void> {
     for (;;) {
       const i = nextIndex++;
       if (i >= tasks.length) return;
-      // Non-null assertion is safe: i < tasks.length guarantees defined.
-      results[i] = await tasks[i]!();
+      try {
+        // Non-null assertion is safe: i < tasks.length guarantees defined.
+        results[i] = await tasks[i]!();
+      } catch (err) {
+        errors.push(err);
+        // Continue — let other workers drain so we can clean up any
+        // late-arriving tenants below.
+      }
     }
   }
 
@@ -756,12 +783,29 @@ export async function provisionTradersStaggered(
   for (let i = 0; i < concurrency; i++) {
     workers.push(worker());
   }
-  // Promise.all rejects on the first worker error. Other workers are still
-  // running, so newly-finished provisions may need cleanup — but that
-  // cleanup is the caller's concern (afterAll always disposes whatever
-  // resolved). The original sequential implementation had the same
-  // semantics: a failure in trader N didn't dispose 0..N-1.
   await Promise.all(workers);
+
+  if (errors.length > 0) {
+    // Dispose every tenant that DID succeed before re-throwing — they are
+    // unreachable to the caller through the rejected promise.
+    for (let i = 0; i < results.length; i++) {
+      const tenant = results[i];
+      if (tenant !== undefined) {
+        try {
+          await tenant.dispose();
+        } catch {
+          // Best-effort cleanup; don't mask the original error.
+        }
+      }
+    }
+    // Re-throw the first error. If multiple workers failed, the rest are
+    // captured via `cause` so they aren't silently swallowed.
+    const primary = errors[0];
+    if (errors.length > 1 && primary instanceof Error) {
+      (primary as Error & { otherErrors?: unknown[] }).otherErrors = errors.slice(1);
+    }
+    throw primary;
+  }
   return results;
 }
 
