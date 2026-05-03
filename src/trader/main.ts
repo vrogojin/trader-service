@@ -383,6 +383,53 @@ export async function startTrader(): Promise<void> {
     accounting: sphere.accounting !== null,
   });
 
+  // Enable global auto-return on every terminated invoice this wallet is a
+  // target of. The SDK's AccountingModule tracks each payer's contribution to
+  // an invoice independently and, on `closeInvoice`, refunds any surplus
+  // (`coveredAmount > requestedAmount`) back to each over-paying party at
+  // either their `refundAddress` or `senderAddress`. Without this flag set,
+  // surplus stays orphaned on our wallet until manually reconciled.
+  //
+  // Why global: the trader receives many payout invoices over its lifetime
+  // (one per completed deal). Setting per-invoice would require us to call
+  // `setAutoReturn(invoiceId, true)` on every imported payout invoice — a
+  // brittle contract. Global is fire-and-forget.
+  //
+  // Why fail-fast (with one exception): if AccountingModule can't persist
+  // auto-return settings, its storage layer is broken and downstream invoice
+  // operations would also fail unpredictably. Better to surface at startup
+  // than discover at first deal completion. The exception is `RATE_LIMITED`:
+  // the SDK throws this if `setAutoReturn('*', true)` is called twice within
+  // a 5-second cooldown. Process restart would not normally hit it (the
+  // cooldown is in-memory only), but an in-process supervisor that retries
+  // `startTrader` on error would. `RATE_LIMITED` here is functionally a
+  // no-op (the flag is already true) so we treat it as success.
+  //
+  // Startup-cost note: `setAutoReturn('*', true)` is NOT just a flag flip —
+  // when enabled, the SDK iterates `closedInvoices ∪ cancelledInvoices`
+  // (capped at 100) and runs `_executeAutoReturnFromFrozen` for each, which
+  // issues real outbound payments. On a wallet with many already-closed
+  // invoices (e.g. one migrated from a prior environment), startup can stall
+  // on aggregator round-trips for up to 100 sequential refund attempts.
+  // The dedup ledger makes this safe to re-run, but operators should expect
+  // the first `setAutoReturn` after wallet migration to be slow.
+  if (sphere.accounting) {
+    try {
+      await sphere.accounting.setAutoReturn('*', true);
+      logger.info('accounting_auto_return_enabled');
+    } catch (err: unknown) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code === 'RATE_LIMITED') {
+        // Already enabled (in-process retry within 5s cooldown). No-op.
+        logger.info('accounting_auto_return_already_enabled', {
+          note: 'setAutoReturn rate-limited — flag already set in this process',
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // PaymentsAdapter — wraps sphere.payments
   // ---------------------------------------------------------------------------
@@ -1497,7 +1544,25 @@ export async function startTrader(): Promise<void> {
         logger.warn('test_fund_invalid_amount', { entry });
         continue;
       }
-      const result = await sphere.payments.mintFungibleToken(coinIdHex, amount);
+      // mintFungibleToken was added in sphere-sdk's `refactor/extract-cli-to-sphere-cli`
+      // branch which has not landed in main. When trader-service is built against
+      // an SDK that doesn't ship this method, fail explicitly instead of typing
+      // through it. The e2e suite uses the faucet path, not TRADER_TEST_FUND,
+      // so this guard never trips in production CI.
+      type MintFungibleApi = {
+        mintFungibleToken?: (
+          coinId: string,
+          amount: bigint,
+        ) => Promise<{ success: boolean; tokenId: string; error?: string }>;
+      };
+      const paymentsApi = sphere.payments as unknown as MintFungibleApi;
+      if (!paymentsApi.mintFungibleToken) {
+        throw new Error(
+          'TRADER_TEST_FUND requires sphere-sdk with mintFungibleToken (only on refactor/extract-cli-to-sphere-cli branch). ' +
+            'Use the faucet path instead, or rebuild with the SDK feature branch.',
+        );
+      }
+      const result = await paymentsApi.mintFungibleToken(coinIdHex, amount);
       if (!result.success) {
         logger.error('test_fund_mint_failed', {
           coin_id: coinIdHex.slice(0, 16) + '...',
