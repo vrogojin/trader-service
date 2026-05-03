@@ -23,6 +23,7 @@ import { pollUntil } from './polling.js';
 import { SWAP_TIMEOUT_MS } from './constants.js';
 import { getControllerWallet } from './tenant-fixture.js';
 import { getContainerLogs, listContainersByNamePrefix } from './docker-helpers.js';
+import { sessionContainerPrefix } from './session.js';
 
 const DEAL_POLL_INTERVAL_MS = 2_000;
 const CREATE_INTENT_TIMEOUT_MS = 30_000;
@@ -234,24 +235,32 @@ export async function waitForDealInState(
       /* container may already be gone */
     }
 
-    // Also dump every running escrow container's recent logs. The trader-side
-    // logs alone don't tell us whether the escrow received the deposit, paid
-    // out, or got stuck — without these, parallel-swap and unreachable-escrow
-    // failures are nearly impossible to diagnose post-mortem.
+    // Also dump every running container from THIS session's tenant pool —
+    // includes escrows + any sibling traders. The trader-side logs alone
+    // don't tell us whether the escrow received the deposit, paid out, or
+    // got stuck. Filter by `sessionContainerPrefix()` so a parallel
+    // session running on the same Docker daemon doesn't leak its logs into
+    // our diagnostic output (and vice versa).
+    //
+    // NOTE: docker-helpers names BOTH trader and escrow containers with
+    // the `trader-e2e-<SESSION>-` prefix, so this single filter captures
+    // escrows. The previous `escrow-e2e` filter never matched anything.
     try {
-      const escrowContainerIds = await listContainersByNamePrefix('escrow-e2e');
-      for (const id of escrowContainerIds) {
+      const sessionContainerIds = await listContainersByNamePrefix(sessionContainerPrefix());
+      for (const id of sessionContainerIds) {
+        // Skip the tenant whose logs we already dumped above.
+        if (id === tenant.container.id) continue;
         try {
           const logs = await getContainerLogs(id, 1500);
           console.error(
-            `[waitForDealInState] last 1500 log lines from escrow container ${id}:\n${logs}`,
+            `[waitForDealInState] last 1500 log lines from session container ${id}:\n${logs}`,
           );
         } catch {
           /* container may have just exited — skip */
         }
       }
     } catch {
-      /* listing failed (docker error) — skip escrow logs */
+      /* listing failed (docker error) — skip sibling logs */
     }
 
     throw new Error(

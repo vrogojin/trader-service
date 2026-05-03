@@ -47,6 +47,7 @@ import { runTraderCtl } from './trader-ctl-driver.js';
 import { RELAYS, TRADER_IMAGE, ESCROW_IMAGE } from './constants.js';
 import { pollUntil } from './polling.js';
 import { fundWallet } from './funding.js';
+import { SESSION_ID } from './session.js';
 
 // ---------------------------------------------------------------------------
 // Local extensions to ProvisionTraderOptions
@@ -141,7 +142,9 @@ let controllerCache: Promise<ControllerWallet> | null = null;
 export async function getControllerWallet(): Promise<ControllerWallet> {
   if (controllerCache !== null) return controllerCache;
   controllerCache = (async () => {
-    const root = mkdtempSync(join(tmpdir(), 'trader-e2e-controller-'));
+    // Per-session prefix so two concurrent test runs don't share a cache dir
+    // and so `ls /tmp/trader-e2e-controller-<sid>-*` scopes cleanly.
+    const root = mkdtempSync(join(tmpdir(), `trader-e2e-controller-${SESSION_ID}-`));
     const dataDir = join(root, 'wallet');
     const tokensDir = join(root, 'tokens');
     mkdirSync(dataDir, { recursive: true });
@@ -228,7 +231,8 @@ function realSecp256k1Pubkey(): string {
  */
 function materializeWalletDir(label: string): string {
   const safeLabel = label.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 24);
-  const root = mkdtempSync(join(tmpdir(), `trader-e2e-${safeLabel}-`));
+  // Per-session prefix isolates two concurrent runs' wallet dirs in /tmp.
+  const root = mkdtempSync(join(tmpdir(), `trader-e2e-${SESSION_ID}-${safeLabel}-`));
   const walletDir = join(root, 'wallet');
   const tokensDir = join(root, 'tokens');
   mkdirSync(walletDir, { recursive: true });
@@ -694,36 +698,70 @@ export async function provisionTrader(
 }
 
 // ============================================================================
-// provisionTradersStaggered — concurrent provisioning with kickoff stagger
+// provisionTradersStaggered — bounded-parallel provisioning
 // ============================================================================
 
+const DEFAULT_PROVISION_CONCURRENCY = 3;
+
+function readProvisionConcurrency(): number {
+  const raw = process.env['TRADER_E2E_PROVISION_CONCURRENCY'];
+  if (raw === undefined || raw === '') return DEFAULT_PROVISION_CONCURRENCY;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_PROVISION_CONCURRENCY;
+  return n;
+}
+
 /**
- * Provisions multiple traders sequentially.
+ * Provision multiple traders with bounded parallelism.
  *
- * **Why sequential, not parallel:** the testnet's single Nostr relay is
- * the bottleneck. When N traders run `Sphere.init` concurrently, all of
- * them publish nametag binding events and then each does a self-verify
- * `sphere.resolve()` query. The relay's queryEvents subscription queue
- * serializes — under N>=3 concurrent load, queries time out at 15s and
- * each trader's verify loop runs out of budget. We've seen all 3 traders
- * hang at sphere_initialized for 180s under pure Promise.all.
+ * **Why bounded, not unbounded Promise.all:** the testnet's single Nostr
+ * relay is the bottleneck. Under unbounded concurrency we have observed
+ * (N≥4) one trader hanging at `sphere_initialized` for 3 minutes while its
+ * `sphere.resolve()` self-verify times out. Bounded parallelism with a
+ * small cap keeps the simultaneous nametag-publish + self-verify load
+ * within the relay's serving budget.
  *
- * Sequential gives each trader's binding event time to propagate to the
- * relay's query index before the next trader starts hitting it. Cost is
- * ~30-60s per trader (dominated by sphere.init + verify); total wall
- * time scales linearly with N.
+ * Concurrency is configurable via `TRADER_E2E_PROVISION_CONCURRENCY` (env
+ * var, default 3). Set to 1 to fall back to fully sequential behavior on
+ * a degraded relay; set higher when the relay is healthy and you want to
+ * cut wall-clock provisioning time. The 2026-04-30 measurement in
+ * `provisioning-load-investigation.e2e-live.test.ts` validates 3-way
+ * parallel provisioning is reliable on a healthy relay.
  *
- * If the testnet relay's subscription throughput improves, this can be
- * revisited as parallel-with-stagger.
+ * **Result ordering** matches the input order regardless of completion
+ * order — callers commonly destructure `[alice, bob, carol] = await ...`
+ * and rely on positional alignment with the factory list.
  */
 export async function provisionTradersStaggered(
   factories: Array<() => Promise<ProvisionedTenant>>,
 ): Promise<ProvisionedTenant[]> {
-  const results: ProvisionedTenant[] = [];
-  for (const factory of factories) {
-    if (factory === undefined) continue;
-    results.push(await factory());
+  const tasks = factories.filter((f): f is () => Promise<ProvisionedTenant> => f !== undefined);
+  const concurrency = Math.min(readProvisionConcurrency(), Math.max(tasks.length, 1));
+  const results: ProvisionedTenant[] = new Array(tasks.length);
+
+  let nextIndex = 0;
+  // Worker pool: each worker pulls the next task index and runs it. When
+  // the index pointer crosses the task list, the worker exits. With
+  // `concurrency` workers we cap simultaneous in-flight provisions.
+  async function worker(): Promise<void> {
+    for (;;) {
+      const i = nextIndex++;
+      if (i >= tasks.length) return;
+      // Non-null assertion is safe: i < tasks.length guarantees defined.
+      results[i] = await tasks[i]!();
+    }
   }
+
+  const workers: Array<Promise<void>> = [];
+  for (let i = 0; i < concurrency; i++) {
+    workers.push(worker());
+  }
+  // Promise.all rejects on the first worker error. Other workers are still
+  // running, so newly-finished provisions may need cleanup — but that
+  // cleanup is the caller's concern (afterAll always disposes whatever
+  // resolved). The original sequential implementation had the same
+  // semantics: a failure in trader N didn't dispose 0..N-1.
+  await Promise.all(workers);
   return results;
 }
 
