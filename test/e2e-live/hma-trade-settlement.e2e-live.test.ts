@@ -113,19 +113,36 @@ const skipReason = !cliProbe.ok
 // Shared HMA + controller fixture
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-scenario controller: the controller wallet (cliHome + pubkey/addr).
+ * Concurrent `sphere host spawn` invocations write to .sphere-cli/wallet.json
+ * inside cliHome (the SDK persists incoming-DM state there atomically via
+ * temp+rename). Two parallel calls in the same cliHome corrupt each other's
+ * rename — give each scenario its own cliHome to make concurrency safe.
+ */
+interface ScenarioController {
+  cliHome: string;
+  pubkey: string;
+  directAddress: string;
+}
+
 interface SuiteState {
   cliPath: string;
-  cliHome: string;
+  /** All cliHome dirs we created — afterAll wipes them. */
+  cliHomes: string[];
   manager: HostManagerProcess;
   managerAddr: string;
-  controllerDirectAddress: string;
+  controllers: ScenarioController[];
   spawned: SpawnedTenant[];
 }
 
-// Both scenarios share the HMA and controller wallet (no point booting
-// two HMAs to test parallelism — production has one HMA per host). The
-// `spawned` list is mutated by each scenario as it provisions tenants
-// so afterAll can stop them all in parallel.
+// Number of concurrent settlement scenarios. Each gets its own controller
+// wallet + own cliHome. Bumping this raises the parallel infra load
+// (more concurrent spawn DMs, more concurrent listdeals polls during
+// settlement). Two is the contract test for the parallelism claim;
+// higher values stress-test the relay+aggregator+HMA further.
+const SCENARIO_COUNT = 2;
+
 let state: SuiteState | null = null;
 
 const SELF_MINT_AMOUNT = 5000n; // matches basic-roundtrip
@@ -151,36 +168,58 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     if (skip) return;
     if (!cliProbe.ok) throw new Error('precondition gate inverted');
     const cliPath = cliProbe.path;
-    const { home: cliHome } = createSphereCliEnv('hma-trade-settlement');
 
-    console.log('[hma-trade-settlement] bootstrapping controller wallet…');
-    const controller = bootstrapControllerWallet(cliPath, cliHome);
-    console.log(`[hma-trade-settlement] controller pubkey ${controller.pubkey.slice(0, 16)}…`);
+    // One controller wallet per scenario — concurrent sphere-cli calls
+    // in the same .sphere-cli/wallet.json race on the SDK's atomic
+    // temp+rename writes (sphere-sdk persists DM state per call).
+    // Bootstrap them sequentially; the wallet-init aggregator round-trip
+    // (~30s each) dominates this section anyway and parallel inits also
+    // race on the same OS-level temp dirs.
+    const controllers: ScenarioController[] = [];
+    const cliHomes: string[] = [];
+    for (let i = 0; i < SCENARIO_COUNT; i++) {
+      const { home } = createSphereCliEnv(`hma-trade-settlement-c${String(i)}`);
+      cliHomes.push(home);
+      console.log(`[hma-trade-settlement] bootstrapping controller wallet #${String(i)}…`);
+      const c = bootstrapControllerWallet(cliPath, home);
+      console.log(`[hma-trade-settlement] controller #${String(i)} pubkey ${c.pubkey.slice(0, 16)}…`);
+      controllers.push({ cliHome: home, pubkey: c.pubkey, directAddress: c.directAddress });
+    }
 
+    // HMA accepts AUTHORIZED_CONTROLLERS as a comma-separated list of
+    // pubkeys (see agentic-hosting/src/shared/config.ts:52). Authorize
+    // every scenario's controller in one HMA — production has one HMA
+    // per host serving multiple operators, so this matches the real
+    // multi-tenant topology.
     console.log('[hma-trade-settlement] booting host-manager…');
-    const manager = await spawnHostManager({ controllerPubkey: controller.pubkey });
+    const manager = await spawnHostManager({
+      controllerPubkey: controllers.map((c) => c.pubkey).join(','),
+    });
     await manager.ready;
     const managerAddr = manager.nametag ? `@${manager.nametag}` : manager.pubkey;
     console.log(`[hma-trade-settlement] manager ready @ ${managerAddr}`);
 
     state = {
       cliPath,
-      cliHome,
+      cliHomes,
       manager,
       managerAddr,
-      controllerDirectAddress: controller.directAddress,
+      controllers,
       spawned: [],
     };
-  }, 240_000);
+  }, 600_000); // 10 min — wallet-init is ~30s per controller on testnet
 
   afterAll(async () => {
     if (!state) return;
-    // Best-effort parallel cleanup — never let one stop block the rest.
+    // Best-effort parallel cleanup. Use the FIRST controller's cliHome
+    // for stop calls — the HMA accepts stops from any authorized
+    // controller, so we don't need to issue one stop per controller.
+    const stopHome = state.controllers[0]?.cliHome ?? state.cliHomes[0]!;
     await Promise.allSettled(
       state.spawned.map((t) =>
         hostStop({
           cliPath: state!.cliPath,
-          cliHome: state!.cliHome,
+          cliHome: stopHome,
           managerAddress: state!.manager.pubkey,
           target: t.instanceName,
           timeoutMs: 60_000,
@@ -188,8 +227,10 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       ),
     );
     await state.manager.stop();
-    try { rmSync(state.cliHome, { recursive: true, force: true }); }
-    catch { /* best effort */ }
+    for (const home of state.cliHomes) {
+      try { rmSync(home, { recursive: true, force: true }); }
+      catch { /* best effort */ }
+    }
   }, 240_000);
 
   // ---- Per-scenario helpers -------------------------------------------------
@@ -202,7 +243,10 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    * TRADER_TEST_FUND is not in FORBIDDEN_ENV_KEYS and doesn't start
    * with UNICITY_ so it's allowed through).
    */
-  async function provisionTriple(scenarioId: string): Promise<{
+  async function provisionTriple(
+    scenarioId: string,
+    controller: ScenarioController,
+  ): Promise<{
     escrow: SpawnedTenant;
     alice: SpawnedTenant;
     bob: SpawnedTenant;
@@ -217,7 +261,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     const [escrow, alice, bob] = await Promise.all([
       hostSpawnAsync({
         cliPath: s.cliPath,
-        cliHome: s.cliHome,
+        cliHome: controller.cliHome,
         managerAddress: s.managerAddr,
         templateId: 'escrow-service',
         instanceName: `escrow-${scenarioId}`,
@@ -225,7 +269,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       }),
       hostSpawnAsync({
         cliPath: s.cliPath,
-        cliHome: s.cliHome,
+        cliHome: controller.cliHome,
         managerAddress: s.managerAddr,
         templateId: 'trader-agent',
         instanceName: `alice-${scenarioId}`,
@@ -234,7 +278,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       }),
       hostSpawnAsync({
         cliPath: s.cliPath,
-        cliHome: s.cliHome,
+        cliHome: controller.cliHome,
         managerAddress: s.managerAddr,
         templateId: 'trader-agent',
         instanceName: `bob-${scenarioId}`,
@@ -276,21 +320,24 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    *      address; assert transfer_id non-empty + post-withdraw balance
    *      reflects the withdrawal.
    */
-  async function runSettlementScenario(scenarioId: string): Promise<void> {
+  async function runSettlementScenario(
+    scenarioId: string,
+    controller: ScenarioController,
+  ): Promise<void> {
     if (!state) throw new Error('beforeAll did not initialize state');
     const s = state;
-    const { escrow, alice, bob } = await provisionTriple(scenarioId);
+    const { escrow, alice, bob } = await provisionTriple(scenarioId, controller);
 
     // ---- 2. Configure trusted escrows on both traders --------------
     console.log(`[${scenarioId}] set-strategy on alice + bob (parallel)…`);
     await Promise.all([
       setStrategyAsync({
-        cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey,
+        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
         trustedEscrows: [escrow.tenantPubkey],
         maxConcurrent: 5,
       }),
       setStrategyAsync({
-        cliPath: s.cliPath, cliHome: s.cliHome, tenant: bob.tenantPubkey,
+        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
         trustedEscrows: [escrow.tenantPubkey],
         maxConcurrent: 5,
       }),
@@ -298,8 +345,8 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
 
     // ---- 3. Pre-trade portfolio snapshot ---------------------------
     const [aliceBefore, bobBefore] = await Promise.all([
-      portfolioAsync({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey }),
-      portfolioAsync({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: bob.tenantPubkey }),
+      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey }),
+      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey }),
     ]);
     const aliceUctBefore = balanceOf(aliceBefore, 'UCT');
     const aliceUsduBefore = balanceOf(aliceBefore, 'USDU');
@@ -319,7 +366,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     console.log(`[${scenarioId}] posting matching intents (parallel)…`);
     const [aliceIntent, bobIntent] = await Promise.all([
       createIntentAsync({
-        cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey,
+        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
         direction: 'buy',
         baseAsset: 'UCT', quoteAsset: 'USDU',
         rateMin: TRADE_RATE, rateMax: TRADE_RATE,
@@ -327,7 +374,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
         expiryMs: SWAP_TIMEOUT_MS,
       }),
       createIntentAsync({
-        cliPath: s.cliPath, cliHome: s.cliHome, tenant: bob.tenantPubkey,
+        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
         direction: 'sell',
         baseAsset: 'UCT', quoteAsset: 'USDU',
         rateMin: TRADE_RATE, rateMax: TRADE_RATE,
@@ -344,12 +391,12 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     console.log(`[${scenarioId}] waiting for COMPLETED on both sides…`);
     const [aliceDeal, bobDeal] = await Promise.all([
       waitForDealInStateAsync({
-        cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey,
+        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
         targetState: 'COMPLETED',
         timeoutMs: SWAP_TIMEOUT_MS,
       }),
       waitForDealInStateAsync({
-        cliPath: s.cliPath, cliHome: s.cliHome, tenant: bob.tenantPubkey,
+        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
         targetState: 'COMPLETED',
         timeoutMs: SWAP_TIMEOUT_MS,
       }),
@@ -369,8 +416,8 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     await new Promise((r) => setTimeout(r, 5_000));
 
     const [aliceAfter, bobAfter] = await Promise.all([
-      portfolioAsync({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey }),
-      portfolioAsync({ cliPath: s.cliPath, cliHome: s.cliHome, tenant: bob.tenantPubkey }),
+      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey }),
+      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey }),
     ]);
     const aliceUctAfter = balanceOf(aliceAfter, 'UCT');
     const aliceUsduAfter = balanceOf(aliceAfter, 'USDU');
@@ -404,10 +451,10 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     // including the round-6 trim+validation gate.
     console.log(`[${scenarioId}] withdraw ${WITHDRAW_AMOUNT} UCT from alice → controller…`);
     const wr = await withdrawAsync({
-      cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey,
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
       asset: 'UCT',
       amount: WITHDRAW_AMOUNT,
-      toAddress: s.controllerDirectAddress,
+      toAddress: controller.directAddress,
     });
     expect(wr.transferId).toMatch(/^[a-zA-Z0-9_-]+$/);
     expect(wr.transferId.length).toBeGreaterThan(8);
@@ -418,7 +465,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     // confirmed bucket (testnet aggregator round-trip).
     await new Promise((r) => setTimeout(r, 5_000));
     const aliceFinal = await portfolioAsync({
-      cliPath: s.cliPath, cliHome: s.cliHome, tenant: alice.tenantPubkey,
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
     });
     const aliceUctFinal = balanceOf(aliceFinal, 'UCT');
     expect(
@@ -432,10 +479,16 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
   // ---- Concurrent scenarios -----------------------------------------------
 
   it('Pair-1: full spawn → trade → settle → withdraw via HMA', async () => {
-    await runSettlementScenario(`p1-${randomUUID().slice(0, 6)}`);
+    if (!state) throw new Error('beforeAll did not initialize state');
+    const c = state.controllers[0];
+    if (!c) throw new Error('controller #0 missing');
+    await runSettlementScenario(`p1-${randomUUID().slice(0, 6)}`, c);
   }, SWAP_TIMEOUT_MS + 4 * 60_000); // 12 min total budget per scenario
 
   it('Pair-2: parallel scenario settles on the same HMA without interference', async () => {
-    await runSettlementScenario(`p2-${randomUUID().slice(0, 6)}`);
+    if (!state) throw new Error('beforeAll did not initialize state');
+    const c = state.controllers[1];
+    if (!c) throw new Error('controller #1 missing');
+    await runSettlementScenario(`p2-${randomUUID().slice(0, 6)}`, c);
   }, SWAP_TIMEOUT_MS + 4 * 60_000);
 });
