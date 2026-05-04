@@ -20,7 +20,13 @@ export const TERMINAL_INTENT_STATES: readonly IntentState[] = ['FILLED', 'CANCEL
 
 export const VALID_INTENT_TRANSITIONS: Record<IntentState, readonly IntentState[]> = {
   DRAFT: ['ACTIVE'],
-  ACTIVE: ['MATCHING', 'CANCELLED', 'EXPIRED'],
+  // ACTIVE → PARTIALLY_FILLED / FILLED is permitted because an acceptor never
+  // passes through MATCHING: only the side that proposes runs the match-fan-out
+  // path that transitions the intent into MATCHING. The acceptor's intent
+  // remains ACTIVE until the swap completes, and recordFill must be able to
+  // record the fill directly. Without this, every swap silently failed to
+  // credit volume on the acceptor's side.
+  ACTIVE: ['MATCHING', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'EXPIRED'],
   MATCHING: ['NEGOTIATING', 'ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED'],
   NEGOTIATING: ['ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED'],
   PARTIALLY_FILLED: ['MATCHING', 'FILLED', 'CANCELLED', 'EXPIRED'],
@@ -117,6 +123,20 @@ export interface DealRecord {
   readonly swap_id: string | null;
   readonly acceptor_swap_address: string | null;
   readonly updated_at: number;
+  /**
+   * Failure reason recorded when state transitions to FAILED. Populated from
+   * the `reason` argument passed to `OnSwapFailed` (e.g. `EXECUTION_TIMEOUT`,
+   * `ESCROW_UNREACHABLE`, `INVALID_ESCROW`, `PAYOUT_UNVERIFIED`,
+   * `PROPOSE_SWAP_FAILED: <message>`) and surfaced via list-deals so
+   * operators can distinguish a network-unreachable failure from a
+   * protocol-violation failure from a verification-gap failure without
+   * cross-referencing logs.
+   *
+   * Optional: only present on FAILED records. Absent on PROPOSED / ACCEPTED /
+   * EXECUTING / COMPLETED / CANCELLED transitions (CANCELLED has its own
+   * counterparty-signed `np.reject_deal` payload as the source of truth).
+   */
+  readonly error_code?: string;
   /**
    * Round-17 F1: the counterparty-signed NP-0 envelope that proves this deal
    * was genuinely negotiated. For role=PROPOSER this is the `np.accept_deal`

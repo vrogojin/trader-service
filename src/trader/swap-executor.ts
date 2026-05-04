@@ -40,6 +40,17 @@ export interface SwapAdapter {
   verifyPayout(swapId: string): Promise<boolean>;
   /** Wait for background operations (e.g. change token persistence) to complete. */
   waitForPendingOperations?(): Promise<void>;
+  /**
+   * Read SDK-side swap status. Used by EXECUTION_TIMEOUT to detect whether
+   * the swap has already reached a terminal SDK state (completed/cancelled/
+   * failed). On testnet the L3 confirmation latency at the verifyPayout
+   * stage often exceeds the trader's deposit_timeout_sec + grace budget.
+   * Without this check we'd incorrectly transition a successful swap to
+   * trader-side FAILED while the SDK considers it COMPLETED, producing
+   * the ledger-vs-chain inconsistency the EXECUTION_TIMEOUT handler is
+   * supposed to PREVENT.
+   */
+  getSwapStatus?(swapId: string): Promise<{ progress?: string } | null>;
 }
 
 export interface SwapDealInput {
@@ -75,6 +86,22 @@ export interface SwapProposalMatchInfo {
   partyBAmount?: string;
   /** Pubkey of the counterparty (proposer), for disambiguation. */
   counterpartyPubkey?: string;
+  /**
+   * SECURITY (spec 7.9.4 / H1): escrow address advertised by the SDK swap
+   * proposal. Compared against the negotiated DealTerms.escrow_address — a
+   * mismatch means the counterparty pivoted to a different escrow at the
+   * SDK layer than what was negotiated, defeating the trusted_escrows
+   * allowlist. Reject on mismatch.
+   */
+  escrowDirectAddress?: string;
+  /** Escrow chain pubkey (alternate identification when DIRECT addresses don't match). */
+  escrowPubkey?: string;
+  /**
+   * SECURITY (spec 7.9.4 / H1): deposit timeout from the SDK proposal, in
+   * seconds. Compared against DealTerms.deposit_timeout_sec; a hostile
+   * counterparty who lengthens the timeout shifts the funds-at-risk window.
+   */
+  depositTimeoutSec?: number;
 }
 
 export interface SwapExecutor {
@@ -116,6 +143,15 @@ export interface SwapExecutor {
   getActiveDeals(): Array<{ deal_id: string; swap_id: string | null; state: string }>;
   /** Get recent errors for debugging. */
   getLastErrors(): Array<{ ts: number; deal_id: string; error: string }>;
+
+  /**
+   * Replace the executor's strategy snapshot. Called from the SET_STRATEGY
+   * command handler so changes to `max_concurrent_swaps`, `trusted_escrows`,
+   * etc. take effect at runtime. Without this, the executor keeps the
+   * startup snapshot and operators see "set-strategy didn't take effect"
+   * until the trader restarts.
+   */
+  updateStrategy(newStrategy: TraderStrategy): void;
 
   /** Stop all pending operations. */
   stop(): void;
@@ -221,7 +257,11 @@ export function buildSwapDealInput(
 // ---------------------------------------------------------------------------
 
 export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
-  const { swap, strategy, onSwapCompleted, onSwapFailed, agentPubkey, agentAddress, logger } = deps;
+  const { swap, onSwapCompleted, onSwapFailed, agentPubkey, agentAddress, logger } = deps;
+  // C1 (steelman round-4): keep `strategy` mutable so SET_STRATEGY changes
+  // propagate at runtime via updateStrategy(). All callsites read through
+  // this binding (NOT a destructured copy), so they see the current values.
+  let strategy: TraderStrategy = { ...deps.strategy };
   // Use directAddress for swap proposals to avoid nametag resolution timing issues
   // in bundled/containerized environments. Falls back to agentAddress if not provided.
   const swapAddress = deps.swapDirectAddress || agentAddress;
@@ -273,20 +313,98 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
       if (stopped) return;
       const dealId = entry.deal.terms.deal_id;
       const swapId = entry.swapId;
-      logger.error('execution_timeout', {
-        deal_id: dealId,
-        swap_id: swapId,
-        timeout_sec: clampedTimeoutSec + EXECUTION_TIMEOUT_GRACE_SEC,
-      });
-      entry.deal = transitionDeal(entry.deal, 'FAILED');
-      unregisterActive(entry);
-      void onSwapFailed(entry.deal, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
-        logger.error('on_swap_failed_callback_error', {
-          deal_id: dealId,
-          error: String(err),
-        });
-      });
+
+      // 2026-04-30 FIX (basic-roundtrip flake investigation):
+      // Don't EXECUTION_TIMEOUT a swap that the SDK already considers
+      // terminal. Empirical observation: testnet L3 confirmation latency
+      // at the verifyPayout stage often exceeds deposit_timeout_sec +
+      // grace (420s by default). The SDK's swap state machine reaches
+      // `completed` before the trader's timer fires, but the wallet's
+      // verifyPayout retry loop (10 min) is still running to wait for L3.
+      // Pre-fix, the trader's timer would transition the deal to FAILED
+      // even though the SDK considered the swap done; the subsequent
+      // rejectSwap call returned "Cannot reject: swap is already
+      // completed", flagging the inconsistency.
+      //
+      // Async: we kick off the status check, but don't await — we still
+      // need to fall through to fail-path if the SDK status is unknown
+      // or actively non-terminal. The timer is fire-and-forget; the
+      // status check sets a flag `skipFailPath` that the inner async
+      // function honors before transitioning.
+      void (async () => {
+        if (deps.swap.getSwapStatus !== undefined && swapId !== null) {
+          try {
+            const status = await deps.swap.getSwapStatus(swapId);
+            const progress = status?.progress;
+            if (progress === 'completed' || progress === 'cancelled' || progress === 'failed') {
+              logger.warn('execution_timeout_skipped_terminal_swap', {
+                deal_id: dealId,
+                swap_id: swapId,
+                sdk_progress: progress,
+                note: 'SDK swap is already terminal — letting verifyPayout retries finish',
+              });
+              // Don't transition deal or fire onSwapFailed. The verifyPayout
+              // retry loop in main.ts will resolve via the swap:completed /
+              // swap:failed events.
+              return;
+            }
+          } catch (statusErr: unknown) {
+            // If status check fails we proceed with the original failure
+            // path — better safe than sorry on unknown SDK state.
+            logger.warn('execution_timeout_status_check_failed', {
+              deal_id: dealId,
+              swap_id: swapId,
+              error: statusErr instanceof Error ? statusErr.message : String(statusErr),
+            });
+          }
+        }
+        execFailPath(entry, dealId, swapId);
+      })();
     }, timeoutMs);
+  }
+
+  function execFailPath(entry: ActiveDeal, dealId: string, swapId: string | null): void {
+    if (stopped) return;
+    logger.error('execution_timeout', {
+      deal_id: dealId,
+      swap_id: swapId,
+      timeout_sec: 0, // exact value lost across the async hop; not load-bearing
+    });
+    entry.deal = transitionDeal(entry.deal, 'FAILED');
+    // SECURITY (C3): cancel the SDK swap BEFORE unregistering. Without
+    // this, a swap that completes after the timeout would emit
+    // swap:completed for a swapId no longer in activeBySwapId — the
+    // handler logs and drops, but the escrow has already moved funds.
+    // Result: ledger says FAILED, chain says COMPLETED, fill never
+    // recorded. Best-effort: if rejectSwap fails (already terminal,
+    // network), log and continue — the failure-path semantics still
+    // hold from the trader's perspective; reconciliation surfaces the
+    // discrepancy.
+    if (swapId !== null) {
+      deps.swap.rejectSwap(swapId, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
+        // N4 (round-5 audit): escalate to error level — when this fails,
+        // there's a real risk the SDK swap subsequently completes while
+        // our ledger says FAILED, producing the exact ledger-vs-chain
+        // inconsistency the round-4 fix was added for. Operator-visible
+        // alert path: the entry is also pushed into lastErrors so
+        // getLastErrors() surfaces it without log archaeology.
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error('execution_timeout_reject_failed', {
+          deal_id: dealId,
+          swap_id: swapId,
+          error: msg,
+          inconsistency_risk: true,
+        });
+        recordError(dealId, `EXECUTION_TIMEOUT_REJECT_FAILED: ${msg}`);
+      });
+    }
+    unregisterActive(entry);
+    void onSwapFailed(entry.deal, 'EXECUTION_TIMEOUT').catch((err: unknown) => {
+      logger.error('on_swap_failed_callback_error', {
+        deal_id: dealId,
+        error: String(err),
+      });
+    });
   }
 
   function clearExecutionTimer(entry: ActiveDeal): void {
@@ -358,6 +476,25 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
 
     // 4. Build SwapDealInput from DealTerms (proposer only)
     const swapDealInput = buildSwapDealInput(deal, agentPubkey, swapAddress);
+
+    // DIAGNOSTIC: log the full SwapDealInput so we can verify direction-to-
+    // currency mapping. Bug-suspicion: if proposer is direction='buy' but
+    // partyACurrency lands on base_asset (UCT) instead of quote_asset (USDU),
+    // the buyer ends up depositing the wrong currency.
+    logger.info('swap_propose_input_diag', {
+      deal_id: deal.terms.deal_id,
+      proposer_direction: deal.terms.proposer_direction,
+      base_asset: deal.terms.base_asset,
+      quote_asset: deal.terms.quote_asset,
+      rate: deal.terms.rate.toString(),
+      volume: deal.terms.volume.toString(),
+      partyA: swapDealInput.partyA,
+      partyB: swapDealInput.partyB,
+      partyACurrency: swapDealInput.partyACurrency,
+      partyAAmount: swapDealInput.partyAAmount,
+      partyBCurrency: swapDealInput.partyBCurrency,
+      partyBAmount: swapDealInput.partyBAmount,
+    });
 
     // 5. Register before proposeSwap
     const entry: ActiveDeal = { deal, swapId: null };
@@ -516,6 +653,87 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
           // On the acceptor path, counterparty is the proposer.
           if (!pubkeysEqual(entry.deal.terms.proposer_pubkey, match.counterpartyPubkey)) return false;
         }
+        // SECURITY (spec 7.9.4 / H1): extend term-binding to escrow address
+        // and timeout. If the SDK proposal advertises a different escrow
+        // address than what was negotiated, or a different deposit timeout,
+        // a hostile counterparty has pivoted at the SDK layer — refuse to
+        // bind. Only enforce when the SDK actually surfaced these fields
+        // (some SDK versions don't expose them); the absence is logged
+        // upstream in main.ts.
+        // SECURITY (round-4 audit N2 + round-5 review CRITICAL): bind the
+        // SDK swap's escrow to the negotiated DealTerms.escrow_address
+        // ONLY when the negotiated form is concrete (DIRECT://hex). Two
+        // legitimate negotiated forms must skip the binding check:
+        //
+        //   1. The wildcard sentinel 'any' (DEFAULT_ESCROW) — used when
+        //      the intent was created without an explicit escrow. The
+        //      `trusted_escrows` allowlist filter at NP-0 negotiation
+        //      time already enforces policy; a per-swap concrete-binding
+        //      check here would reject the entire default flow.
+        //   2. Nametag form (starts with '@') — the negotiated form
+        //      hasn't been resolved to DIRECT://hex yet; comparison
+        //      against the SDK's resolved DIRECT://hex form is moot.
+        //      Resolution happens at SDK swap-proposal time; the
+        //      trusted_escrows filter still ran on the original nametag.
+        //
+        // For concrete (DIRECT://hex) negotiated forms, require BOTH the
+        // escrowDirectAddress AND escrowPubkey (when supplied) to match.
+        // The previous OR semantics let a hostile counterparty spoof
+        // ONE of the two and still pass binding.
+        if (match.escrowDirectAddress !== undefined && match.escrowDirectAddress !== '') {
+          const negotiatedEscrow = entry.deal.terms.escrow_address;
+          const isWildcard = negotiatedEscrow === 'any';
+          const isNametag = negotiatedEscrow.startsWith('@');
+          if (!isWildcard && !isNametag) {
+            // Concrete DIRECT://hex binding — must match the SDK's
+            // authoritative escrowDirectAddress for this swap.
+            //
+            // Round-5b correction (post-live observation): an earlier
+            // pass also required `negotiatedEscrow === escrowPubkey` or
+            // `negotiatedEscrow === DIRECT://${escrowPubkey}` as a
+            // secondary clause. Both were wrong:
+            //
+            //   1. The two SDK-reported fields (escrowDirectAddress and
+            //      escrowPubkey) come from the SAME getSwapStatus() call,
+            //      not independent sources. They cannot diverge under
+            //      attacker manipulation — a hostile pivot updates both
+            //      together. Once directMatches binds against the
+            //      negotiated escrow, we've already detected any pivot;
+            //      the pubkey clause adds nothing.
+            //
+            //   2. `DIRECT://${pubkey}` is naive string-concat. Real
+            //      DIRECT addresses are derived via
+            //      UnmaskedPredicateReference(pubkey).toAddress() — a
+            //      structural hash, not the raw pubkey. The clause
+            //      false-rejected every legitimate proposal seen in
+            //      basic-roundtrip 2026-04-29.
+            //
+            // If we ever need to verify the pubkey-derives-the-DIRECT
+            // invariant, do it via the SDK's UnmaskedPredicateReference
+            // helper, not string concatenation.
+            const directMatches = negotiatedEscrow === match.escrowDirectAddress;
+            if (!directMatches) {
+              logger.warn('swap_id_register_escrow_mismatch', {
+                swap_id: swapId,
+                negotiated_escrow: negotiatedEscrow,
+                proposal_escrow: match.escrowDirectAddress,
+                proposal_escrow_pubkey: match.escrowPubkey,
+              });
+              return false;
+            }
+          }
+        }
+        if (match.depositTimeoutSec !== undefined) {
+          const negotiated = entry.deal.terms.deposit_timeout_sec;
+          if (negotiated !== undefined && negotiated !== match.depositTimeoutSec) {
+            logger.warn('swap_id_register_timeout_mismatch', {
+              swap_id: swapId,
+              negotiated_timeout_sec: negotiated,
+              proposal_timeout_sec: match.depositTimeoutSec,
+            });
+            return false;
+          }
+        }
         return true;
       });
     }
@@ -589,6 +807,13 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
     },
     getLastErrors() {
       return [...lastErrors];
+    },
+    updateStrategy(newStrategy: TraderStrategy): void {
+      strategy = { ...newStrategy };
+      logger.info('swap_executor_strategy_updated', {
+        max_concurrent_swaps: strategy.max_concurrent_swaps,
+        trusted_escrows_count: strategy.trusted_escrows.length,
+      });
     },
     stop: stopAll,
   };

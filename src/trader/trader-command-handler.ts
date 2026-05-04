@@ -169,6 +169,10 @@ function toDealSummary(rec: DealRecord, agentPubkey: string): DealSummary {
     swap_id: rec.swap_id,
     created_ms: rec.terms.created_ms,
     updated_ms: rec.updated_at,
+    // Surface the recorded failure code for FAILED records so list-deals
+    // consumers can distinguish ESCROW_UNREACHABLE from EXECUTION_TIMEOUT
+    // from PAYOUT_UNVERIFIED without trawling logs.
+    ...(rec.error_code !== undefined ? { error_code: rec.error_code } : {}),
   };
 }
 

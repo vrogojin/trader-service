@@ -259,7 +259,24 @@ export async function startTrader(): Promise<void> {
     },
   });
 
-  const nametag = `t-${config.instance_id.replace(/[^a-z0-9]/g, '').slice(0, 12)}`;
+  // 2026-04-30 FIX (basic-roundtrip flake investigation): expand the
+  // nametag entropy from 3 hex chars to 9. The pre-fix slice(0, 12)
+  // gave only `tradere2e` (9 fixed) + 3 hex → 4096 distinct nametags.
+  // Nostr relays persist NIP-17 nametag bindings indefinitely, so test
+  // runs accumulated bindings on the relay until a fresh UUID's first
+  // 3 hex chars happened to match a prior run's binding.
+  // publishNametagBinding then rejected with "already claimed" and the
+  // process exited at ~1s — but `waitForReadyAddress` polls for
+  // `sphere_initialized` for 180s, mis-interpreting the early exit as
+  // a hang.
+  //
+  // Constraint: Unicity ID format is "lowercase alphanumeric,
+  // underscore, or hyphen (3-20 chars)" (validated by Sphere SDK at
+  // registerNametag time). With `t-` prefix (2) we have 18 chars for
+  // the rest. Slicing 18 of the sanitized instance_id gives
+  // `tradere2e` (9) + 9 hex (16^9 = 68 billion combinations) →
+  // effectively collision-free across all foreseeable test history.
+  const nametag = `t-${config.instance_id.replace(/[^a-z0-9]/g, '').slice(0, 18)}`;
   logger.info('registering_nametag', { nametag });
 
   // Enable SDK debug logging for swap diagnostics only when log_level is debug
@@ -303,33 +320,54 @@ export async function startTrader(): Promise<void> {
   const swapDirectAddress = agentAddress; // @nametag
 
   // Verify nametag is resolvable on the relay before declaring ready.
-  // The binding event must have propagated so other agents and the faucet
-  // can find us by @nametag. Retry with backoff if not yet visible.
-  const MAX_NAMETAG_VERIFY_ATTEMPTS = 10;
-  const NAMETAG_VERIFY_DELAY_MS = 2_000;
+  //
+  // Why we need this: downstream consumers (the faucet, peer DMs, the
+  // controller's runTraderCtl) all do nametag→pubkey lookups via the
+  // same relay. If we declare ready before the binding event has
+  // propagated to the relay's query index, those consumers see "Nametag
+  // not found" (or worse, time out) and the test fails non-locally.
+  //
+  // Why this is bounded (not "forever proceeding anyway"): each
+  // sphere.resolve() call is wrapped in a short timeout (3s) so a
+  // single hung subscription doesn't wedge the loop. Total budget is
+  // 60s — long enough to cover real testnet propagation under load,
+  // short enough that an end-to-end-broken relay surfaces as a clear
+  // startup error rather than a 180s hang in waitForReadyAddress.
+  //
+  // Why per-call timeout (3s) is much shorter than the SDK's internal
+  // queryEvents timeout (15s): we want quick retry cadence. If a query
+  // hangs because the relay is briefly overloaded by another trader's
+  // simultaneous activity, retrying after 3s is better than waiting
+  // 15s for the SDK's own timeout.
+  const MAX_NAMETAG_VERIFY_ATTEMPTS = 30;
+  const NAMETAG_VERIFY_DELAY_MS = 1_000;
+  const RESOLVE_TIMEOUT_MS = 3_000;
   for (let attempt = 1; attempt <= MAX_NAMETAG_VERIFY_ATTEMPTS; attempt++) {
     try {
-      const resolved = await sphere.resolve(agentAddress);
+      const resolved = await Promise.race([
+        sphere.resolve(agentAddress),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), RESOLVE_TIMEOUT_MS),
+        ),
+      ]);
       if (resolved?.directAddress) {
         logger.info('nametag_verified', {
           nametag: identity.nametag,
-          directAddress: resolved.directAddress.slice(0, 30) + '...',
-          attempt,
+          attempts: attempt,
         });
         break;
       }
-      logger.warn('nametag_not_yet_resolvable', { nametag: identity.nametag, attempt });
     } catch (err: unknown) {
-      logger.warn('nametag_verify_error', {
+      logger.debug('nametag_verify_error', {
         nametag: identity.nametag,
         attempt,
         error: err instanceof Error ? err.message : String(err),
       });
     }
     if (attempt < MAX_NAMETAG_VERIFY_ATTEMPTS) {
-      await new Promise((r) => setTimeout(r, NAMETAG_VERIFY_DELAY_MS * attempt));
+      await new Promise((r) => setTimeout(r, NAMETAG_VERIFY_DELAY_MS));
     } else {
-      logger.error('nametag_verification_failed', {
+      logger.warn('nametag_verification_timeout', {
         nametag: identity.nametag,
         message: 'Nametag not resolvable after all attempts — proceeding anyway',
       });
@@ -351,8 +389,10 @@ export async function startTrader(): Promise<void> {
 
   const payments: PaymentsAdapter = {
     getConfirmedBalance(coinId: string): bigint {
-      const assets = sphere.payments.getBalance(coinId);
-      const asset = assets[0];
+      // getBalance(coinId) filters by exact hex coinId, not by symbol.
+      // Intent assets ('UCT', 'USDU') are symbols — search all balances.
+      const assets = sphere.payments.getBalance();
+      const asset = assets.find(a => a.coinId === coinId || a.symbol === coinId);
       return asset ? BigInt(asset.confirmedAmount) : 0n;
     },
     getAllBalances() {
@@ -461,7 +501,23 @@ export async function startTrader(): Promise<void> {
       try {
         const receiveResult = await sphere.payments.receive({ finalize: true });
         if (receiveResult.transfers.length > 0) {
-          logger.info('sync_receive_transfers', { count: receiveResult.transfers.length });
+          logger.info('sync_receive_transfers', {
+            count: receiveResult.transfers.length,
+            // DIAGNOSTIC: per-transfer details so we can distinguish
+            // invoice-token deliveries from actual payout payments.
+            transfers: receiveResult.transfers.map((t) => ({
+              id: t.id,
+              senderPubkey: t.senderPubkey?.slice(0, 16),
+              senderNametag: t.senderNametag,
+              memo: t.memo?.slice(0, 80) ?? null,
+              receivedAt: t.receivedAt,
+              tokens: t.tokens?.map((tok) => ({
+                coinId: tok.coinId?.slice(0, 16) ?? null,
+                symbol: tok.symbol ?? null,
+                amount: tok.amount ?? null,
+              })),
+            })),
+          });
         }
         // IPFS sync — tokens may be published there alongside Nostr
         if (stopped) return;
@@ -493,6 +549,114 @@ export async function startTrader(): Promise<void> {
   // SDK test calls pingEscrow once before any swaps — we do it here because
   // trusted_escrows are set via ACP command after startup).
   const pingedEscrows = new Set<string>();
+
+  // depositInFlight: per-swapId guard against duplicate deposit() calls.
+  // Used by BOTH the swap:announced event handler AND the swap-poll loop's
+  // fallback path (some SDK paths fire swap:announced only on the proposer
+  // side, not the acceptor — observed live 2026-04-29 basic-roundtrip).
+  // Hoisted to outer scope so both paths share the same dedup state.
+  const depositInFlight = new Set<string>();
+  // Track the deposit fallback issuer separately from the event-driven
+  // path so the structured-log event identifies which path triggered.
+  async function tryDepositForSwap(swapId: string, trigger: 'event' | 'poll'): Promise<void> {
+    if (!sphere.swap) {
+      logger.warn('swap_deposit_no_swap_module', { swap_id: swapId, trigger });
+      return;
+    }
+    // Fault injection: skip deposit on BOTH event and poll triggers when
+    // TRADER_FAULT_SKIP_DEPOSITS=1 is set. Pre-2026-05-01 the check lived
+    // only in the swap:announced event handler; the poll-loop fallback
+    // (`trigger='poll'`) bypassed it and the fault was effectively a no-op
+    // for the acceptor side (where the SDK doesn't always fire
+    // swap:announced and the poll path is the canonical dispatcher).
+    // Hoisting the check here makes the fault honor both code paths.
+    if (process.env['TRADER_FAULT_SKIP_DEPOSITS'] === '1') {
+      logger.warn('fault_inject_deposit_skipped', {
+        swap_id: swapId,
+        trigger,
+        note: 'TRADER_FAULT_SKIP_DEPOSITS=1 — deposit() not called; counterparty will time out',
+      });
+      return;
+    }
+    const swapMod = sphere.swap;
+    if (depositInFlight.has(swapId)) {
+      logger.debug('swap_deposit_already_in_flight', { swap_id: swapId, trigger });
+      return;
+    }
+    depositInFlight.add(swapId);
+    let depositSucceeded = false;
+    try {
+      const isFresh = await agent.markDepositAttempted(swapId);
+      if (!isFresh) {
+        logger.info('swap_deposit_skipped_already_attempted', {
+          swap_id: swapId,
+          trigger,
+          note: 'persistent record indicates this swap was deposited on a previous lifetime',
+        });
+        return;
+      }
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && !stopped) {
+        try {
+          await swapMod.deposit(swapId);
+          logger.info('swap_deposit_sent', { swap_id: swapId, trigger });
+          await sphere.payments.waitForPendingOperations();
+          depositSucceeded = true;
+          return;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // 2026-04-30 FIX: extend the retry filter. Empirical observation
+          // in basic-roundtrip live e2e — when the SDK's `swap:announced`
+          // event fires BEFORE the escrow's invoice_delivery DM arrives
+          // (44ms race seen in the wild), the immediate deposit() call
+          // throws `Deposit invoice not yet imported into accounting
+          // module`. The pre-fix filter only matched "not yet available"
+          // / "SWAP_WRONG_STATE" → fell through to "give up" → the
+          // persistent markDepositAttempted flag from round-5c prevented
+          // future retries. Now we ALSO retry on "not yet imported".
+          //
+          // Defensive: any "not yet" message indicates the SDK-internal
+          // race conditions we care about. Pattern broadened for forward
+          // compat.
+          if (
+            msg.includes('not yet available') ||
+            msg.includes('not yet imported') ||
+            msg.includes('SWAP_WRONG_STATE')
+          ) {
+            await waitCancellable(3000);
+            if (stopped) return;
+            continue;
+          }
+          logger.error('swap_deposit_failed', { swap_id: swapId, trigger, error: msg });
+          return;
+        }
+      }
+    } catch (err: unknown) {
+      logger.error('swap_announced_handler_failed', {
+        swap_id: swapId,
+        trigger,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      depositInFlight.delete(swapId);
+      // 2026-04-30 fix: if deposit didn't succeed, ROLL BACK the
+      // persistent markDepositAttempted flag. Otherwise a transient
+      // failure (or a 60s deadline timeout) would permanently block
+      // future deposit attempts via the persistent
+      // swap_deposit_skipped_already_attempted gate. Spec 7.9.3
+      // idempotency requires "don't double-deposit on restart" — the
+      // flag should only persist AFTER a successful deposit, not
+      // BEFORE the attempt. This restores the correct semantics.
+      if (!depositSucceeded) {
+        await agent.clearDepositAttempted(swapId).catch((clearErr: unknown) => {
+          logger.warn('swap_deposit_attempted_clear_failed', {
+            swap_id: swapId,
+            error: clearErr instanceof Error ? clearErr.message : String(clearErr),
+          });
+        });
+      }
+    }
+  }
   function scheduleSwapPoll(): void {
     if (stopped) return;
     // Remove the previous timer from tracked set (it already fired or is
@@ -522,11 +686,15 @@ export async function startTrader(): Promise<void> {
           }
         } catch { /* best effort */ }
 
-        // Poll active swap status and drive lifecycle explicitly.
-        // This matches the sphere-sdk's swap-continuous.test.ts pattern:
-        // poll getSwapStatus() → when announced, call deposit() → when
-        // completed, the SDK emits swap:completed automatically.
-        // Do NOT rely on events for deposit — they can be missed.
+        // W1 (steelman round-4): the poll-loop deposit branch was dropped.
+        // The canonical deposit trigger is the `swap:announced` event
+        // handler (see below in this file) which uses the `depositInFlight`
+        // Set to dedup against duplicate deliveries. Two parallel paths
+        // both calling sphere.swap.deposit() raced under SWAP_WRONG_STATE
+        // (SDK guard) but emitted "swap_deposit_sent" twice and could
+        // resync waitForPendingOperations() on phantom progress. The poll
+        // loop is preserved for status visibility (diag below) and other
+        // lifecycle observation; deposit issuance is event-driven only.
         try {
           if (stopped) return;
           const swaps = await sphere.swap.getSwaps();
@@ -535,18 +703,47 @@ export async function startTrader(): Promise<void> {
             try {
               if (stopped) return;
               const status = await sphere.swap.getSwapStatus(s.swapId);
-              // Drive deposit explicitly when announced (same as working test)
               if (status.progress === 'announced') {
+                // ROUND-5C FIX (basic-roundtrip flake fix 2026-04-29):
+                // also dispatch deposit from the poll path. The SDK's
+                // swap:announced event was observed firing only on the
+                // proposer side; the acceptor's poll detected
+                // progress=='announced' but never deposited. Now both
+                // paths call tryDepositForSwap which dedups via
+                // depositInFlight + markDepositAttempted (persistent).
+                // Fire-and-forget — the gate prevents redundant work.
+                void tryDepositForSwap(s.swapId, 'poll').catch((err: unknown) => {
+                  logger.warn('swap_deposit_poll_dispatch_failed', {
+                    swap_id: s.swapId,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                });
                 try {
-                  if (stopped) return;
-                  await sphere.swap.deposit(s.swapId);
-                  logger.info('swap_deposit_sent', { swap_id: s.swapId, trigger: 'poll' });
-                  await sphere.payments.waitForPendingOperations();
-                } catch (err: unknown) {
-                  const msg = err instanceof Error ? err.message : String(err);
-                  if (!msg.includes('not yet available') && !msg.includes('SWAP_WRONG_STATE')) {
-                    logger.warn('swap_deposit_poll_error', { swap_id: s.swapId, error: msg });
-                  }
+                  const diagInvoice = status.depositInvoiceId && sphere.accounting
+                    ? sphere.accounting.getInvoice(status.depositInvoiceId)
+                    : null;
+                  logger.info('swap_deposit_target_diag', {
+                    swap_id: s.swapId,
+                    depositInvoiceId: status.depositInvoiceId,
+                    escrowDirectAddress: status.escrowDirectAddress,
+                    escrowPubkey: status.escrowPubkey,
+                    my_role: status.role,
+                    manifest_escrow_address: status.manifest?.escrow_address,
+                    manifest_party_a_address: status.manifest?.party_a_address,
+                    manifest_party_b_address: status.manifest?.party_b_address,
+                    manifest_party_a_currency: status.manifest?.party_a_currency_to_change,
+                    manifest_party_a_value: status.manifest?.party_a_value_to_change,
+                    manifest_party_b_currency: status.manifest?.party_b_currency_to_change,
+                    manifest_party_b_value: status.manifest?.party_b_value_to_change,
+                    invoice_target_addresses: diagInvoice?.terms?.targets?.map((t) => t.address) ?? null,
+                    invoice_target_assets: diagInvoice?.terms?.targets?.[0]?.assets?.map((a) => a.coin) ?? null,
+                    invoice_creator: diagInvoice?.terms?.creator,
+                  });
+                } catch (diagErr) {
+                  logger.warn('swap_deposit_target_diag_failed', {
+                    swap_id: s.swapId,
+                    error: diagErr instanceof Error ? diagErr.message : String(diagErr),
+                  });
                 }
               }
             } catch { /* swap may have been pruned */ }
@@ -651,6 +848,18 @@ export async function startTrader(): Promise<void> {
         async waitForPendingOperations() {
           await sphere.payments.waitForPendingOperations();
         },
+        async getSwapStatus(id) {
+          // EXECUTION_TIMEOUT skip-when-terminal check — see swap-executor.ts.
+          // Reads SDK swap progress to avoid transitioning a successfully-
+          // completed swap to trader-side FAILED while L3 verifyPayout retries
+          // are still legitimately pending.
+          try {
+            const status = await sdkSwap.getSwapStatus(id);
+            return { progress: status?.progress };
+          } catch {
+            return null;
+          }
+        },
       }
     : {
         async proposeSwap() {
@@ -685,6 +894,37 @@ export async function startTrader(): Promise<void> {
     if (isSwap) {
       logger.info('swap_dm_received', {
         prefix: dm.content.slice(0, 20),
+        sender: dm.senderPubkey.slice(0, 16),
+        length: dm.content.length,
+      });
+      return;
+    }
+    // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+    // the escrow's deposit-invoice delivery DM is JSON without a string
+    // prefix — `{"type":"invoice_delivery", "invoice_token": {...}, ...}`.
+    // Log it explicitly so we can confirm receipt on the trader side
+    // when the buyer's invoice_target_addresses stays null in
+    // swap_deposit_target_diag. Distinguishes "DM lost in transport"
+    // from "DM received but not imported into accounting".
+    if (dm.content.startsWith('{') && dm.content.includes('invoice_delivery')) {
+      let messageType = 'unknown';
+      let swapId: string | undefined;
+      let invoiceType: string | undefined;
+      let invoiceId: string | undefined;
+      try {
+        const parsed = JSON.parse(dm.content) as Record<string, unknown>;
+        messageType = String(parsed['type'] ?? 'unknown');
+        if (parsed['swap_id'] !== undefined) swapId = String(parsed['swap_id']);
+        if (parsed['invoice_type'] !== undefined) invoiceType = String(parsed['invoice_type']);
+        if (parsed['invoice_id'] !== undefined) invoiceId = String(parsed['invoice_id']);
+      } catch {
+        /* best-effort */
+      }
+      logger.info('diag_invoice_delivery_dm_received', {
+        message_type: messageType,
+        swap_id: swapId !== undefined ? swapId.slice(0, 16) : undefined,
+        invoice_type: invoiceType,
+        invoice_id: invoiceId !== undefined ? invoiceId.slice(0, 16) : undefined,
         sender: dm.senderPubkey.slice(0, 16),
         length: dm.content.length,
       });
@@ -890,20 +1130,87 @@ export async function startTrader(): Promise<void> {
           // ambiguous assignment is blocked inside the executor.
           try {
             const status = await swapModule.getSwapStatus(data.swapId);
-            const s = status as unknown as {
-              partyACurrency?: string;
-              partyAAmount?: string;
-              partyBCurrency?: string;
-              partyBAmount?: string;
-              partyA?: string;
-              proposer?: string;
-            };
+            // SwapRef has deal.partyACurrency, deal.partyAAmount, etc. and
+            // counterpartyPubkey (transport pubkey of the proposer).
+            const s = status;
+
+            // SECURITY (spec 7.9.5): reject any swap that isn't on
+            // protocolVersion === 2. v1 lacks the mutual-consent signature
+            // chain and doesn't bind escrow_address into swap_id, opening
+            // a MITM substitution vector.
+            //
+            // N1 (round-4 audit) — type-drift defense: parse permissively
+            // so a future SDK that changes the field's encoding (e.g.
+            // string "v2", semver "2.0.0") doesn't silently DoS every
+            // proposal. Accepts: number 2, string "2", string "v2",
+            // semver "2.x.y". Reject everything else.
+            const rawProtocolVersion = (s as unknown as { protocolVersion?: unknown }).protocolVersion;
+            const isV2 = (() => {
+              if (rawProtocolVersion === 2) return true;
+              if (typeof rawProtocolVersion === 'string') {
+                if (rawProtocolVersion === '2' || rawProtocolVersion === 'v2') return true;
+                // semver "2.x.y" → major version 2
+                const match = /^v?(\d+)(?:\.\d+)*$/.exec(rawProtocolVersion);
+                if (match && match[1] === '2') return true;
+              }
+              return false;
+            })();
+            if (!isV2) {
+              logger.warn('swap_proposal_rejected_protocol_version', {
+                swap_id: data.swapId,
+                protocol_version: rawProtocolVersion ?? 'unspecified',
+              });
+              try {
+                await swapModule.rejectSwap(data.swapId, 'PROTOCOL_VERSION_TOO_OLD');
+              } catch (rejErr: unknown) {
+                logger.error('swap_reject_failed', {
+                  swap_id: data.swapId,
+                  error: rejErr instanceof Error ? rejErr.message : String(rejErr),
+                });
+              }
+              return;
+            }
+
+            // SECURITY (M1): if BOTH counterpartyPubkey and proposerChainPubkey
+            // are undefined (SDK version skew, sandbox build, malformed
+            // status), the identity check inside registerSwapId silently
+            // skips, leaving currency/amount alone as identity. In a busy
+            // testnet that's not enough. Reject explicitly.
+            const cpPubkey = s.counterpartyPubkey ?? s.proposerChainPubkey;
+            if (cpPubkey === undefined || cpPubkey === '') {
+              logger.error('swap_proposal_rejected_missing_counterparty_pubkey', {
+                swap_id: data.swapId,
+              });
+              try {
+                await swapModule.rejectSwap(data.swapId, 'MISSING_COUNTERPARTY_PUBKEY');
+              } catch (rejErr: unknown) {
+                // N5 (round-5 audit): mirror the protocolVersion path —
+                // surface rejectSwap failures so an operator can tell
+                // when the escrow held funds awaiting a manual reclaim.
+                logger.error('swap_reject_failed', {
+                  swap_id: data.swapId,
+                  reason: 'MISSING_COUNTERPARTY_PUBKEY',
+                  error: rejErr instanceof Error ? rejErr.message : String(rejErr),
+                });
+              }
+              return;
+            }
+
             registered = agent.registerSwapId(data.swapId, {
-              partyACurrency: s.partyACurrency,
-              partyAAmount: s.partyAAmount,
-              partyBCurrency: s.partyBCurrency,
-              partyBAmount: s.partyBAmount,
-              counterpartyPubkey: s.proposer ?? s.partyA,
+              partyACurrency: s.deal?.partyACurrency,
+              partyAAmount: s.deal?.partyAAmount,
+              partyBCurrency: s.deal?.partyBCurrency,
+              partyBAmount: s.deal?.partyBAmount,
+              counterpartyPubkey: cpPubkey,
+              // SECURITY (spec 7.9.4 / H1): extend term-binding to escrow
+              // address and timeout. registerSwapId compares against the
+              // negotiated DealTerms; mismatch → reject (defeats a hostile
+              // counterparty proposing v2 with a different escrow at the
+              // SDK layer than what was negotiated at NP-0).
+              escrowDirectAddress: (s as unknown as { escrowDirectAddress?: string }).escrowDirectAddress,
+              escrowPubkey: (s as unknown as { escrowPubkey?: string }).escrowPubkey,
+              depositTimeoutSec: (s.deal as unknown as { timeout?: number; depositTimeoutSec?: number })?.depositTimeoutSec
+                ?? (s.deal as unknown as { timeout?: number })?.timeout,
             });
           } catch (err: unknown) {
             logger.warn('swap_proposal_status_fetch_failed', {
@@ -952,37 +1259,58 @@ export async function startTrader(): Promise<void> {
     // retry loop can escape as an unhandled rejection. Waits are cancelable
     // via the `stopped` flag so SIGTERM doesn't leave a background loop
     // retrying deposit() after the trader is torn down.
+    // Fault-injection: when `TRADER_FAULT_SKIP_DEPOSITS=1` is set in the
+    // environment, the trader receives swap:announced events normally but
+    // does NOT call swapModule.deposit(). The escrow's deposit_timeout_sec
+    // counter then expires and the swap fails with EXECUTION_TIMEOUT, which
+    // is exactly the "B does not deposit" leg of the negotiation-failures
+    // deposit-timeout test. Read once at module init so the gate is
+    // immutable for the trader's lifetime — operators can't accidentally
+    // toggle this on a live swap.
+    const FAULT_SKIP_DEPOSITS_ENV = process.env['TRADER_FAULT_SKIP_DEPOSITS'] === '1';
+    // SECURITY (H2): hard-fail at startup if fault injection is enabled on
+    // anything other than testnet/dev. Without this, a poisoned config
+    // pipeline (k8s ConfigMap drift, .env leak from a CI job, image pulled
+    // from a tagged dev branch) can flip the flag on mainnet and silently
+    // break every counterparty's swap with EXECUTION_TIMEOUT.
+    const NETWORK = process.env['UNICITY_NETWORK'] ?? 'testnet';
+    const FAULT_INJECTION_ALLOWED_NETWORKS = new Set(['testnet', 'dev']);
+    const FAULT_INJECTION_ALLOWED = process.env['TRADER_FAULT_INJECTION_ALLOWED'] === '1';
+    if (FAULT_SKIP_DEPOSITS_ENV) {
+      if (!FAULT_INJECTION_ALLOWED_NETWORKS.has(NETWORK) || !FAULT_INJECTION_ALLOWED) {
+        const reason = !FAULT_INJECTION_ALLOWED_NETWORKS.has(NETWORK)
+          ? `network=${NETWORK} (allowed: testnet, dev)`
+          : 'TRADER_FAULT_INJECTION_ALLOWED=1 not set';
+        logger.error('fault_inject_production_guard_violation', {
+          note: 'TRADER_FAULT_SKIP_DEPOSITS=1 rejected at startup',
+          reason,
+          network: NETWORK,
+        });
+        throw new Error(
+          `TRADER_FAULT_SKIP_DEPOSITS=1 not permitted in this environment: ${reason}. ` +
+            `To enable for testing: set UNICITY_NETWORK=testnet (or dev) AND TRADER_FAULT_INJECTION_ALLOWED=1.`,
+        );
+      }
+    }
+    if (FAULT_SKIP_DEPOSITS_ENV) {
+      logger.warn('fault_inject_deposit_skip_enabled', {
+        note: 'trader will NOT call deposit() (event OR poll trigger); downstream swaps will EXECUTION_TIMEOUT. Production deployments must NOT set TRADER_FAULT_SKIP_DEPOSITS.',
+        network: NETWORK,
+      });
+    }
+    // ROUND-5C: deposit dispatch unified between event + poll paths via
+    // tryDepositForSwap (defined earlier in this scope). The swap:announced
+    // event fires reliably for the proposer side; the acceptor relies on
+    // the poll loop's same dispatch (depositInFlight + markDepositAttempted
+    // gate dedups across both paths).
     sphereUnsubscribers.push(sphere.on('swap:announced' as SphereEventType, ((data: { swapId: string }) => {
       logger.info('swap_announced', { swap_id: data.swapId });
-      void (async () => {
-        try {
-          const deadline = Date.now() + 60_000;
-          while (Date.now() < deadline && !stopped) {
-            try {
-              await swapModule.deposit(data.swapId);
-              logger.info('swap_deposit_sent', { swap_id: data.swapId });
-              await sphere.payments.waitForPendingOperations();
-              return;
-            } catch (err: unknown) {
-              const msg = err instanceof Error ? err.message : String(err);
-              if (msg.includes('not yet available') || msg.includes('SWAP_WRONG_STATE')) {
-                // Cancelable sleep — bail immediately on shutdown rather than
-                // leaking a 3s setTimeout past teardown.
-                await waitCancellable(3000);
-                if (stopped) return;
-                continue;
-              }
-              logger.error('swap_deposit_failed', { swap_id: data.swapId, error: msg });
-              return;
-            }
-          }
-        } catch (err: unknown) {
-          logger.error('swap_announced_handler_failed', {
-            swap_id: data.swapId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      })();
+      // Fault-injection (TRADER_FAULT_SKIP_DEPOSITS=1) is enforced inside
+      // tryDepositForSwap — the check lives in one place to cover both
+      // event and poll triggers.
+      void tryDepositForSwap(data.swapId, 'event').catch(() => {
+        /* tryDepositForSwap logs internally */
+      });
     }) as Parameters<typeof sphere.on>[1]));
 
     // Log payout received — SDK auto-verifies internally
@@ -990,17 +1318,200 @@ export async function startTrader(): Promise<void> {
       logger.info('swap_payout_received', { swap_id: data.swapId });
     }) as Parameters<typeof sphere.on>[1]));
 
-    // Log completion + update deal tracker
+    // Log completion + update deal tracker.
+    // Per spec §7.9.2 (Constraint #9): payoutVerified must be true before
+    // marking the deal volume_filled. The SDK's first auto-verify can race
+    // with payout-invoice token import — getInvoice() returns null before
+    // the import completes, causing verifyPayout() to return false. Retry
+    // 30s × 10 (5-minute window) before declaring PAYOUT_UNVERIFIED.
     sphereUnsubscribers.push(sphere.on('swap:completed' as SphereEventType, ((data: { swapId: string; payoutVerified: boolean }) => {
       logger.info('swap_completed', { swap_id: data.swapId, payout_verified: data.payoutVerified });
-      agent.handleSwapCompleted(data.swapId, data.payoutVerified);
       sphere.payments.receive().catch(() => {});
+      // Round-5: clear the persisted deposit-attempted flag so the
+      // long-lived persistent set doesn't grow without bound.
+      depositInFlight.delete(data.swapId);
+      void agent.clearDepositAttempted(data.swapId).catch(() => {});
+      if (data.payoutVerified) {
+        agent.handleSwapCompleted(data.swapId, true);
+        return;
+      }
+      // Async retry loop — fire-and-forget, gated on stopped flag.
+      void (async () => {
+        // 30s × 20 = 10-minute window before escalating to FAILED.
+        // The SDK's verifyPayout fails closed when payout-invoice tokens
+        // are L3-pending. On testnet, aggregator inclusion-proof
+        // propagation has been observed to take up to ~7 minutes during
+        // peak load — 5 minutes reliably escalated legitimate payouts
+        // to PAYOUT_UNVERIFIED. 2026-04-30 observation: even 10 min
+        // wasn't enough on a slow day (verifyPayout still allConfirmed=false
+        // at attempt 18 = 9 min). 20 min covers the observed worst case
+        // with sufficient margin for testnet's ALB-fronted aggregator.
+        const MAX_ATTEMPTS = 40;
+        const RETRY_INTERVAL_MS = 30_000;
+        let verified = false;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          await waitCancellable(RETRY_INTERVAL_MS);
+          if (stopped) return;
+          // Pull pending tokens before each verify so a late-arriving payout
+          // invoice import has a chance to land.
+          await sphere.payments.receive({ finalize: true }).catch(() => {});
+          if (stopped) return;
+          try {
+            if (!sphere.swap) {
+              logger.warn('swap_verify_payout_module_unavailable', { swap_id: data.swapId, attempt });
+              break;
+            }
+            // DIAGNOSTIC: dump the payout-invoice coverage state to identify which
+            // returnFalse() branch in SDK verifyPayout is firing.
+            try {
+              const swapStatus = await sphere.swap.getSwapStatus(data.swapId);
+              const payoutId = swapStatus.payoutInvoiceId;
+              if (payoutId && sphere.accounting) {
+                const inv = sphere.accounting.getInvoice(payoutId);
+                let invStatus: unknown = null;
+                try {
+                  invStatus = await sphere.accounting.getInvoiceStatus(payoutId);
+                } catch (statusErr) {
+                  invStatus = `status_threw:${statusErr instanceof Error ? statusErr.message : String(statusErr)}`;
+                }
+                logger.info('swap_payout_verify_diag', {
+                  swap_id: data.swapId,
+                  attempt,
+                  payoutInvoiceId: payoutId,
+                  invoice_imported: inv !== null,
+                  invoice_terms: inv ? {
+                    creator: inv.terms.creator,
+                    targets: inv.terms.targets.map((t) => ({
+                      address: t.address,
+                      assets: t.assets.map((a) => ({ coin: a.coin })),
+                    })),
+                  } : null,
+                  invoice_status: invStatus,
+                });
+              }
+            } catch (diagErr) {
+              logger.warn('swap_payout_verify_diag_failed', {
+                swap_id: data.swapId,
+                attempt,
+                error: diagErr instanceof Error ? diagErr.message : String(diagErr),
+              });
+            }
+            verified = await sphere.swap.verifyPayout(data.swapId);
+          } catch (err) {
+            // verifyPayout throws on terminal non-completed states. If that
+            // happens, the swap has been moved to failed/cancelled by some
+            // other code path — no point retrying.
+            logger.warn('swap_verify_payout_threw', {
+              swap_id: data.swapId,
+              attempt,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            break;
+          }
+          if (verified) {
+            logger.info('swap_payout_verified_on_retry', {
+              swap_id: data.swapId,
+              attempt,
+            });
+            break;
+          }
+          logger.info('swap_payout_verify_retry_failed', {
+            swap_id: data.swapId,
+            attempt,
+            remaining: MAX_ATTEMPTS - attempt,
+          });
+        }
+        if (stopped) return;
+        agent.handleSwapCompleted(data.swapId, verified);
+      })();
     }) as Parameters<typeof sphere.on>[1]));
 
     sphereUnsubscribers.push(sphere.on('swap:failed' as SphereEventType, ((data: { swapId: string; error: string }) => {
       logger.error('swap_failed', { swap_id: data.swapId, error: data.error });
+      depositInFlight.delete(data.swapId);
+      void agent.clearDepositAttempted(data.swapId).catch(() => {});
       agent.handleSwapFailed(data.swapId, data.error);
     }) as Parameters<typeof sphere.on>[1]));
+
+    // swap:cancelled — escrow declared the swap cancelled (typically because
+    // a counterparty's deposit didn't arrive within deposit_timeout_sec, but
+    // also for explicit escrow-side cancels). This is a terminal failure
+    // from the deal's perspective: we need to release the volume reservation
+    // and mark the deal FAILED so the intent can be re-matched. Without
+    // calling handleSwapFailed, the deal would stay in EXECUTING forever
+    // and the intent stuck in NEGOTIATING — the deposit-timeout e2e
+    // scenario hung at exactly this point pre-fix (alice's swap got
+    // cancelled, payout refund arrived, but deal record never transitioned).
+    sphereUnsubscribers.push(sphere.on('swap:cancelled' as SphereEventType, ((data: { swapId: string }) => {
+      logger.info('swap_cancelled', { swap_id: data.swapId });
+      depositInFlight.delete(data.swapId);
+      void agent.clearDepositAttempted(data.swapId).catch(() => {});
+      agent.handleSwapFailed(data.swapId, 'SWAP_CANCELLED');
+    }) as Parameters<typeof sphere.on>[1]));
+  }
+
+  // ---- TRADER_TEST_FUND: self-mint test coins (replaces faucet HTTP) ----
+  //
+  // Format: comma-separated `<coinIdHex>:<amount>` tuples.
+  //   TRADER_TEST_FUND="455ad8720656...:100000000000000000000,8f0f3d7a...:1000000000"
+  // (UCT and USDU coinIds from the public testnet registry.)
+  //
+  // Production-guarded with the same gate as TRADER_FAULT_SKIP_DEPOSITS:
+  // requires UNICITY_NETWORK ∈ {testnet, dev}. Without the network gate
+  // a misconfigured prod deployment could mint arbitrary balances. The
+  // gate also requires TRADER_FAULT_INJECTION_ALLOWED=1 to make the
+  // intent unambiguous. Mint runs BEFORE agent.start() so balances are
+  // visible to the intent engine on the first scan cycle.
+  const TEST_FUND_RAW = process.env['TRADER_TEST_FUND'];
+  if (TEST_FUND_RAW !== undefined && TEST_FUND_RAW !== '') {
+    const TEST_FUND_NETWORK = process.env['UNICITY_NETWORK'] ?? 'testnet';
+    const TEST_FUND_ALLOWED = process.env['TRADER_FAULT_INJECTION_ALLOWED'] === '1';
+    const TEST_FUND_NETWORKS = new Set(['testnet', 'dev']);
+    if (!TEST_FUND_NETWORKS.has(TEST_FUND_NETWORK) || !TEST_FUND_ALLOWED) {
+      const reason = !TEST_FUND_NETWORKS.has(TEST_FUND_NETWORK)
+        ? `network=${TEST_FUND_NETWORK} (allowed: testnet, dev)`
+        : 'TRADER_FAULT_INJECTION_ALLOWED=1 not set';
+      logger.error('test_fund_production_guard_violation', {
+        note: 'TRADER_TEST_FUND rejected at startup',
+        reason,
+        network: TEST_FUND_NETWORK,
+      });
+      throw new Error(
+        `TRADER_TEST_FUND not permitted in this environment: ${reason}. ` +
+          `To enable for testing: set UNICITY_NETWORK=testnet (or dev) AND TRADER_FAULT_INJECTION_ALLOWED=1.`,
+      );
+    }
+    const entries = TEST_FUND_RAW.split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    for (const entry of entries) {
+      const [coinIdHex, amountStr] = entry.split(':');
+      if (!coinIdHex || !amountStr) {
+        logger.warn('test_fund_invalid_entry', { entry });
+        continue;
+      }
+      let amount: bigint;
+      try {
+        amount = BigInt(amountStr);
+      } catch {
+        logger.warn('test_fund_invalid_amount', { entry });
+        continue;
+      }
+      const result = await sphere.payments.mintFungibleToken(coinIdHex, amount);
+      if (!result.success) {
+        logger.error('test_fund_mint_failed', {
+          coin_id: coinIdHex.slice(0, 16) + '...',
+          amount: amountStr,
+          error: result.error,
+        });
+        throw new Error(`TRADER_TEST_FUND mint failed for ${coinIdHex}: ${result.error}`);
+      }
+      logger.info('test_fund_mint_succeeded', {
+        coin_id: coinIdHex.slice(0, 16) + '...',
+        amount: amountStr,
+        token_id: result.tokenId.slice(0, 16) + '...',
+      });
+    }
   }
 
   await agent.start();

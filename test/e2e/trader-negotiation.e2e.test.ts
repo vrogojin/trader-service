@@ -372,7 +372,9 @@ describe('NP-0 Negotiation E2E', () => {
         escrow_address: 'escrow-001',
         proposer_address: ADDR_ALICE,
         proposer_direction: aliceIntent.intent.direction,
-        proposer_intent_id: aliceIntent.intent.intent_id,
+        // DealTerms carries MARKET intent_id, not local — peers exchange the
+        // ID they can see in market search results.
+        proposer_intent_id: aliceIntent.intent.market_intent_id,
         proposer_pubkey: PK_ALICE,
         quote_asset: aliceIntent.intent.quote_asset,
         rate: 475n,

@@ -162,15 +162,16 @@ function addCreateIntent(parent: Command): Command {
     .requiredOption('--rate-min <bigint>', 'Minimum acceptable rate (string-encoded bigint)')
     .requiredOption('--rate-max <bigint>', 'Maximum acceptable rate (string-encoded bigint)')
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
-    // Wire shape aligned with src/trader/acp-types.ts:23 (volume_max)
-    // and trader-command-handler.ts:331 (expiry_sec). The CLI flag
-    // stays in milliseconds for ergonomic consistency with other
-    // timeout flags; we convert at the wire boundary via
-    // floor(ms/1000). See sphere-cli PR #7 for the equivalent fix
-    // in the canonical CLI; this trader-ctl shim mirrors the same
-    // wire shape so direct-docker e2e tests don't break either.
-    .requiredOption('--volume-max <bigint>', 'Total intent volume')
+    // Wire shape aligned with src/trader/acp-types.ts:23 (volume_max) and
+    // trader-command-handler.ts:331 (expiry_sec). PR #9 introduced
+    // --escrow-address and --deposit-timeout-sec for real-settlement
+    // testing; the CLI-layer expiry guards (≥1000ms, ≤7d) mirror the
+    // trader's own validation so the operator gets a clear local error
+    // instead of an opaque INVALID_PARAM round-trip.
+    .requiredOption('--volume-max <bigint>', 'Maximum volume the intent will accept')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h, must be ≥1000ms and ≤7 days)')
+    .option('--escrow-address <address>', 'Escrow address for this intent (default: "any")')
+    .option('--deposit-timeout-sec <sec>', 'Override deposit timeout in seconds (default: 300). Lower for tests; production should keep the default.')
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -187,22 +188,31 @@ function addCreateIntent(parent: Command): Command {
         volume_min: local['volumeMin'],
         volume_max: local['volumeMax'],
       };
+      // Expiry validation: explicit --expiry-ms must be a positive integer
+      // in [1000ms, 7d]; omitted falls back to 24h.
+      let expiryMs: number;
       if (local['expiryMs'] !== undefined) {
         const n = Number.parseInt(local['expiryMs'], 10);
         if (!Number.isFinite(n) || n <= 0) {
           fail(`--expiry-ms must be a positive integer (got "${local['expiryMs']}")`, 2);
         }
         if (n < 1000) {
-          // Sub-second expiries floor to 0 and would be rejected by
-          // the trader with an opaque "expiry_sec must be positive"
-          // error. Catch at the CLI layer with a clear message.
           fail(`--expiry-ms must be at least 1000 (1 second); got ${n}`, 2);
         }
         const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
         if (n > sevenDaysMs) {
           fail(`--expiry-ms must not exceed 7 days (${sevenDaysMs}ms); got ${n}`, 2);
         }
-        params['expiry_sec'] = Math.floor(n / 1000);
+        expiryMs = n;
+      } else {
+        expiryMs = 24 * 60 * 60 * 1000;
+      }
+      params['expiry_sec'] = Math.floor(expiryMs / 1000);
+      if (local['escrowAddress'] !== undefined) {
+        params['escrow_address'] = local['escrowAddress'];
+      }
+      if (local['depositTimeoutSec'] !== undefined) {
+        params['deposit_timeout_sec'] = Number.parseInt(local['depositTimeoutSec'], 10);
       }
       await runCommand(opts, 'CREATE_INTENT', params);
     });
@@ -279,6 +289,12 @@ function addSetStrategy(parent: Command): Command {
     .option('--rate-strategy <strategy>', 'Rate strategy: aggressive|moderate|conservative')
     .option('--max-concurrent <n>', 'Max concurrent negotiations')
     .option('--trusted-escrows <list>', 'Comma-separated escrow addresses (overwrites)')
+    .option(
+      '--blocked-counterparties <list>',
+      'Comma-separated counterparty addresses or pubkeys to block (overwrites). ' +
+        'Pass empty string to clear. Engine filters matched intents whose ' +
+        'agent_pubkey is on this list before fan-out.',
+    )
     .action(async function (this: Command) {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
@@ -289,6 +305,15 @@ function addSetStrategy(parent: Command): Command {
       }
       if (local['trustedEscrows'] !== undefined) {
         params['trusted_escrows'] = local['trustedEscrows'].split(',').map((s) => s.trim()).filter((s) => s !== '');
+      }
+      if (local['blockedCounterparties'] !== undefined) {
+        // Empty string is a valid "clear the list" signal — split('') on ''
+        // gives [''], which we filter out, leaving []. The handler accepts
+        // [] and replaces the strategy field.
+        params['blocked_counterparties'] = local['blockedCounterparties']
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '');
       }
       await runCommand(opts, 'SET_STRATEGY', params);
     });

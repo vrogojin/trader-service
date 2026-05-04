@@ -203,11 +203,22 @@ export async function runTraderCtl(
   }
 
   let output: unknown = child.stdout;
-  if (opts.json === true && child.exitCode === 0) {
-    try {
-      output = JSON.parse(child.stdout);
-    } catch {
-      throw new Error(`trader-ctl returned non-JSON on success: ${child.stdout}`);
+  if (opts.json === true) {
+    if (child.exitCode === 0) {
+      try {
+        output = JSON.parse(child.stdout);
+      } catch {
+        throw new Error(`trader-ctl returned non-JSON on success: ${child.stdout}`);
+      }
+    } else if (child.stdout.trim().length > 0) {
+      // Non-zero exit with --json: emitResult writes the AcpErrorPayload JSON
+      // envelope to stdout. Parse it best-effort so callers can inspect
+      // error_code / message; fall back to raw string if it's not JSON.
+      try {
+        output = JSON.parse(child.stdout);
+      } catch {
+        // leave output as raw stdout string
+      }
     }
   }
 
