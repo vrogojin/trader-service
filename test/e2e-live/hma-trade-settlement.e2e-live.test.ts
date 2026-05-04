@@ -59,10 +59,31 @@
  *   - settlement wait: 3-5 min on testnet (dominates)
  *   - 2 concurrent withdraws: ~5-10s
  *
+ * Trader image:
+ *   This test requires `ghcr.io/vrogojin/agentic-hosting/trader:local`
+ *   built from this repo's Dockerfile (which embeds the current
+ *   sphere-sdk including mintFungibleToken). Build before running:
+ *     cd /home/vrogojin && docker build -f trader-service/Dockerfile \
+ *       -t ghcr.io/vrogojin/agentic-hosting/trader:local .
+ *   The published `:v0.1` tag at ghcr.io is too old (tested in rounds
+ *   3-5: lacks mintFungibleToken AND the faucet path silently
+ *   doesn't deliver). The test materializes a temp templates.json
+ *   that swaps the image tag from v0.1 to local without modifying
+ *   agentic-hosting's shared config.
+ *
+ * Funding:
+ *   Self-mint via TRADER_TEST_FUND env var (5000 each of UCT/USDU
+ *   per trader at startup). HMA forwards the env to docker via its
+ *   payload.env passthrough (validatePayloadEnv at
+ *   agentic-hosting/src/host-manager/manager.ts:97 — TRADER_TEST_FUND
+ *   isn't in FORBIDDEN_ENV_KEYS and doesn't start with UNICITY_, so
+ *   it passes through unchanged). The trader's startup self-mint
+ *   gate also requires TRADER_FAULT_INJECTION_ALLOWED=1.
+ *
  * Out of scope:
- *   - Faucet HTTP — the trader self-mints via TRADER_TEST_FUND, the
- *     same pattern basic-roundtrip uses (faucet has been a recurring
- *     source of flakiness on testnet).
+ *   - Faucet HTTP — verified silently broken on testnet (round 5/6:
+ *     POST returns 200 OK + tx_id but the deposit never surfaces in
+ *     the trader's portfolio after 2+ minutes of polling).
  *   - Negotiation-failure paths — covered by negotiation-failures.
  *   - Partial fills — covered by edge-cases.
  */
@@ -96,7 +117,7 @@ import {
   withdrawAsync,
   type PortfolioBalance,
 } from './helpers/sphere-trader.js';
-import { fundWallet } from './helpers/funding.js';
+import { UCT_COIN_ID, USDU_COIN_ID } from './helpers/constants.js';
 
 // ---------------------------------------------------------------------------
 // Precondition gates (mirrors hma-trade-flow's structure)
@@ -156,6 +177,7 @@ const SCENARIO_COUNT = 2;
 let state: SuiteState | null = null;
 
 const SWAP_TIMEOUT_MS = 8 * 60_000; // 8 minutes; testnet settlement is 3-5 min typical
+const SELF_MINT_AMOUNT = 5000n; // matches basic-roundtrip's selfMintFund amount
 
 // `volume_max` for matching intents in each scenario. Both sides post
 // identical volumes so a single fill clears both intents.
@@ -288,15 +310,29 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
   }> {
     if (!state) throw new Error('beforeAll did not initialize state');
     const s = state;
+    // The locally-rebuilt trader image (ghcr.io/.../trader:local) ships
+    // with the current sphere-sdk which includes mintFungibleToken,
+    // so we use TRADER_TEST_FUND for funding (self-mint at startup).
+    // Reasons we don't use the testnet faucet:
+    //   - The faucet returns 200 OK with a tx_id but the deposit
+    //     never lands in the trader's portfolio (verified with
+    //     5+ minute polling in round 5/6). basic-roundtrip's commit
+    //     history documents the same flakiness.
+    //   - Self-mint avoids any external HTTP dependency for funding,
+    //     which is a more reliable test contract.
+    // Both flags are required by the trader's production guard:
+    //   TRADER_FAULT_INJECTION_ALLOWED=1 — opt-in to fault injection
+    //   TRADER_TEST_FUND=<coinIdHex>:<amount>,...
+    const traderEnv = {
+      TRADER_TEST_FUND:
+        `${UCT_COIN_ID}:${(SELF_MINT_AMOUNT).toString()},` +
+        `${USDU_COIN_ID}:${(SELF_MINT_AMOUNT).toString()}`,
+      TRADER_FAULT_INJECTION_ALLOWED: '1',
+    };
     // Within a scenario, sphere-cli calls share one wallet.json and
-    // race on its atomic temp+rename writes (FileStorageProvider.save
-    // → fs.renameSync). So within-scenario calls are serialized. The
-    // PARALLELISM the user asked for is preserved cross-scenario via
-    // vitest `it.concurrent` — each scenario has its own controller
-    // wallet and the long settlement-wait phases run truly in parallel
-    // across scenarios. Wall-clock cost of this serialization vs full
-    // parallel: 2-3 spawn DM round-trips (~5-15s each) instead of 1,
-    // negligible against the 3-5 min settlement dominator.
+    // race on its atomic temp+rename writes — see header. Sequential
+    // within-scenario; cross-scenario runs in true parallel via
+    // vitest it.concurrent.
     console.log(`[${scenarioId}] spawning escrow + alice + bob (sequential within-scenario)…`);
     const escrow = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -306,11 +342,6 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       instanceName: `escrow-${scenarioId}`,
       timeoutMs: 180_000,
     });
-    // Trader templates do NOT receive TRADER_TEST_FUND — the published
-    // trader image (ghcr.io/.../trader:v0.1) uses an older sphere-sdk
-    // without mintFungibleToken, so the self-mint path errors out
-    // ("TRADER_TEST_FUND requires sphere-sdk with mintFungibleToken").
-    // Funding happens AFTER spawn via the testnet faucet (HTTP).
     const alice = await hostSpawnAsync({
       cliPath: s.cliPath,
       cliHome: controller.cliHome,
@@ -318,6 +349,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `alice-${scenarioId}`,
       timeoutMs: 180_000,
+      env: traderEnv,
     });
     const bob = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -326,6 +358,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `bob-${scenarioId}`,
       timeoutMs: 180_000,
+      env: traderEnv,
     });
     s.spawned.push(escrow, alice, bob);
     console.log(
@@ -361,65 +394,6 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    *      address; assert transfer_id non-empty + post-withdraw balance
    *      reflects the withdrawal.
    */
-  /**
-   * Map an asset symbol (as the trader exposes it in portfolio:
-   * `UCT`, `USDU`, etc.) to the faucet's coin identifier. The
-   * faucet's `/api/v1/faucet/request` endpoint looks up coins by
-   * the `name` field of `/api/v1/faucet/coins`, NOT by symbol —
-   * `coin: "UCT"` returns `Coin not found: UCT`. Verified by probing
-   * the faucet directly:
-   *   coins[].name "unicity"     → faucet accepts symbol UCT
-   *   coins[].name "unicity-usd" → faucet accepts symbol USDU
-   * If a future coin is added to this test, extend this map.
-   */
-  const FAUCET_COIN_NAME: Record<string, string> = {
-    UCT: 'unicity',
-    USDU: 'unicity-usd',
-  };
-
-  /**
-   * Fund a trader via the testnet faucet, then poll its portfolio
-   * until the requested asset arrives or `timeoutMs` elapses. Faucet
-   * deposits land via the trader's payments.receive() loop (~15s
-   * cycle) plus aggregator confirmation, so we typically observe the
-   * balance ~30-60s after the faucet POST.
-   *
-   * Faucet expects the BARE nametag (no `@`) in `unicityId`. The
-   * fundWallet helper unwraps `@nametag` automatically.
-   */
-  async function faucetFundAndWait(
-    label: string,
-    tenant: { tenantNametag: string | null; tenantPubkey: string },
-    asset: 'UCT' | 'USDU',
-    amount: bigint,
-    cliHome: string,
-    timeoutMs = 120_000,
-  ): Promise<void> {
-    if (!state) throw new Error('state missing');
-    const s = state;
-    const recipient = tenant.tenantNametag ? `@${tenant.tenantNametag}` : `DIRECT://${tenant.tenantPubkey}`;
-    const faucetCoin = FAUCET_COIN_NAME[asset];
-    if (faucetCoin === undefined) {
-      throw new Error(`[${label}] no faucet coin name for ${asset}`);
-    }
-    console.log(`[${label}] faucet → ${recipient} ${amount}${asset} (faucet name: ${faucetCoin})…`);
-    await fundWallet(recipient, amount, faucetCoin);
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const p = await portfolioAsync({
-        cliPath: s.cliPath, cliHome, tenant: tenant.tenantPubkey,
-      });
-      if (balanceOf(p, asset) >= amount) {
-        console.log(`[${label}] balance arrived: ${balanceOf(p, asset)}${asset}`);
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 5_000));
-    }
-    throw new Error(
-      `[${label}] balance ${asset}>=${amount} did not arrive within ${timeoutMs}ms`,
-    );
-  }
-
   async function runSettlementScenario(
     scenarioId: string,
     controller: ScenarioController,
@@ -428,15 +402,13 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     const s = state;
     const { escrow, alice, bob } = await provisionTriple(scenarioId, controller);
 
-    // ---- 1.5 Faucet-fund both traders before they can trade ---------
-    // Alice (buyer of UCT) needs USDU to pay. Bob (seller of UCT) needs UCT.
-    // Sequential within-scenario (wallet.json contention again). Use
-    // exact trade-required amounts plus headroom for the withdraw step.
-    const aliceUsduFundAmount = TRADE_RATE * TRADE_VOLUME * 2n; // 2× headroom
-    const bobUctFundAmount = TRADE_VOLUME * 2n;
-    console.log(`[${scenarioId}] funding alice + bob via faucet…`);
-    await faucetFundAndWait(scenarioId, alice, 'USDU', aliceUsduFundAmount, controller.cliHome);
-    await faucetFundAndWait(scenarioId, bob, 'UCT', bobUctFundAmount, controller.cliHome);
+    // Funding happened via TRADER_TEST_FUND at trader startup (5000 each
+    // of UCT and USDU on both traders). The trader's main.ts logs
+    // "test_fund_mint_succeeded" once per coin if the mint worked,
+    // and the intent engine reads the resulting balance on its first
+    // scan cycle. Wait briefly so the first portfolio query reflects
+    // the post-mint balance.
+    await new Promise((r) => setTimeout(r, 5_000));
 
     // ---- 2. Configure trusted escrows on both traders --------------
     // Sequential within-scenario (wallet.json contention; see provisionTriple).
