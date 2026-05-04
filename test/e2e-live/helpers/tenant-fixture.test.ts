@@ -251,7 +251,7 @@ describe('createMatchingIntents', () => {
       rate_min: 100n,
       rate_max: 200n,
       volume_min: 10n,
-      volume_total: 1000n,
+      volume_max: 1000n,
     });
 
     expect(result.buyerIntentId).toBe('intent-buyer-1');
@@ -272,7 +272,7 @@ describe('createMatchingIntents', () => {
       '--rate-min', '100',
       '--rate-max', '200',
       '--volume-min', '10',
-      '--volume-total', '1000',
+      '--volume-max', '1000',
     ]);
     expect(buyerOpts.tenant).toBe(buyer.address);
     expect(buyerOpts.json).toBe(true);
@@ -291,7 +291,7 @@ describe('createMatchingIntents', () => {
       '--rate-min', '100',
       '--rate-max', '200',
       '--volume-min', '10',
-      '--volume-total', '1000',
+      '--volume-max', '1000',
     ]);
     expect(sellerOpts.tenant).toBe(seller.address);
     expect(sellerOpts.json).toBe(true);
@@ -314,7 +314,7 @@ describe('createMatchingIntents', () => {
         rate_min: 100n,
         rate_max: 200n,
         volume_min: 10n,
-        volume_total: 1000n,
+        volume_max: 1000n,
       }),
     ).rejects.toThrow(/buyer CREATE_INTENT not ok/);
   });
@@ -342,7 +342,7 @@ describe('createMatchingIntents', () => {
       rate_min: 100n,
       rate_max: 200n,
       volume_min: 10n,
-      volume_total: 1000n,
+      volume_max: 1000n,
     });
 
     expect(result.buyerIntentId).toBe('wrapped-buy');

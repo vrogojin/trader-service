@@ -98,7 +98,7 @@ async function createIntent(
     rateMin: bigint;
     rateMax: bigint;
     volumeMin: bigint;
-    volumeTotal: bigint;
+    volumeMax: bigint;
     expiryMs?: number;
   },
 ): Promise<string> {
@@ -115,8 +115,8 @@ async function createIntent(
     args.rateMax.toString(),
     '--volume-min',
     args.volumeMin.toString(),
-    '--volume-total',
-    args.volumeTotal.toString(),
+    '--volume-max',
+    args.volumeMax.toString(),
   ];
   if (args.expiryMs !== undefined) {
     argv.push('--expiry-ms', String(args.expiryMs));
@@ -199,14 +199,14 @@ describe('Negotiation failures', () => {
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 100n,
-        volumeTotal: 500n,
+        volumeMax: 500n,
       });
       const aliceIntent = await createIntent(alice, {
         direction: 'sell',
         rateMin: 1n,
         rateMax: 1n,
         volumeMin: 100n,
-        volumeTotal: 500n,
+        volumeMax: 500n,
       });
 
       expect(bobIntent).toBeTruthy();
@@ -268,7 +268,7 @@ describe('Negotiation failures', () => {
         rate_min: 1n,
         rate_max: 1n,
         volume_min: 100n,
-        volume_total: 500n,
+        volume_max: 500n,
       });
       expect(intents.buyerIntentId).toBeTruthy();
       expect(intents.sellerIntentId).toBeTruthy();
