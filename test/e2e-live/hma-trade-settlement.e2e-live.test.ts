@@ -335,6 +335,22 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    *      reflects the withdrawal.
    */
   /**
+   * Map an asset symbol (as the trader exposes it in portfolio:
+   * `UCT`, `USDU`, etc.) to the faucet's coin identifier. The
+   * faucet's `/api/v1/faucet/request` endpoint looks up coins by
+   * the `name` field of `/api/v1/faucet/coins`, NOT by symbol —
+   * `coin: "UCT"` returns `Coin not found: UCT`. Verified by probing
+   * the faucet directly:
+   *   coins[].name "unicity"     → faucet accepts symbol UCT
+   *   coins[].name "unicity-usd" → faucet accepts symbol USDU
+   * If a future coin is added to this test, extend this map.
+   */
+  const FAUCET_COIN_NAME: Record<string, string> = {
+    UCT: 'unicity',
+    USDU: 'unicity-usd',
+  };
+
+  /**
    * Fund a trader via the testnet faucet, then poll its portfolio
    * until the requested asset arrives or `timeoutMs` elapses. Faucet
    * deposits land via the trader's payments.receive() loop (~15s
@@ -342,7 +358,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    * balance ~30-60s after the faucet POST.
    *
    * Faucet expects the BARE nametag (no `@`) in `unicityId`. The
-   * helper unwraps `@nametag` automatically.
+   * fundWallet helper unwraps `@nametag` automatically.
    */
   async function faucetFundAndWait(
     label: string,
@@ -355,8 +371,12 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     if (!state) throw new Error('state missing');
     const s = state;
     const recipient = tenant.tenantNametag ? `@${tenant.tenantNametag}` : `DIRECT://${tenant.tenantPubkey}`;
-    console.log(`[${label}] faucet → ${recipient} ${amount}${asset}…`);
-    await fundWallet(recipient, amount, asset);
+    const faucetCoin = FAUCET_COIN_NAME[asset];
+    if (faucetCoin === undefined) {
+      throw new Error(`[${label}] no faucet coin name for ${asset}`);
+    }
+    console.log(`[${label}] faucet → ${recipient} ${amount}${asset} (faucet name: ${faucetCoin})…`);
+    await fundWallet(recipient, amount, faucetCoin);
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const p = await portfolioAsync({
