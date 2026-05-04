@@ -13,13 +13,23 @@
 import type { AcpResultPayload, AcpErrorPayload } from '../protocols/acp.js';
 import type { CommandHandler } from '../tenant/command-handler.js';
 import { pubkeysEqual } from '../shared/crypto.js';
-// Authoritative address validator from sphere-sdk. Accepts the three
-// canonical forms — @nametag, DIRECT://hex, PROXY://hex — using the
-// SDK's own NAMETAG_RE / DIRECT_HEX_RE / PROXY_HEX_RE so the trader's
-// validation is bit-identical to what `payments.send` will accept
-// downstream. Avoids the prior pitfall of rolling our own regex that
-// disagreed with the SDK at the boundary (case sensitivity, length).
-import { isValidAddress as sdkIsValidAddress } from '@unicitylabs/sphere-sdk';
+// Authoritative address validators from sphere-sdk.
+//
+// The SDK's `isValidAddress` is intentionally permissive — it only
+// checks the prefix (`@`, `DIRECT://`, `PROXY://`) and that the
+// remainder is non-empty. The SDK comments explicitly: "Strict hex
+// validation is NOT enforced here — test fixtures use non-hex
+// placeholder addresses." For a money-movement command like
+// WITHDRAW_TOKEN, that's too lax: `@ALICE` (uppercase) and
+// `DIRECT://garbage` would slip through and then fail confusingly at
+// `payments.send`.
+//
+// We layer two stricter checks on top:
+//   - For `@nametag`:   delegate to `isValidNametag` (enforces SDK's
+//                       canonical NAMETAG_RE = /^[a-z0-9][a-z0-9_-]{0,29}$/).
+//   - For DIRECT/PROXY: enforce hex-only after the prefix, length 64-80
+//                       (matches SDK's signing-boundary regex).
+import { parseAddress, isValidNametag } from '@unicitylabs/sphere-sdk';
 import type { Logger } from '../shared/logger.js';
 import type { IntentEngine } from './intent-engine.js';
 import type { NegotiationHandler } from './negotiation-handler.js';
@@ -275,24 +285,30 @@ function validateStrategyParams(params: SetStrategyParams): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Address validation
+// Address validation (strict, money-movement gate)
 // ---------------------------------------------------------------------------
 //
-// Delegate to sphere-sdk's `isValidAddress`, which is the authoritative
-// validator for the three canonical Sphere address forms:
-//   1. `@nametag`        — lowercase alphanumeric + `_`/`-`, 1-30 chars
-//                           (sphere-sdk core/address.ts NAMETAG_RE).
-//   2. `DIRECT://<hex>`  — 64-80 hex chars (sphere-sdk DIRECT_HEX_RE).
-//   3. `PROXY://<hex>`   — 64-80 hex chars (sphere-sdk PROXY_HEX_RE).
-//
-// Rolling our own regex previously diverged from the SDK on case
-// (we accepted uppercase nametags the relay would not resolve) and
-// length (60-130 hex range was too permissive at both ends; SDK's
-// signing boundary requires 64-80). Delegating to the SDK keeps the
-// trader's gate bit-identical to what `payments.send` will accept
-// downstream.
+// Hex regex matching the SDK's signing-boundary contract for
+// DIRECT://hex / PROXY://hex addresses. Lower bound 64 (x-only
+// pubkey) covers the canonical Unicity DIRECT-address shape; upper
+// bound 80 matches `modules/swap/manifest.ts`'s DIRECT_HEX_RE.
+const STRICT_HEX_RE = /^[0-9a-fA-F]{64,80}$/;
+
 function isValidAddress(addr: unknown): addr is string {
-  return typeof addr === 'string' && sdkIsValidAddress(addr);
+  if (typeof addr !== 'string') return false;
+  const parsed = parseAddress(addr);
+  if (parsed === null) return false;
+  if (parsed.type === 'NAMETAG') {
+    // isValidNametag re-parses internally, but it gives us the
+    // SDK's canonical content rules (lowercase, 1-30 chars, _-).
+    return isValidNametag(addr);
+  }
+  if (parsed.type === 'DIRECT' || parsed.type === 'PROXY') {
+    return STRICT_HEX_RE.test(parsed.value);
+  }
+  // Future SDK address types — reject conservatively until we add
+  // explicit handling.
+  return false;
 }
 
 // ---------------------------------------------------------------------------
