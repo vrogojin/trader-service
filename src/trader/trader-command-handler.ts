@@ -704,12 +704,19 @@ export function createTraderCommandHandler(
       return errorPayload(commandId, 'INVALID_PARAM', 'amount must be a positive integer string');
     }
 
-    const toAddress = params['to_address'];
+    // Trim before validation AND forwarding. parseAddress (used by
+    // isValidAddress) trims internally so the gate would accept
+    // `'  @alice  '`, but the SDK transport layer's resolve() does not
+    // trim and would fail INVALID_RECIPIENT downstream. Trimming once
+    // here keeps the gate semantics aligned with payments.send and
+    // ensures the same canonical value is logged and forwarded.
+    const rawAddress = params['to_address'];
+    const toAddress = typeof rawAddress === 'string' ? rawAddress.trim() : rawAddress;
     if (!isValidAddress(toAddress)) {
       return errorPayload(
         commandId,
         'INVALID_PARAM',
-        'to_address must be a valid Sphere address: @nametag (lowercase alphanumeric + _/-, 1-30 chars), DIRECT://<64-80 hex>, or PROXY://<64-80 hex>',
+        'to_address must be a valid Sphere address: @nametag (lowercase alphanumeric + _/-, 3-20 chars or E.164 phone), DIRECT://<64-80 hex>, or PROXY://<64-80 hex>',
       );
     }
 

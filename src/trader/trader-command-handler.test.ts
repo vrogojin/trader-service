@@ -49,9 +49,19 @@ describe('isValidAddress (WITHDRAW_TOKEN gate)', () => {
       expect(isValidAddress('@ab')).toBe(false);
     });
 
+    it('accepts the 3-char minimum boundary', () => {
+      expect(isValidAddress('@aaa')).toBe(true);
+      expect(isValidAddress('@a_b')).toBe(true);
+      expect(isValidAddress('@123')).toBe(true);
+    });
+
     it('rejects nametags longer than 20 chars (SDK relay constraint)', () => {
       expect(isValidAddress('@' + 'a'.repeat(21))).toBe(false);
       expect(isValidAddress('@' + 'a'.repeat(30))).toBe(false);
+    });
+
+    it('accepts the 20-char maximum boundary', () => {
+      expect(isValidAddress('@' + 'a'.repeat(20))).toBe(true);
     });
 
     it('rejects empty / whitespace nametag', () => {
@@ -119,7 +129,11 @@ describe('isValidAddress (WITHDRAW_TOKEN gate)', () => {
   });
 
   describe('rejected forms', () => {
-    it('rejects bare hex pubkey (no prefix — SDK does not parse)', () => {
+    it('rejects bare hex pubkey — intentionally stricter than payments.send', () => {
+      // payments.send accepts bare 64+ char hex / 66-char compressed
+      // pubkey, but the trader gate requires an explicit Sphere address
+      // prefix to keep WITHDRAW_TOKEN destinations unambiguous in logs
+      // and audit trails.
       expect(isValidAddress('a'.repeat(64))).toBe(false);
       expect(isValidAddress('02' + 'a'.repeat(64))).toBe(false); // compressed
     });
