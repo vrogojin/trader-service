@@ -368,16 +368,26 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     return { escrow, alice, bob };
   }
 
-  /** Pull a coin's confirmed balance (smallest units) from a portfolio response. */
+  /**
+   * Pull a coin's confirmed balance (smallest units) from a portfolio
+   * response. The trader's GET_PORTFOLIO emits each balance as
+   *   { asset, available, total, confirmed, unconfirmed }
+   * where `confirmed` is the amount we should use for assertions.
+   * Older versions used `amount`; tolerate both. Round-7 hit a bug
+   * where the early return on `b.amount ?? '0'` short-circuited to
+   * 0n WITHOUT falling through to `confirmed` when the field was
+   * absent, so the self-mint balance assertion failed despite the
+   * mint succeeding.
+   */
   function balanceOf(p: readonly PortfolioBalance[], symbol: string): bigint {
-    for (const b of p) {
-      if (b.asset === symbol) return BigInt(String(b.amount ?? '0'));
-    }
-    // Tolerate alternate field names (some sphere-sdk versions emit `confirmed`).
     for (const b of p as Array<Record<string, unknown>>) {
-      if (b['asset'] === symbol && b['confirmed'] !== undefined) {
-        return BigInt(String(b['confirmed']));
-      }
+      if (b['asset'] !== symbol) continue;
+      // Prefer `confirmed` (canonical); fall back to `amount` (legacy).
+      if (b['confirmed'] !== undefined) return BigInt(String(b['confirmed']));
+      if (b['amount'] !== undefined) return BigInt(String(b['amount']));
+      // `available` is also a reasonable fallback for "what can be spent now".
+      if (b['available'] !== undefined) return BigInt(String(b['available']));
+      return 0n;
     }
     return 0n;
   }
