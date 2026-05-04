@@ -23,7 +23,7 @@
  * call site that needs parallelism.
  */
 
-import { runSphere, type SphereRunResult } from './sphere-cli.js';
+import { runSphere, runSphereAsync, type SphereRunResult } from './sphere-cli.js';
 
 const DEFAULT_TRADER_TIMEOUT_MS = 60_000;
 
@@ -312,6 +312,202 @@ export async function waitForDealInState(
     : 'no deals visible';
   throw new Error(
     `waitForDealInState: tenant ${opts.tenant} did not reach state="${opts.targetState}" ` +
+    `within ${opts.timeoutMs ?? 600_000}ms. ${summary}.`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// WITHDRAW_TOKEN — sphere trader withdraw <asset> <amount> <to_address>
+// ---------------------------------------------------------------------------
+
+export interface WithdrawOpts extends TraderInvocationOpts {
+  asset: string;
+  amount: bigint;
+  toAddress: string;
+}
+
+export interface WithdrawResult {
+  readonly transferId: string;
+  readonly remainingBalance: string;
+}
+
+function parseWithdrawResult(result: unknown): WithdrawResult {
+  if (typeof result !== 'object' || result === null) {
+    throw new Error(`withdraw: result not an object. Got: ${JSON.stringify(result)}`);
+  }
+  const r = result as Record<string, unknown>;
+  const transferId = r['transfer_id'];
+  if (typeof transferId !== 'string' || transferId === '') {
+    throw new Error(`withdraw: missing transfer_id. Got: ${JSON.stringify(result)}`);
+  }
+  return {
+    transferId,
+    remainingBalance: String(r['remaining_balance'] ?? ''),
+  };
+}
+
+export function withdraw(opts: WithdrawOpts): WithdrawResult {
+  const args = [
+    '--asset', opts.asset,
+    '--amount', opts.amount.toString(),
+    '--to-address', opts.toAddress,
+  ];
+  const { result } = runTraderCommand('withdraw', args, opts);
+  return parseWithdrawResult(result);
+}
+
+// ---------------------------------------------------------------------------
+// Async variants — required for true concurrency. The sync helpers above
+// use spawnSync which BLOCKS the event loop, so wrapping them in
+// Promise.all(...) does NOT parallelize: each spawnSync call holds the
+// thread until the child exits. The async variants below use spawn (via
+// runSphereAsync) so concurrent calls actually overlap.
+//
+// Only the helpers needed for parallel scenarios get async wrappers; the
+// rest stay sync to keep the surface small.
+// ---------------------------------------------------------------------------
+
+async function runTraderCommandAsync(
+  subcommand: string,
+  args: readonly string[],
+  opts: TraderInvocationOpts,
+): Promise<{ result: unknown; raw: SphereRunResult }> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TRADER_TIMEOUT_MS;
+  const fullArgs = [
+    'trader', subcommand, ...args,
+    '--tenant', opts.tenant,
+    '--json',
+    '--timeout', String(timeoutMs),
+  ];
+  const raw = await runSphereAsync(opts.cliPath, opts.cliHome, fullArgs, {
+    timeoutMs: timeoutMs + 15_000,
+  });
+  if (raw.status !== 0) {
+    throw new Error(
+      `sphere trader ${subcommand} failed (status=${raw.status}, signal=${raw.signal}).\n` +
+      `stderr: ${raw.stderr.slice(0, 800)}\n` +
+      `stdout: ${raw.stdout.slice(0, 800)}`,
+    );
+  }
+  const start = raw.stdout.indexOf('{');
+  const end = raw.stdout.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    throw new Error(
+      `sphere trader ${subcommand} --json: no JSON object in stdout. ` +
+      `Got first 500 chars: ${raw.stdout.slice(0, 500)}`,
+    );
+  }
+  const parsed = JSON.parse(raw.stdout.slice(start, end + 1)) as {
+    ok?: boolean;
+    result?: unknown;
+    error_code?: string;
+    message?: string;
+  };
+  if (parsed.ok === false) {
+    throw new Error(
+      `sphere trader ${subcommand}: ok=false. ` +
+      `[${parsed.error_code ?? 'UNKNOWN'}] ${parsed.message ?? '(no message)'}`,
+    );
+  }
+  const result = parsed.result ?? parsed;
+  return { result, raw };
+}
+
+export async function setStrategyAsync(opts: SetStrategyOpts): Promise<unknown> {
+  const args: string[] = [];
+  if (opts.rateStrategy !== undefined) args.push('--rate-strategy', opts.rateStrategy);
+  if (opts.maxConcurrent !== undefined) args.push('--max-concurrent', String(opts.maxConcurrent));
+  if (opts.trustedEscrows !== undefined && opts.trustedEscrows.length > 0) {
+    args.push('--trusted-escrows', opts.trustedEscrows.join(','));
+  }
+  const { result } = await runTraderCommandAsync('set-strategy', args, opts);
+  return result;
+}
+
+export async function createIntentAsync(opts: CreateIntentOpts): Promise<CreatedIntent> {
+  const args = [
+    '--direction', opts.direction,
+    '--base', opts.baseAsset,
+    '--quote', opts.quoteAsset,
+    '--rate-min', opts.rateMin.toString(),
+    '--rate-max', opts.rateMax.toString(),
+    '--volume-min', opts.volumeMin.toString(),
+    '--volume-max', opts.volumeMax.toString(),
+  ];
+  if (opts.expiryMs !== undefined) args.push('--expiry-ms', String(opts.expiryMs));
+  const { result } = await runTraderCommandAsync('create-intent', args, opts);
+  if (typeof result !== 'object' || result === null) {
+    throw new Error(`create-intent: result is not an object. Got: ${JSON.stringify(result)}`);
+  }
+  const intentId = (result as Record<string, unknown>)['intent_id'];
+  if (typeof intentId !== 'string') {
+    throw new Error(`create-intent: missing intent_id. Got: ${JSON.stringify(result)}`);
+  }
+  return { intentId };
+}
+
+export async function portfolioAsync(opts: TraderInvocationOpts): Promise<readonly PortfolioBalance[]> {
+  const { result } = await runTraderCommandAsync('portfolio', [], opts);
+  if (Array.isArray(result)) return result as PortfolioBalance[];
+  if (typeof result === 'object' && result !== null) {
+    const r = result as Record<string, unknown>;
+    const balances = r['balances'] ?? r['portfolio'];
+    if (Array.isArray(balances)) return balances as PortfolioBalance[];
+    return Object.entries(r).map(([asset, amount]) => ({ asset, amount: String(amount) }));
+  }
+  throw new Error(`portfolio: response not in expected shape. Got: ${JSON.stringify(result)}`);
+}
+
+export async function listDealsAsync(opts: TraderInvocationOpts): Promise<readonly DealSummary[]> {
+  const { result } = await runTraderCommandAsync('list-deals', [], opts);
+  if (Array.isArray(result)) return result as DealSummary[];
+  if (typeof result === 'object' && result !== null) {
+    const arr = (result as Record<string, unknown>)['deals'] ?? (result as Record<string, unknown>)['swaps'];
+    if (Array.isArray(arr)) return arr as DealSummary[];
+  }
+  throw new Error(`list-deals: response not in expected shape. Got: ${JSON.stringify(result)}`);
+}
+
+export async function withdrawAsync(opts: WithdrawOpts): Promise<WithdrawResult> {
+  const args = [
+    '--asset', opts.asset,
+    '--amount', opts.amount.toString(),
+    '--to-address', opts.toAddress,
+  ];
+  const { result } = await runTraderCommandAsync('withdraw', args, opts);
+  return parseWithdrawResult(result);
+}
+
+/**
+ * Async polling variant of waitForDealInState — uses listDealsAsync so
+ * concurrent waits across multiple traders truly overlap (each list-deals
+ * spawns its own subprocess via runSphereAsync, no event-loop blocking).
+ */
+export async function waitForDealInStateAsync(
+  opts: TraderInvocationOpts & {
+    targetState: string;
+    timeoutMs?: number;
+    intervalMs?: number;
+  },
+): Promise<DealSummary> {
+  const deadline = Date.now() + (opts.timeoutMs ?? 600_000);
+  const interval = opts.intervalMs ?? 3_000;
+  let lastSeen: readonly DealSummary[] = [];
+  while (Date.now() < deadline) {
+    try {
+      lastSeen = await listDealsAsync(opts);
+      const match = lastSeen.find((d) => d.state === opts.targetState);
+      if (match) return match;
+    } catch {
+      // Transient error — keep polling.
+    }
+    await new Promise((r) => setTimeout(r, interval));
+  }
+  const summary = lastSeen.length > 0
+    ? `last seen ${lastSeen.length} deal(s) in states [${lastSeen.map((d) => d.state).join(', ')}]`
+    : 'no deals visible';
+  throw new Error(
+    `waitForDealInStateAsync: tenant ${opts.tenant} did not reach state="${opts.targetState}" ` +
     `within ${opts.timeoutMs ?? 600_000}ms. ${summary}.`,
   );
 }

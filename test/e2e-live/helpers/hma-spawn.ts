@@ -143,6 +143,54 @@ export function hostSpawn(opts: HostSpawnOpts): SpawnedTenant {
   };
 }
 
+/**
+ * Async variant of hostSpawn — uses runSphereAsync so concurrent calls
+ * (Promise.all([hostSpawnAsync(escrow), hostSpawnAsync(alice), ...]))
+ * actually overlap. The sync version uses spawnSync which blocks the
+ * event loop, defeating parallelism.
+ */
+export async function hostSpawnAsync(opts: HostSpawnOpts): Promise<SpawnedTenant> {
+  const args = [
+    'host',
+    'spawn',
+    opts.instanceName,
+    '--manager', opts.managerAddress,
+    '--template', opts.templateId,
+    '--json',
+    '--timeout', String(opts.timeoutMs ?? DEFAULT_HMCP_TIMEOUT_MS),
+  ];
+  for (const [k, v] of Object.entries(opts.env ?? {})) {
+    args.push('--env', `${k}=${v}`);
+  }
+  const result = await runSphereAsync(opts.cliPath, opts.cliHome, args, {
+    timeoutMs: (opts.timeoutMs ?? DEFAULT_HMCP_TIMEOUT_MS) + 30_000,
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `sphere host spawn failed (status=${result.status}, signal=${result.signal}). ` +
+      `stderr: ${result.stderr.slice(0, 800)}\nstdout: ${result.stdout.slice(0, 800)}`,
+    );
+  }
+  const responses = parseSpawnResponses(result.stdout);
+  const ready = responses.find((r) => r.type === 'hm.spawn_ready');
+  if (!ready) {
+    const failed = responses.find((r) => r.type === 'hm.spawn_failed' || r.type === 'hm.error');
+    throw new Error(
+      `sphere host spawn did not produce hm.spawn_ready. ` +
+      `last response: ${JSON.stringify(failed ?? responses[responses.length - 1])}`,
+    );
+  }
+  const p = ready.payload;
+  return {
+    instanceId: String(p['instance_id'] ?? ''),
+    instanceName: String(p['instance_name'] ?? ''),
+    tenantPubkey: String(p['tenant_pubkey'] ?? ''),
+    tenantDirectAddress: String(p['tenant_direct_address'] ?? ''),
+    tenantNametag: typeof p['tenant_nametag'] === 'string' ? p['tenant_nametag'] : null,
+    state: String(p['state'] ?? ''),
+  };
+}
+
 export interface HostStopOpts {
   cliPath: string;
   cliHome: string;
