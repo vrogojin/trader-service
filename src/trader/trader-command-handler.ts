@@ -289,37 +289,46 @@ function validateStrategyParams(params: SetStrategyParams): string | null {
 // ---------------------------------------------------------------------------
 //
 // Hex regex matching the SDK's signing-boundary contract for
-// DIRECT://hex / PROXY://hex addresses. Lower bound 64 (x-only
-// pubkey) covers the canonical Unicity DIRECT-address shape; upper
-// bound 80 matches `modules/swap/manifest.ts`'s DIRECT_HEX_RE.
-const STRICT_HEX_RE = /^[0-9a-fA-F]{64,80}$/;
+// DIRECT://hex / PROXY://hex addresses. Lowercase-only — matches
+// `modules/swap/manifest.ts`'s DIRECT_HEX_RE and `normalizeAddress`'s
+// canonical form. The validator below applies `.toLowerCase()` to
+// `parsed.value` before testing, so an operator submitting
+// `DIRECT://AABB...` and `DIRECT://aabb...` validate identically.
+// Lower bound 64 (x-only pubkey) covers the canonical Unicity
+// DIRECT-address shape; upper bound 80 matches the SDK signing
+// boundary.
+const STRICT_HEX_RE = /^[0-9a-f]{64,80}$/;
 
-function isValidAddress(addr: unknown): addr is string {
+// Exported for unit tests in trader-command-handler.test.ts. The
+// function is otherwise only consumed by handleWithdrawToken below.
+export function isValidAddress(addr: unknown): addr is string {
   if (typeof addr !== 'string') return false;
   const parsed = parseAddress(addr);
   if (parsed === null) return false;
   if (parsed.type === 'NAMETAG') {
     // CRITICAL: pass the BARE nametag (parsed.value, no `@` prefix),
-    // not the full address. The SDK exports two `isValidNametag`
-    // functions with different signatures:
-    //   - core/address.ts:isValidNametag — internally calls parseAddress
-    //                                     and applies NAMETAG_RE to .value;
-    //                                     accepts the full `@nametag` string.
-    //   - core/Sphere.ts:isValidNametag — applies /^[a-z0-9_-]{3,20}$/ to
-    //                                     the BARE input directly; rejects
-    //                                     anything with `@`.
-    // The Sphere.ts version is the one the SDK package re-exports, AND
-    // is what the relay binding-layer actually enforces. We need its
-    // behaviour but must give it the bare name.
+    // not the full address. The SDK package re-exports the
+    // `core/Sphere.ts` version of isValidNametag, whose regex
+    // `/^[a-z0-9_-]{3,20}$/` (plus an isPhoneNumber escape hatch)
+    // tests the BARE input directly — passing `@alice` would fail
+    // because `@` is not in the character class.
+    //
+    // What the gate accepts (matches SDK relay binding-layer):
+    //   - 3-20 chars of lowercase alphanumeric / `_` / `-`,
+    //     including leading hyphen/underscore (the exported regex
+    //     has no first-char anchor).
+    //   - Phone-number-shaped nametags (E.164 strings like
+    //     `+12025551234` after stripping `@`). The SDK supports
+    //     phone numbers as canonical Unicity identities; this is
+    //     intentional.
     return isValidNametag(parsed.value);
   }
   if (parsed.type === 'DIRECT' || parsed.type === 'PROXY') {
-    // Normalize hex case before regex check so `DIRECT://AABB...` and
-    // `DIRECT://aabb...` validate identically (the SDK's signing-
-    // boundary regex is lowercase-only and `normalizeAddress`
-    // lowercases). The wire payload still carries the operator's
-    // original string; downstream `normalizeAddress` is the single
-    // place that case is canonicalized for any on-chain comparison.
+    // Normalize hex case before the lowercase-only regex check so
+    // `DIRECT://AABB...` and `DIRECT://aabb...` validate identically.
+    // The wire payload still carries the operator's original string;
+    // downstream `normalizeAddress` is the single place that case
+    // is canonicalized for any on-chain comparison.
     return STRICT_HEX_RE.test(parsed.value.toLowerCase());
   }
   // Future SDK address types — reject conservatively until we add
