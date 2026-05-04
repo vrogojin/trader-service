@@ -32,15 +32,24 @@
  *   - this file: spawns through HMA, settles, AND withdraws.
  *
  * Parallelism contract:
- *   - 2 scenarios run concurrently (vitest `it.concurrent`).
- *   - Within each scenario, every step that can fan out does so via
- *     Promise.all using the *Async helpers (which use spawn, not
- *     spawnSync — sync helpers would serialize even inside Promise.all
- *     because spawnSync blocks the event loop).
- *   - Total live infra load at peak: ~6 spawn DMs, 4 set-strategy DMs,
- *     4 create-intent DMs, ~4 list-deals DMs every 3s during settlement
- *     wait. The infra-probe preflight runs first to fail-fast on a
- *     degraded testnet.
+ *   - 2 scenarios run concurrently across the file (vitest `it.concurrent`).
+ *     Each scenario uses its OWN controller wallet in its OWN cliHome
+ *     dir — concurrent sphere-cli calls in the SAME .sphere-cli/wallet.json
+ *     race on the SDK's atomic temp+rename writes (FileStorageProvider.save
+ *     → fs.renameSync) and corrupt each other's state.
+ *   - WITHIN each scenario, sphere-cli calls are SEQUENTIAL. Tried fully
+ *     parallel (Promise.all over spawn/set-strategy/portfolio) and got
+ *     two distinct races on the first run: "No wallet exists" (Sphere.init
+ *     reading mid-write) and "ENOENT: rename wallet.json.tmp -> wallet.json"
+ *     (two atomic writes racing each other). The DM round-trips for spawn
+ *     are the only ones inside a scenario where parallelism would matter
+ *     (~5-15s each); against the 3-5min settlement-wait dominator, the
+ *     wall-clock cost of serializing them is negligible.
+ *   - Net effect: total wall time ≈ max(scenario_time), not sum, because
+ *     the long settlement wait runs concurrently across scenarios.
+ *   - Live infra load at peak: 2 cross-scenario sphere-cli children,
+ *     each making 1 DM at a time. Manageable for the relay. Aggregator
+ *     load comes from the trader containers themselves, not sphere-cli.
  *
  * Performance target on a healthy testnet: ~5-8 minutes total.
  *   - HMA boot: ~10s
@@ -257,35 +266,42 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       TRADER_TEST_FUND: `${UCT_COIN_ID}:${SELF_MINT_AMOUNT.toString()},${USDU_COIN_ID}:${SELF_MINT_AMOUNT.toString()}`,
       TRADER_FAULT_INJECTION_ALLOWED: '1',
     };
-    console.log(`[${scenarioId}] spawning escrow + alice + bob (parallel)…`);
-    const [escrow, alice, bob] = await Promise.all([
-      hostSpawnAsync({
-        cliPath: s.cliPath,
-        cliHome: controller.cliHome,
-        managerAddress: s.managerAddr,
-        templateId: 'escrow-service',
-        instanceName: `escrow-${scenarioId}`,
-        timeoutMs: 180_000,
-      }),
-      hostSpawnAsync({
-        cliPath: s.cliPath,
-        cliHome: controller.cliHome,
-        managerAddress: s.managerAddr,
-        templateId: 'trader-agent',
-        instanceName: `alice-${scenarioId}`,
-        timeoutMs: 180_000,
-        env: traderEnv,
-      }),
-      hostSpawnAsync({
-        cliPath: s.cliPath,
-        cliHome: controller.cliHome,
-        managerAddress: s.managerAddr,
-        templateId: 'trader-agent',
-        instanceName: `bob-${scenarioId}`,
-        timeoutMs: 180_000,
-        env: traderEnv,
-      }),
-    ]);
+    // Within a scenario, sphere-cli calls share one wallet.json and
+    // race on its atomic temp+rename writes (FileStorageProvider.save
+    // → fs.renameSync). So within-scenario calls are serialized. The
+    // PARALLELISM the user asked for is preserved cross-scenario via
+    // vitest `it.concurrent` — each scenario has its own controller
+    // wallet and the long settlement-wait phases run truly in parallel
+    // across scenarios. Wall-clock cost of this serialization vs full
+    // parallel: 2-3 spawn DM round-trips (~5-15s each) instead of 1,
+    // negligible against the 3-5 min settlement dominator.
+    console.log(`[${scenarioId}] spawning escrow + alice + bob (sequential within-scenario)…`);
+    const escrow = await hostSpawnAsync({
+      cliPath: s.cliPath,
+      cliHome: controller.cliHome,
+      managerAddress: s.managerAddr,
+      templateId: 'escrow-service',
+      instanceName: `escrow-${scenarioId}`,
+      timeoutMs: 180_000,
+    });
+    const alice = await hostSpawnAsync({
+      cliPath: s.cliPath,
+      cliHome: controller.cliHome,
+      managerAddress: s.managerAddr,
+      templateId: 'trader-agent',
+      instanceName: `alice-${scenarioId}`,
+      timeoutMs: 180_000,
+      env: traderEnv,
+    });
+    const bob = await hostSpawnAsync({
+      cliPath: s.cliPath,
+      cliHome: controller.cliHome,
+      managerAddress: s.managerAddr,
+      templateId: 'trader-agent',
+      instanceName: `bob-${scenarioId}`,
+      timeoutMs: 180_000,
+      env: traderEnv,
+    });
     s.spawned.push(escrow, alice, bob);
     console.log(
       `[${scenarioId}] up: escrow=${escrow.instanceName} ` +
@@ -329,25 +345,26 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     const { escrow, alice, bob } = await provisionTriple(scenarioId, controller);
 
     // ---- 2. Configure trusted escrows on both traders --------------
-    console.log(`[${scenarioId}] set-strategy on alice + bob (parallel)…`);
-    await Promise.all([
-      setStrategyAsync({
-        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
-        trustedEscrows: [escrow.tenantPubkey],
-        maxConcurrent: 5,
-      }),
-      setStrategyAsync({
-        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
-        trustedEscrows: [escrow.tenantPubkey],
-        maxConcurrent: 5,
-      }),
-    ]);
+    // Sequential within-scenario (wallet.json contention; see provisionTriple).
+    console.log(`[${scenarioId}] set-strategy on alice + bob…`);
+    await setStrategyAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
+      trustedEscrows: [escrow.tenantPubkey],
+      maxConcurrent: 5,
+    });
+    await setStrategyAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
+      trustedEscrows: [escrow.tenantPubkey],
+      maxConcurrent: 5,
+    });
 
     // ---- 3. Pre-trade portfolio snapshot ---------------------------
-    const [aliceBefore, bobBefore] = await Promise.all([
-      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey }),
-      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey }),
-    ]);
+    const aliceBefore = await portfolioAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
+    });
+    const bobBefore = await portfolioAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
+    });
     const aliceUctBefore = balanceOf(aliceBefore, 'UCT');
     const aliceUsduBefore = balanceOf(aliceBefore, 'USDU');
     const bobUctBefore = balanceOf(bobBefore, 'UCT');
@@ -361,46 +378,46 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     expect(aliceUctBefore + aliceUsduBefore).toBeGreaterThan(0n);
     expect(bobUctBefore + bobUsduBefore).toBeGreaterThan(0n);
 
-    // ---- 4. Post matching intents in parallel ----------------------
+    // ---- 4. Post matching intents (sequential — wallet.json) ------
     // Alice buys UCT (pays USDU). Bob sells UCT (receives USDU).
-    console.log(`[${scenarioId}] posting matching intents (parallel)…`);
-    const [aliceIntent, bobIntent] = await Promise.all([
-      createIntentAsync({
-        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
-        direction: 'buy',
-        baseAsset: 'UCT', quoteAsset: 'USDU',
-        rateMin: TRADE_RATE, rateMax: TRADE_RATE,
-        volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
-        expiryMs: SWAP_TIMEOUT_MS,
-      }),
-      createIntentAsync({
-        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
-        direction: 'sell',
-        baseAsset: 'UCT', quoteAsset: 'USDU',
-        rateMin: TRADE_RATE, rateMax: TRADE_RATE,
-        volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
-        expiryMs: SWAP_TIMEOUT_MS,
-      }),
-    ]);
+    console.log(`[${scenarioId}] posting matching intents…`);
+    const aliceIntent = await createIntentAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
+      direction: 'buy',
+      baseAsset: 'UCT', quoteAsset: 'USDU',
+      rateMin: TRADE_RATE, rateMax: TRADE_RATE,
+      volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
+      expiryMs: SWAP_TIMEOUT_MS,
+    });
+    const bobIntent = await createIntentAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
+      direction: 'sell',
+      baseAsset: 'UCT', quoteAsset: 'USDU',
+      rateMin: TRADE_RATE, rateMax: TRADE_RATE,
+      volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
+      expiryMs: SWAP_TIMEOUT_MS,
+    });
     console.log(
       `[${scenarioId}] intents posted: alice=${aliceIntent.intentId.slice(0, 12)}… ` +
       `bob=${bobIntent.intentId.slice(0, 12)}…`,
     );
 
-    // ---- 5. Wait for both deals to reach COMPLETED in parallel -----
-    console.log(`[${scenarioId}] waiting for COMPLETED on both sides…`);
-    const [aliceDeal, bobDeal] = await Promise.all([
-      waitForDealInStateAsync({
-        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
-        targetState: 'COMPLETED',
-        timeoutMs: SWAP_TIMEOUT_MS,
-      }),
-      waitForDealInStateAsync({
-        cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
-        targetState: 'COMPLETED',
-        timeoutMs: SWAP_TIMEOUT_MS,
-      }),
-    ]);
+    // ---- 5. Wait for both deals to reach COMPLETED ------------------
+    // Sequential within-scenario (wallet.json contention). Wait for
+    // alice first; once she's COMPLETED, bob is typically COMPLETED
+    // already on the next poll, so this adds at most one poll cycle.
+    console.log(`[${scenarioId}] waiting for alice COMPLETED…`);
+    const aliceDeal = await waitForDealInStateAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
+      targetState: 'COMPLETED',
+      timeoutMs: SWAP_TIMEOUT_MS,
+    });
+    console.log(`[${scenarioId}] waiting for bob COMPLETED…`);
+    const bobDeal = await waitForDealInStateAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
+      targetState: 'COMPLETED',
+      timeoutMs: SWAP_TIMEOUT_MS,
+    });
     expect(aliceDeal.state).toBe('COMPLETED');
     expect(bobDeal.state).toBe('COMPLETED');
     // Both sides observe the same deal_id (one negotiation, two ledgers).
@@ -415,10 +432,12 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     // has been enough on testnet).
     await new Promise((r) => setTimeout(r, 5_000));
 
-    const [aliceAfter, bobAfter] = await Promise.all([
-      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey }),
-      portfolioAsync({ cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey }),
-    ]);
+    const aliceAfter = await portfolioAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
+    });
+    const bobAfter = await portfolioAsync({
+      cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
+    });
     const aliceUctAfter = balanceOf(aliceAfter, 'UCT');
     const aliceUsduAfter = balanceOf(aliceAfter, 'USDU');
     const bobUctAfter = balanceOf(bobAfter, 'UCT');
