@@ -282,6 +282,42 @@ function addStatus(parent: Command): Command {
     });
 }
 
+function addWithdraw(parent: Command): Command {
+  return parent
+    .command('withdraw')
+    .description('Withdraw a token from the trader to an external address (ACP WITHDRAW_TOKEN)')
+    .requiredOption('--asset <symbol>', 'Asset symbol (e.g. UCT, USDU) or hex coin id')
+    .requiredOption('--amount <bigint>', 'Amount to withdraw in smallest units (string-encoded bigint, must be > 0)')
+    .requiredOption('--to-address <address>', 'Destination address: @nametag, DIRECT://hex, or 64-char hex pubkey')
+    .action(async function (this: Command) {
+      const opts = parseGlobalOpts(this);
+      const local = this.opts() as Record<string, string | undefined>;
+      // The trader-side handler validates these again (asset non-empty,
+      // amount > 0, to_address shape). Catching the trivial cases here
+      // gives a faster local error path; non-trivial validation
+      // (insufficient available balance, unknown asset) requires
+      // round-tripping to the trader.
+      const asset = local['asset'];
+      if (!asset) fail('--asset is required', 2);
+      const amountStr = local['amount'];
+      if (!amountStr) fail('--amount is required', 2);
+      // bigint validation — accept only digit-only strings to avoid
+      // surprising parseInt('1e6')→1 truncation. The trader's
+      // safeParseBigint also rejects non-digit input, but a clear
+      // local message is friendlier.
+      if (!/^[1-9]\d*$/.test(amountStr)) {
+        fail(`--amount must be a positive integer in smallest units (got "${amountStr}")`, 2);
+      }
+      const toAddress = local['toAddress'];
+      if (!toAddress) fail('--to-address is required', 2);
+      await runCommand(opts, 'WITHDRAW_TOKEN', {
+        asset,
+        amount: amountStr,
+        to_address: toAddress,
+      });
+    });
+}
+
 function addSetStrategy(parent: Command): Command {
   return parent
     .command('set-strategy')
@@ -340,6 +376,7 @@ export function buildProgram(): Command {
   addListSwaps(program);
   addPortfolio(program);
   addSetStrategy(program);
+  addWithdraw(program);
   addStatus(program);
 
   return program;
