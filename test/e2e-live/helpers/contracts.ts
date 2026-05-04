@@ -164,6 +164,19 @@ export interface ProvisionTraderOptions {
   waitForReady?: boolean;
   /** Ready-poll budget. Default: 60s. */
   readyTimeoutMs?: number;
+  /**
+   * Self-mint funding (replaces faucet HTTP). When set, the trader
+   * mints the listed amounts at startup via
+   * sphere.payments.mintFungibleToken (genesis mint with the wallet's
+   * own SigningService as issuer). Public testnet registry coinIds
+   * (UCT / USDU) work because there's no cryptographic restriction
+   * on which key issues a given CoinId — `class CoinId { ctor(bytes) }`.
+   *
+   * Eliminates the test's faucet HTTP dependency. The remaining
+   * external services are L3 aggregator + Nostr relays, both of
+   * which the swap path already requires.
+   */
+  selfMintFund?: Array<{ coinIdHex: string; amount: bigint }>;
 }
 
 /** @deprecated Architecture A. Use `SpawnedTenant` from `hma-spawn.ts`. */
@@ -200,6 +213,8 @@ export interface TestnetConstants {
   readonly IPFS_GATEWAY: string;
   /** Faucet endpoint. */
   readonly FAUCET_URL: string;
+  /** Market API endpoint (intent database for counterparty discovery). */
+  readonly MARKET_API_URL: string;
   /** Default trader image (matches templates.json shortcut). */
   readonly TRADER_IMAGE: string;
   /** Default escrow image. */

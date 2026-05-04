@@ -29,6 +29,7 @@ import type {
   StopContainer,
   WaitForContainerRunning,
 } from './contracts.js';
+import { sessionContainerPrefix } from './session.js';
 
 // ----------------------------------------------------------------------------
 // Errors
@@ -170,8 +171,13 @@ export function buildRunArgs(opts: DockerRunOptions, name: string): string[] {
 function buildName(label: string | undefined): string {
   // Docker container names: [a-zA-Z0-9][a-zA-Z0-9_.-]+
   // Label has already been validated against LABEL_RE if provided.
+  //
+  // Stem includes the per-process SESSION_ID so two concurrent invocations
+  // of `npm run test:e2e-live` produce disjoint name spaces. See
+  // session.ts for the rationale.
   const suffix = Math.random().toString(36).slice(2, 8);
-  const stem = label ? `trader-e2e-${label}` : 'trader-e2e';
+  const sessionPrefix = sessionContainerPrefix();
+  const stem = label ? `${sessionPrefix}-${label}` : sessionPrefix;
   return `${stem}-${suffix}`;
 }
 
@@ -345,6 +351,51 @@ export const waitForContainerRunning: WaitForContainerRunning = async (
  */
 export async function inspectContainer(id: string): Promise<boolean> {
   return isRunning(id);
+}
+
+/**
+ * List running container IDs (12-char hex prefix form) for containers whose
+ * name matches `docker ps --filter name=<prefix>`. IDs (not names) are
+ * returned because every downstream consumer (`getContainerLogs`,
+ * `stopContainer`, `removeContainer`) validates the input through
+ * `assertValidContainerId`, which enforces a hex-only regex. Names would be
+ * rejected — every log fetch in the diagnostic-dump path used to silently
+ * throw and get swallowed.
+ *
+ * @param namePrefix - Prefix to match against container names.
+ * @returns Array of container IDs (newest first per Docker's default
+ *   ordering — `docker ps` lists most-recently-started containers first).
+ */
+export async function listContainersByNamePrefix(
+  namePrefix: string,
+): Promise<string[]> {
+  if (typeof namePrefix !== 'string' || namePrefix.length === 0) {
+    throw new DockerError('listContainersByNamePrefix: namePrefix must be a non-empty string');
+  }
+  // Docker name rule: must start with [a-zA-Z0-9] and may contain `._-` after.
+  // The leading-char restriction also means a prefix of just `.` or `-`
+  // (which would degenerate to "match every container") is rejected.
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(namePrefix)) {
+    throw new DockerError(
+      `listContainersByNamePrefix: invalid name prefix '${namePrefix}' (must start with [A-Za-z0-9] and contain only [A-Za-z0-9._-])`,
+    );
+  }
+  try {
+    // Docker's `name=` filter is a SUBSTRING match by default — `name=foo`
+    // matches any container whose name CONTAINS "foo", not just those that
+    // START with "foo". For our session-isolation guarantee (where another
+    // test run's session ID could in theory share leading hex digits with
+    // ours), we anchor the regex with `^` to force prefix semantics.
+    // Docker passes the value through to its regexp matcher, so `^` is honored.
+    const { stdout } = await execFileImpl('docker', [
+      'ps',
+      '--filter', `name=^${namePrefix}`,
+      '--format', '{{.ID}}',
+    ]);
+    return stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
+  } catch (err) {
+    throw new DockerError(`docker ps failed for prefix ${namePrefix}: ${errMsg(err)}`, err);
+  }
 }
 
 async function isRunning(id: string): Promise<boolean> {

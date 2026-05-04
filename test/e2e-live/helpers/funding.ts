@@ -28,6 +28,11 @@ const DEFAULT_COIN_ID = 'UCT';
 
 interface FaucetResponseBody {
   tx_id?: unknown;
+  // Newer faucet API wraps the result in a data envelope
+  data?: {
+    requestId?: unknown;
+    [key: string]: unknown;
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -45,9 +50,11 @@ export const fundWallet: FundWallet = async (
   coinId,
 ): Promise<{ tx_id: string }> => {
   const coin = coinId ?? DEFAULT_COIN_ID;
+  // Faucet expects the raw nametag WITHOUT the '@' prefix.
+  const unicityId = walletAddress.startsWith('@') ? walletAddress.slice(1) : walletAddress;
   // bigint isn't JSON-serializable; the original wire shape uses a string.
   const body = JSON.stringify({
-    unicityId: walletAddress,
+    unicityId,
     coin,
     amount: amount.toString(),
   });
@@ -82,8 +89,16 @@ export const fundWallet: FundWallet = async (
           `Faucet returned non-JSON success body: ${text.slice(0, 200)}`,
         );
       }
-      const tx_id = parsed.tx_id;
-      if (typeof tx_id !== 'string' || tx_id.length === 0) {
+      // Support both response shapes:
+      //   Legacy: { tx_id: "..." }
+      //   Current: { data: { requestId: <number> } }
+      const tx_id =
+        typeof parsed.tx_id === 'string' && parsed.tx_id.length > 0
+          ? parsed.tx_id
+          : typeof parsed.data?.requestId !== 'undefined'
+          ? String(parsed.data.requestId)
+          : null;
+      if (tx_id === null) {
         throw new Error(
           `Faucet response missing tx_id: ${text.slice(0, 200)}`,
         );

@@ -7,7 +7,7 @@
  * intent state machine from Section 6.1.
  */
 
-import { randomBytes, randomInt } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 
 import type { CreateIntentParams } from './acp-types.js';
 import type {
@@ -162,6 +162,18 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   // Prevents repeatedly matching against the same dead counterparty.
   const failedCounterparties = new Map<string, Set<string>>();
 
+  // Per-intent timestamp of the FIRST scan-cycle yield under spec 5.7. When
+  // every match candidate is a lower-pubkey-priority peer (so we should
+  // wait for them to propose), we record `Date.now()`. If a scan still
+  // finds only lower-priority candidates `YIELD_TIMEOUT_MS` later AND we've
+  // never received an `np.propose_deal` for this intent, the original yield
+  // partner is presumed dead (likely a stale aggregator listing) and we
+  // fall through to propose anyway. The duplicate-guard + no-blacklist
+  // pair already shipped (commit c1f24d8 + later) breaks the live-vs-live
+  // race without permanently wedging either side.
+  const firstYieldAt = new Map<string, number>();
+  const YIELD_TIMEOUT_MS = 45_000;
+
   // Timers
   let scanTimer: ReturnType<typeof setInterval> | null = null;
   let expiryTimer: ReturnType<typeof setInterval> | null = null;
@@ -174,6 +186,33 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   // ---------------------------------------------------------------------------
   // Internal state helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Resolve an intent record from EITHER a local intent_id (the SHA-256 hash
+   * keyed in `intents`) OR a market_intent_id (UUID assigned by MarketModule
+   * when the intent is posted).
+   *
+   * Why both are accepted: DealTerms carry market IDs by necessity — peers
+   * exchange their MarketModule-visible intent IDs in np.propose_deal /
+   * np.accept_deal because they don't share each other's local hash IDs. So
+   * any callback that runs from a deal-context (onSwapCompleted, onSwapFailed,
+   * onDealCancelled) only has market IDs to work with, but the engine's
+   * lookup table is local-id-keyed. Without this fallback, every fill record
+   * and every state restore on a deal completion silently no-ops, leaving
+   * the intent at volume_filled=0 and stuck in MATCHING.
+   *
+   * Local-id lookup is O(1) via the Map; market-id lookup falls back to a
+   * linear scan, which is fine because `intents` is bounded by
+   * `strategy.max_active_intents` (default 20).
+   */
+  function resolveIntentByEitherId(id: string): IntentRecord | undefined {
+    const direct = intents.get(id);
+    if (direct) return direct;
+    for (const record of intents.values()) {
+      if (record.intent.market_intent_id === id) return record;
+    }
+    return undefined;
+  }
 
   function transitionIntent(
     record: IntentRecord,
@@ -330,8 +369,89 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
 
     if (matches.length === 0) return;
 
-    // Sort by priority (spec 5.5)
-    matches.sort((a, b) => {
+    // Spec 5.7 — deterministic proposer election. The lower-pubkey side
+    // proposes; the higher-pubkey side waits for the counterparty's
+    // np.propose_deal to arrive over NP-0. Filter our match list to only
+    // candidates whose pubkey sorts AFTER ours.
+    const myKey = canonicalPubkeyKey(agentPubkey);
+    let proposingMatches = matches.filter((m) => {
+      const cpKey = canonicalPubkeyKey(m.agentPublicKey);
+      return myKey < cpKey;
+    });
+    if (proposingMatches.length === 0) {
+      // Every candidate is a lower-priority peer that should propose to us.
+      // Track when we FIRST started yielding for this intent. If a peer is
+      // alive and elected proposer, their np.propose_deal arrives within
+      // their own scan interval (5–30s typically). If we're still yielding
+      // YIELD_TIMEOUT_MS later, treat the partner as dead (e.g. a stale
+      // intent listing on a shared aggregator) and fall through to propose
+      // anyway. The duplicate-guard + no-blacklist combo handles the
+      // live-vs-live race without permanently wedging the pair.
+      const now = nowMs();
+      const firstAt = firstYieldAt.get(own.intent_id);
+      if (firstAt === undefined) {
+        firstYieldAt.set(own.intent_id, now);
+        logger.info('match_proposer_election_yield', {
+          intent_id: own.intent_id,
+          candidate_count: matches.length,
+          note: 'all candidates have lower-priority pubkey — waiting for their np.propose_deal',
+        });
+        return;
+      }
+      const elapsed = now - firstAt;
+      if (elapsed < YIELD_TIMEOUT_MS) {
+        // W4 (steelman round-4): rate-limit yield logging to fresh-yield
+        // only (handled in the firstAt === undefined branch above). The
+        // continuing-yield case fires every scan iteration (~5s) for the
+        // 45s window — 9 redundant log lines per yield session. Fall
+        // through silently; the timestamp suffices as state.
+        return;
+      }
+      // Yield timeout exceeded — proceed with the original (unfiltered)
+      // candidates. This is the "presumed-dead lower-priority candidate"
+      // fall-through. Once we propose, the engine clears the timestamp on
+      // the next successful match cycle (or the intent transitions out of
+      // ACTIVE/PARTIALLY_FILLED, in which case the entry is harmless and
+      // ages out via the periodic intents-map cleanup).
+      logger.warn('match_proposer_election_yield_timeout', {
+        intent_id: own.intent_id,
+        candidate_count: matches.length,
+        elapsed_ms: elapsed,
+        timeout_ms: YIELD_TIMEOUT_MS,
+        note: 'lower-priority candidates have not proposed within timeout — falling through to propose anyway',
+      });
+      proposingMatches = matches;
+      // W2 (steelman round-4): blacklist the failed-yield candidates so the
+      // next scan tries OTHER candidates first. Without this, every scan
+      // re-yields → 45s timeout → propose → AGENT_BUSY race → cancel →
+      // re-yield, a pathological retry loop. The failed-counterparty Set
+      // is per-intent and per-pubkey; it's used by matchesCriteria's
+      // criterion-7-equivalent in the next scan cycle.
+      // (TTL semantics: failedCounterparties uses an LRU+capacity bound
+      // rather than a per-entry TTL. Adding here moves the entry to the
+      // most-recent position; old entries age out as new failures arrive.)
+      for (const m of matches) {
+        engine.markCounterpartyFailed(own.intent_id, m.agentPublicKey);
+      }
+      // CRITICAL state-machine fix (basic-roundtrip flake investigation,
+      // 2026-04-29): RESET firstYieldAt after fall-through. Without this
+      // reset, the next scan finds the same lower-priority candidate
+      // (e.g. after blacklist LRU eviction or counterparty rotation),
+      // sees firstYieldAt is set with elapsed ≫ TIMEOUT, and IMMEDIATELY
+      // re-fires the fall-through. Empirical evidence: a single yield
+      // session of 80 fall-throughs in 11.5 min from one intent against
+      // one peer (basic-roundtrip 2026-04-28 log). The W2 blacklist
+      // alone breaks the storm in the immediate-next-scan, but a stale
+      // firstYieldAt resurrects the storm later. Resetting here means
+      // each yield session has at most ONE fall-through.
+      firstYieldAt.delete(own.intent_id);
+      // We have proposing-elected candidates — clear the yield timestamp
+      // so the next yield (if any) starts a fresh window.
+      firstYieldAt.delete(own.intent_id);
+    }
+
+    // Sort by priority (spec 5.5) — only the proposer-elected candidates.
+    proposingMatches.sort((a, b) => {
       const parsedA = parseDescription(a.description);
       const parsedB = parseDescription(b.description);
       if (!parsedA || !parsedB) return 0;
@@ -369,8 +489,9 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
 
     logger.info('matches_found', {
       intent_id: own.intent_id,
-      count: matches.length,
-      counterparties: matches.slice(0, 5).map((m) => m.agentPublicKey.slice(0, 12)),
+      count: proposingMatches.length,
+      total_candidates: matches.length,
+      counterparties: proposingMatches.slice(0, 5).map((m) => m.agentPublicKey.slice(0, 12)),
     });
 
     // Transition to MATCHING BEFORE fanning out proposals to prevent the next
@@ -387,42 +508,17 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     // Dead counterparties simply never respond and their proposals time out harmlessly.
     // Cap at max_concurrent_swaps to avoid flooding.
     const fanOutLimit = Math.max(1, strategy.max_concurrent_swaps * 3);
-    const candidates = matches.slice(0, fanOutLimit);
+    const candidates = proposingMatches.slice(0, fanOutLimit);
 
-    // F6 — divide remaining volume across fan-out candidates so two
-    // concurrent accepts cannot exceed volume_max. Distribute the remainder
-    // to a rotated window of candidates so the full remainingVolume is
-    // offered; integer truncation would otherwise drop up to
-    // (candidates.length - 1) units. Candidates that receive 0n are skipped.
-    //
-    // F7 — rotate the "+1 remainder" bonus across candidates via a per-scan
-    // random offset. The previous implementation deterministically awarded
-    // the bonus to the first-sorted candidate, giving an attacker who games
-    // the sort keys (rate/time/volume) a small but real preference edge.
-    // Uses crypto.randomInt — this is not a security-critical draw per se,
-    // but randomInt is the correct primitive (uniform, cryptographically
-    // secure) and avoids the Math.random() predictability/modulo-bias
-    // concern that static analysis tools flag (round-13 F3).
     const remainingVolume = current.intent.volume_max - current.intent.volume_filled;
-    const candidateCountBn = BigInt(candidates.length);
-    const baseVolume = remainingVolume / candidateCountBn;
-    const remainderVolume = remainingVolume % candidateCountBn;
-    const rotationOffset = candidates.length > 0 ? randomInt(candidates.length) : 0;
-    const volumeFor = (idx: number): bigint => {
-      const rotated = (idx + rotationOffset) % candidates.length;
-      return rotated < Number(remainderVolume) ? baseVolume + 1n : baseVolume;
-    };
 
-    // If even the smallest share would be zero (i.e. remainingVolume === 0n
-    // OR there is nothing left to distribute), skip the fan-out entirely
-    // and restore the intent to ACTIVE.
+    // If remaining volume is zero, skip fan-out and restore to ACTIVE.
     if (remainingVolume <= 0n) {
       logger.info('fan_out_skipped_zero_remaining_volume', {
         intent_id: own.intent_id,
         remaining_volume: remainingVolume.toString(),
         candidate_count: candidates.length,
       });
-      // Restore the intent to ACTIVE if we were just moved to MATCHING above.
       const currentAfter = intents.get(own.intent_id);
       if (currentAfter?.state === 'MATCHING') {
         try { transitionIntent(currentAfter, 'ACTIVE'); } catch { /* best effort */ }
@@ -430,16 +526,49 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       return;
     }
 
-    // Build the per-candidate volume list, skipping candidates whose share
-    // would be zero (only happens when remainingVolume < candidates.length
-    // for the tail candidates after the remainder is exhausted).
+    // Greedy allocation in priority order — each candidate gets the largest
+    // share it can absorb (capped by its parsed.volume_max), drawn from
+    // remainingVolume in priority order. Sum of shares <= volume_max so
+    // concurrent accepts cannot over-commit (the F6 safety invariant).
+    //
+    // Why greedy beats even-division (the previous F6/F7 scheme):
+    // The aggregator/relay surfaces stale buy/sell intents from prior
+    // sessions on shared infrastructure. Even-division splits remaining
+    // volume across all candidates, including dead ones — diluting the
+    // share offered to the live counterparty.
+    //
+    // Concrete failure (multi-agent partial-fill e2e):
+    //   Alice (sell vMax=100) sees 4 buy candidates at rate=1 (Bob_new
+    //   vMax=30 + 3 stale). Even-division gives each 100/4=25. Alice
+    //   proposes 25 to Bob, Bob accepts (within [10,30]). Alice fills
+    //   25 instead of the expected 30. Stale candidates time out
+    //   silently, wasting 75 units of dilution.
+    //
+    // Greedy assigns the priority-sorted (best-rate, then newest) leader
+    // up to its full vMax cap, then the next, etc. The newest live
+    // candidate (Bob_new) is first in priority and gets min(100, 30)=30.
+    // Stale candidates inherit the remainder and time out without
+    // affecting the live deal.
+    //
+    // Fairness note (replaces F7 rotation): priority order IS the spec
+    // 5.5 ranking (best rate → time → volume). Greedy by priority is
+    // therefore deterministic AND aligned with spec — no rotation
+    // needed because the most-likely-best candidate gets first claim
+    // by design.
     const candidatesWithVolume: Array<MarketSearchResult & { __perCandidateVolume?: bigint }> = [];
-    for (let i = 0; i < candidates.length; i += 1) {
-      const share = volumeFor(i);
-      if (share <= 0n) continue;
-      const entry = candidates[i];
-      if (!entry) continue;
+    let remainingToAllocate = remainingVolume;
+    const ownMin = current.intent.volume_min;
+    for (const entry of candidates) {
+      if (remainingToAllocate <= 0n) break;
+      const parsedCp = parseDescription(entry.description);
+      if (!parsedCp) continue;
+      const cpMax = parsedCp.volume_max;
+      const cpMin = parsedCp.volume_min;
+      const minRequired = ownMin > cpMin ? ownMin : cpMin;
+      const share = remainingToAllocate < cpMax ? remainingToAllocate : cpMax;
+      if (share < minRequired) continue;
       candidatesWithVolume.push({ ...entry, __perCandidateVolume: share });
+      remainingToAllocate -= share;
     }
 
     if (candidatesWithVolume.length === 0) {
@@ -663,6 +792,7 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       if (TERMINAL_INTENT_STATES.includes(record.state) && record.updated_at < purgeThreshold) {
         intents.delete(id);
         failedCounterparties.delete(id);
+        firstYieldAt.delete(id);
         logger.debug('intent_purged', { intent_id: id, state: record.state });
       }
     }
@@ -879,12 +1009,12 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     },
 
     restoreToActive(intentId: string): void {
-      const record = intents.get(intentId);
+      const record = resolveIntentByEitherId(intentId);
       if (!record) return;
       if (record.state === 'MATCHING' || record.state === 'NEGOTIATING') {
         try {
           transitionIntent(record, 'ACTIVE');
-          logger.info('intent_restored_to_active', { intent_id: intentId });
+          logger.info('intent_restored_to_active', { intent_id: record.intent.intent_id });
         } catch {
           // Transition failed — intent may have been cancelled/expired
         }
@@ -892,11 +1022,17 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     },
 
     markCounterpartyFailed(intentId: string, counterpartyPubkey: string): void {
+      // Resolve to the LOCAL intent_id so the failed-counterparty Set is
+      // keyed consistently regardless of whether the caller passed a local
+      // or a market intent_id (DealTerms carry market IDs).
+      const record = resolveIntentByEitherId(intentId);
+      const localId = record?.intent.intent_id ?? intentId;
+
       const MAX_FAILED_PER_INTENT = 1000;
-      let set = failedCounterparties.get(intentId);
+      let set = failedCounterparties.get(localId);
       if (!set) {
         set = new Set();
-        failedCounterparties.set(intentId, set);
+        failedCounterparties.set(localId, set);
       }
       // Use canonical form so a peer can't re-engage by presenting a different
       // pubkey encoding of the same identity.
@@ -914,11 +1050,11 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
         if (oldest !== undefined) set.delete(oldest);
       }
       set.add(key);
-      logger.info('counterparty_marked_failed', { intent_id: intentId, counterparty: counterpartyPubkey });
+      logger.info('counterparty_marked_failed', { intent_id: localId, counterparty: counterpartyPubkey });
     },
 
     recordFill(intentId: string, filledVolume: bigint): void {
-      const record = intents.get(intentId);
+      const record = resolveIntentByEitherId(intentId);
       if (!record) return;
       const newFilled = record.intent.volume_filled + filledVolume;
       const remaining = record.intent.volume_max - newFilled;

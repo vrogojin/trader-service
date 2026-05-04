@@ -13,6 +13,23 @@
 import type { AcpResultPayload, AcpErrorPayload } from '../protocols/acp.js';
 import type { CommandHandler } from '../tenant/command-handler.js';
 import { pubkeysEqual } from '../shared/crypto.js';
+// Authoritative address validators from sphere-sdk.
+//
+// The SDK's `isValidAddress` is intentionally permissive — it only
+// checks the prefix (`@`, `DIRECT://`, `PROXY://`) and that the
+// remainder is non-empty. The SDK comments explicitly: "Strict hex
+// validation is NOT enforced here — test fixtures use non-hex
+// placeholder addresses." For a money-movement command like
+// WITHDRAW_TOKEN, that's too lax: `@ALICE` (uppercase) and
+// `DIRECT://garbage` would slip through and then fail confusingly at
+// `payments.send`.
+//
+// We layer two stricter checks on top:
+//   - For `@nametag`:   delegate to `isValidNametag` (enforces SDK's
+//                       canonical NAMETAG_RE = /^[a-z0-9][a-z0-9_-]{0,29}$/).
+//   - For DIRECT/PROXY: enforce hex-only after the prefix, length 64-80
+//                       (matches SDK's signing-boundary regex).
+import { parseAddress, isValidNametag } from '@unicitylabs/sphere-sdk';
 import type { Logger } from '../shared/logger.js';
 import type { IntentEngine } from './intent-engine.js';
 import type { NegotiationHandler } from './negotiation-handler.js';
@@ -169,6 +186,10 @@ function toDealSummary(rec: DealRecord, agentPubkey: string): DealSummary {
     swap_id: rec.swap_id,
     created_ms: rec.terms.created_ms,
     updated_ms: rec.updated_at,
+    // Surface the recorded failure code for FAILED records so list-deals
+    // consumers can distinguish ESCROW_UNREACHABLE from EXECUTION_TIMEOUT
+    // from PAYOUT_UNVERIFIED without trawling logs.
+    ...(rec.error_code !== undefined ? { error_code: rec.error_code } : {}),
   };
 }
 
@@ -264,13 +285,55 @@ function validateStrategyParams(params: SetStrategyParams): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Address validation (basic hex or bech32-like check)
+// Address validation (strict, money-movement gate)
 // ---------------------------------------------------------------------------
+//
+// Hex regex matching the SDK's signing-boundary contract for
+// DIRECT://hex / PROXY://hex addresses. Lowercase-only — matches
+// `modules/swap/manifest.ts`'s DIRECT_HEX_RE and `normalizeAddress`'s
+// canonical form. The validator below applies `.toLowerCase()` to
+// `parsed.value` before testing, so an operator submitting
+// `DIRECT://AABB...` and `DIRECT://aabb...` validate identically.
+// Lower bound 64 (x-only pubkey) covers the canonical Unicity
+// DIRECT-address shape; upper bound 80 matches the SDK signing
+// boundary.
+const STRICT_HEX_RE = /^[0-9a-f]{64,80}$/;
 
-const ADDRESS_RE = /^[a-zA-Z0-9]{10,128}$/;
-
-function isValidAddress(addr: unknown): addr is string {
-  return typeof addr === 'string' && ADDRESS_RE.test(addr);
+// Exported for unit tests in trader-command-handler.test.ts. The
+// function is otherwise only consumed by handleWithdrawToken below.
+export function isValidAddress(addr: unknown): addr is string {
+  if (typeof addr !== 'string') return false;
+  const parsed = parseAddress(addr);
+  if (parsed === null) return false;
+  if (parsed.type === 'NAMETAG') {
+    // CRITICAL: pass the BARE nametag (parsed.value, no `@` prefix),
+    // not the full address. The SDK package re-exports the
+    // `core/Sphere.ts` version of isValidNametag, whose regex
+    // `/^[a-z0-9_-]{3,20}$/` (plus an isPhoneNumber escape hatch)
+    // tests the BARE input directly — passing `@alice` would fail
+    // because `@` is not in the character class.
+    //
+    // What the gate accepts (matches SDK relay binding-layer):
+    //   - 3-20 chars of lowercase alphanumeric / `_` / `-`,
+    //     including leading hyphen/underscore (the exported regex
+    //     has no first-char anchor).
+    //   - Phone-number-shaped nametags (E.164 strings like
+    //     `+12025551234` after stripping `@`). The SDK supports
+    //     phone numbers as canonical Unicity identities; this is
+    //     intentional.
+    return isValidNametag(parsed.value);
+  }
+  if (parsed.type === 'DIRECT' || parsed.type === 'PROXY') {
+    // Normalize hex case before the lowercase-only regex check so
+    // `DIRECT://AABB...` and `DIRECT://aabb...` validate identically.
+    // The wire payload still carries the operator's original string;
+    // downstream `normalizeAddress` is the single place that case
+    // is canonicalized for any on-chain comparison.
+    return STRICT_HEX_RE.test(parsed.value.toLowerCase());
+  }
+  // Future SDK address types — reject conservatively until we add
+  // explicit handling.
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -641,9 +704,20 @@ export function createTraderCommandHandler(
       return errorPayload(commandId, 'INVALID_PARAM', 'amount must be a positive integer string');
     }
 
-    const toAddress = params['to_address'];
+    // Trim before validation AND forwarding. parseAddress (used by
+    // isValidAddress) trims internally so the gate would accept
+    // `'  @alice  '`, but the SDK transport layer's resolve() does not
+    // trim and would fail INVALID_RECIPIENT downstream. Trimming once
+    // here keeps the gate semantics aligned with payments.send and
+    // ensures the same canonical value is logged and forwarded.
+    const rawAddress = params['to_address'];
+    const toAddress = typeof rawAddress === 'string' ? rawAddress.trim() : rawAddress;
     if (!isValidAddress(toAddress)) {
-      return errorPayload(commandId, 'INVALID_PARAM', 'to_address must be a valid address (10-128 alphanumeric characters)');
+      return errorPayload(
+        commandId,
+        'INVALID_PARAM',
+        'to_address must be a valid Sphere address: @nametag (lowercase alphanumeric + _/-, 3-20 chars or E.164 phone), DIRECT://<64-80 hex>, or PROXY://<64-80 hex>',
+      );
     }
 
     // Check available balance (confirmed - reserved)

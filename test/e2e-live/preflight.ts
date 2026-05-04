@@ -1,20 +1,19 @@
 /**
- * Preflight infrastructure check for the trader-service e2e-live suite.
+ * Preflight infrastructure check for the e2e-live suite.
  *
  * Wraps `@unicitylabs/infra-probe` to verify that every Unicity Network
- * service the live tests depend on (Nostr relay, L3 Aggregator, IPFS
+ * service the e2e-live tests depend on (Nostr relay, L3 Aggregator, IPFS
  * gateway, L1 Fulcrum, Market API) is reachable and functional BEFORE
- * booting the host-manager binary or spawning any tenant containers.
+ * spawning any Docker containers or burning faucet quota.
  *
  * Failure modes the probe catches that the e2e suite would otherwise hit
- * as opaque timeouts deep into a run:
- *   - Nostr relay silently dropping kind:1059 publishes — controller's
- *     HMCP DM never reaches the manager; we'd time out on `hm.spawn`.
- *   - Aggregator API key rejection / rate-limit — Sphere.init hangs
- *     during nametag registration.
- *   - IPFS gateway 5xx — token-create races during nametag mint.
- *   - Fulcrum chain tip stale — L1-side identity publishes never resolve.
- *   - Market API down — traders post intents but no peer can find them.
+ * as opaque timeouts 5-15 minutes deep into a run:
+ *   - Nostr relay silently dropping kind:30078 / kind:1059 publishes
+ *     (the symptom of the 2026-04-30 outage that motivated this gate)
+ *   - Aggregator API key rejection / rate-limit
+ *   - IPFS gateway 5xx
+ *   - Fulcrum chain tip stale (L1 stuck) → token-create races
+ *   - Market API down → no intent discovery at all
  *
  * Environment knobs:
  *   TRADER_E2E_SKIP_PREFLIGHT=1     — bypass the gate entirely (escape hatch)
@@ -88,6 +87,9 @@ export async function runPreflight(): Promise<void> {
     return;
   }
 
+  // Validate network enum locally rather than blind-cast. The upstream
+  // `runProbes` would also throw on an unknown network, but tightening here
+  // makes the contract local and immune to upstream silent enum extensions.
   const VALID_NETWORKS = ['testnet', 'mainnet', 'dev'] as const;
   type Network = (typeof VALID_NETWORKS)[number];
   const rawNetwork = process.env['TRADER_E2E_PREFLIGHT_NETWORK'] ?? 'testnet';
@@ -99,6 +101,11 @@ export async function runPreflight(): Promise<void> {
   }
   const network = rawNetwork as Network;
 
+  // Validate timeoutMs. `Number('abc')` returns NaN; `Number('-1')` returns -1;
+  // `Number('0')` returns 0. All of these would propagate to the upstream
+  // probe's setTimeout and either fire immediately (NaN coerces to 1ms in Node)
+  // or never fire (0 = no timeout in setTimeout's contract). Both produce
+  // misleading "preflight failed" results from a typo. Reject loudly.
   const rawTimeoutMs = process.env['TRADER_E2E_PREFLIGHT_TIMEOUT_MS'] ?? '30000';
   const timeoutMs = Number(rawTimeoutMs);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
