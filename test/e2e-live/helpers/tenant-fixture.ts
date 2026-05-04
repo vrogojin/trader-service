@@ -1,6 +1,17 @@
 /**
  * tenant-fixture — provisions a fresh trader tenant container ready to trade.
  *
+ * @deprecated Architecture A (direct-docker). New tests should use
+ * `hma-spawn.ts` (Architecture B — HMA-orchestrated). See
+ * `contracts.ts` for the migration plan and SPHERE-CLI-EXTRACTION-PLAN
+ * §6.4 in agentic-hosting for the upstream architectural decision.
+ *
+ * Existing tests using `provisionTrader()` continue to work — they
+ * are scheduled for migration on a per-file basis. Once all direct-
+ * docker tests are migrated to `hostSpawn` from `hma-spawn.ts`, this
+ * file (and `docker-helpers.ts`, `trader-ctl-driver.ts`'s direct
+ * mode) will be removed.
+ *
  * Flow per `provisionTrader(opts)`:
  *   1. Materialize a fresh Sphere wallet on the host filesystem (mkdtempSync).
  *   2. Optionally fund the wallet from the testnet faucet.
@@ -13,11 +24,11 @@
  * On any failure: cleanup partial resources (container + wallet dir) before
  * rethrowing. The returned `dispose()` is idempotent.
  *
- * Architectural note (echoes contracts.ts): NO host-manager, NO HMCP. We
- * provision via the local Docker daemon directly. The trader's ACP-0 listener
- * still demands UNICITY_MANAGER_PUBKEY — we synthesize a one-off pubkey for
- * that env var so the boilerplate startup checks pass; the e2e tests drive
- * the trader via trader-ctl over Sphere DM, never via the manager channel.
+ * Architectural note: NO host-manager, NO HMCP — direct docker daemon
+ * call. The trader's ACP-0 listener still demands UNICITY_MANAGER_PUBKEY —
+ * we synthesize a one-off pubkey for that env var so the boilerplate
+ * startup checks pass; the e2e tests drive the trader via trader-ctl
+ * over Sphere DM, never via the manager channel.
  */
 
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
