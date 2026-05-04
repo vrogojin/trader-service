@@ -182,7 +182,10 @@ const SELF_MINT_AMOUNT = 5000n; // matches basic-roundtrip's selfMintFund amount
 // `volume_max` for matching intents in each scenario. Both sides post
 // identical volumes so a single fill clears both intents.
 const TRADE_VOLUME = 10n;
-const TRADE_RATE = 1n; // 1 USDU per UCT — keeps the math obvious
+// Per-scenario rates are distinct to prevent cross-scenario matching;
+// see runSettlementScenario header for why.
+const PAIR_1_RATE = 1n; // 1 USDU per UCT
+const PAIR_2_RATE = 3n; // 3 USDU per UCT — non-adjacent to avoid any rate-fuzzing overlap
 
 // Withdraw amount: small fraction of received UCT so the test asserts
 // real value movement without exhausting the trader's post-trade balance.
@@ -404,9 +407,22 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    *      address; assert transfer_id non-empty + post-withdraw balance
    *      reflects the withdrawal.
    */
+  /**
+   * `tradeRate` differs per scenario so the two pairs CANNOT
+   * cross-match on testnet. Round 8 saw both scenarios stuck at
+   * waitForDealInState → COMPLETED with 29 deals in CANCELLED state
+   * because pair-1's alice (rate=1) was matching pair-2's bob (also
+   * rate=1) and trying to negotiate — but the trusted_escrows on
+   * each side only allow that scenario's own escrow, so every
+   * cross-scenario negotiation flipped to FAILED/CANCELLED in a
+   * thrash loop. With distinct rates, rate-overlap filtering at
+   * the matcher level prevents the cross-match before negotiation
+   * even starts.
+   */
   async function runSettlementScenario(
     scenarioId: string,
     controller: ScenarioController,
+    tradeRate: bigint,
   ): Promise<void> {
     if (!state) throw new Error('beforeAll did not initialize state');
     const s = state;
@@ -461,7 +477,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
       direction: 'buy',
       baseAsset: 'UCT', quoteAsset: 'USDU',
-      rateMin: TRADE_RATE, rateMax: TRADE_RATE,
+      rateMin: tradeRate, rateMax: tradeRate,
       volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
       expiryMs: SWAP_TIMEOUT_MS,
     });
@@ -469,7 +485,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
       direction: 'sell',
       baseAsset: 'UCT', quoteAsset: 'USDU',
-      rateMin: TRADE_RATE, rateMax: TRADE_RATE,
+      rateMin: tradeRate, rateMax: tradeRate,
       volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
       expiryMs: SWAP_TIMEOUT_MS,
     });
@@ -519,7 +535,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     const bobUctAfter = balanceOf(bobAfter, 'UCT');
     const bobUsduAfter = balanceOf(bobAfter, 'USDU');
 
-    const expectedUsduPaid = TRADE_RATE * TRADE_VOLUME;
+    const expectedUsduPaid = tradeRate * TRADE_VOLUME;
     // Alice (buy UCT for USDU): +UCT / -USDU
     expect(
       aliceUctAfter - aliceUctBefore,
@@ -573,17 +589,17 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
 
   // ---- Concurrent scenarios -----------------------------------------------
 
-  it('Pair-1: full spawn → trade → settle → withdraw via HMA', async () => {
+  it('Pair-1: full spawn → trade → settle → withdraw via HMA (rate=1)', async () => {
     if (!state) throw new Error('beforeAll did not initialize state');
     const c = state.controllers[0];
     if (!c) throw new Error('controller #0 missing');
-    await runSettlementScenario(`p1-${randomUUID().slice(0, 6)}`, c);
+    await runSettlementScenario(`p1-${randomUUID().slice(0, 6)}`, c, PAIR_1_RATE);
   }, SWAP_TIMEOUT_MS + 4 * 60_000); // 12 min total budget per scenario
 
-  it('Pair-2: parallel scenario settles on the same HMA without interference', async () => {
+  it('Pair-2: parallel scenario settles on the same HMA at distinct rate (rate=3)', async () => {
     if (!state) throw new Error('beforeAll did not initialize state');
     const c = state.controllers[1];
     if (!c) throw new Error('controller #1 missing');
-    await runSettlementScenario(`p2-${randomUUID().slice(0, 6)}`, c);
+    await runSettlementScenario(`p2-${randomUUID().slice(0, 6)}`, c, PAIR_2_RATE);
   }, SWAP_TIMEOUT_MS + 4 * 60_000);
 });
