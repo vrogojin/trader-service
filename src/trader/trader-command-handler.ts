@@ -299,12 +299,28 @@ function isValidAddress(addr: unknown): addr is string {
   const parsed = parseAddress(addr);
   if (parsed === null) return false;
   if (parsed.type === 'NAMETAG') {
-    // isValidNametag re-parses internally, but it gives us the
-    // SDK's canonical content rules (lowercase, 1-30 chars, _-).
-    return isValidNametag(addr);
+    // CRITICAL: pass the BARE nametag (parsed.value, no `@` prefix),
+    // not the full address. The SDK exports two `isValidNametag`
+    // functions with different signatures:
+    //   - core/address.ts:isValidNametag — internally calls parseAddress
+    //                                     and applies NAMETAG_RE to .value;
+    //                                     accepts the full `@nametag` string.
+    //   - core/Sphere.ts:isValidNametag — applies /^[a-z0-9_-]{3,20}$/ to
+    //                                     the BARE input directly; rejects
+    //                                     anything with `@`.
+    // The Sphere.ts version is the one the SDK package re-exports, AND
+    // is what the relay binding-layer actually enforces. We need its
+    // behaviour but must give it the bare name.
+    return isValidNametag(parsed.value);
   }
   if (parsed.type === 'DIRECT' || parsed.type === 'PROXY') {
-    return STRICT_HEX_RE.test(parsed.value);
+    // Normalize hex case before regex check so `DIRECT://AABB...` and
+    // `DIRECT://aabb...` validate identically (the SDK's signing-
+    // boundary regex is lowercase-only and `normalizeAddress`
+    // lowercases). The wire payload still carries the operator's
+    // original string; downstream `normalizeAddress` is the single
+    // place that case is canonicalized for any on-chain comparison.
+    return STRICT_HEX_RE.test(parsed.value.toLowerCase());
   }
   // Future SDK address types — reject conservatively until we add
   // explicit handling.
