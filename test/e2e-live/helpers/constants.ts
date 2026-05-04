@@ -31,6 +31,17 @@ export const IPFS_GATEWAY = 'https://unicity-ipfs1.dyndns.org';
 export const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 
 /**
+ * Testnet Market API endpoint — the intent database that traders post to
+ * and search against for counterparty discovery. Pinned here (rather than
+ * relying on the trader image's hard-coded default) so that:
+ *   1. Tests can assert which Market API is being exercised, and
+ *   2. The infra-probe preflight gate verifies this exact endpoint.
+ *
+ * Matches `@unicitylabs/sphere-sdk` constants `DEFAULT_MARKET_API_URL`.
+ */
+export const MARKET_API_URL = 'https://market-api.unicity.network';
+
+/**
  * Canonical CoinId bytes from the public testnet registry
  * (https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet.json).
  *
@@ -71,6 +82,7 @@ export const TESTNET: TestnetConstants = {
   AGGREGATOR_URL,
   IPFS_GATEWAY,
   FAUCET_URL,
+  MARKET_API_URL,
   TRADER_IMAGE,
   ESCROW_IMAGE,
   DEFAULT_TIMEOUT_MS,

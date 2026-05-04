@@ -31,6 +31,10 @@ import { runTraderCtl } from './helpers/trader-ctl-driver.js';
 import { getControllerWallet } from './helpers/tenant-fixture.js';
 import { getContainerLogs } from './helpers/docker-helpers.js';
 import { TESTNET, UCT_COIN_ID, USDU_COIN_ID } from './helpers/constants.js';
+import {
+  snapshotPortfolio,
+  expectBalanceUnchanged,
+} from './helpers/portfolio-assertions.js';
 
 // ---------------------------------------------------------------------------
 // Shared fixtures: provisioned ONCE per file to amortize faucet rate-limits
@@ -317,6 +321,15 @@ describe('Basic round-trip trading', () => {
   }
 
   it('seller cancels intent before match → cancelled state observed', async () => {
+    // Audit Claim 5b: cancel-before-match must not move tokens. Snapshot
+    // before / cancel intent / snapshot after / assert unchanged. The window
+    // between create and cancel is ~1s and the intent uses an unusual rate
+    // (5) that won't match standard market peers — match probability is
+    // negligible. If a parallel testnet peer DOES happen to fill in that
+    // window, this assertion fires; the operator should investigate via the
+    // emitted delta message.
+    const sellerBalBefore = await snapshotPortfolio(seller.address);
+
     // Seller alone — no matching buyer intent posted in this scenario.
     const create = await authedTraderCtl(
       'create-intent',
@@ -379,9 +392,21 @@ describe('Basic round-trip trading', () => {
         { timeout: 60_000, interval: 2_000 },
       )
       .toBe(true);
+
+    // Cancel was successful and no swap occurred — balance must be unchanged.
+    const sellerBalAfter = await snapshotPortfolio(seller.address);
+    expectBalanceUnchanged(sellerBalBefore, sellerBalAfter);
   }, 5 * 60_000);
 
   it('intent expires before match → expired state observed', async () => {
+    // Audit Claim 5b: expire-without-match must not move tokens. Same
+    // shared-aggregator caveat as the cancel test — the intent uses an
+    // unusual rate (7) and the expiry window is short (15s), so match
+    // probability is low but non-zero. The emitted delta message on
+    // failure tells the operator whether spurious testnet noise is
+    // responsible.
+    const sellerBalBefore = await snapshotPortfolio(seller.address);
+
     // Short expiry, no matching counterparty intent → engine should mark EXPIRED.
     const expiryMs = 15_000;
     const create = await authedTraderCtl(
@@ -432,5 +457,9 @@ describe('Basic round-trip trading', () => {
         { timeout: expiryMs * 4 + 30_000, interval: 2_000 },
       )
       .toBe(true);
+
+    // Intent expired without matching — balance must be unchanged.
+    const sellerBalAfter = await snapshotPortfolio(seller.address);
+    expectBalanceUnchanged(sellerBalBefore, sellerBalAfter);
   }, 5 * 60_000);
 });

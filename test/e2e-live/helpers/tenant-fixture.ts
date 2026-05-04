@@ -29,11 +29,10 @@ import {
   Sphere,
 } from '@unicitylabs/sphere-sdk';
 
-// Drive-by fix: same change is also in PR #10. `@unicitylabs/sphere-sdk` no
-// longer exports `generatePrivateKey` at the package root (moved to the L1
-// sub-namespace). A secp256k1 private key is just 32 random bytes — inline
-// here so this test fixture compiles against current sphere-sdk regardless
-// of which PR lands first. The fix is identical in both PRs.
+// `@unicitylabs/sphere-sdk` no longer exports `generatePrivateKey` at the
+// package root (moved to the L1 sub-namespace). A secp256k1 private key is
+// just 32 random bytes — inline here so this fixture compiles against current
+// sphere-sdk regardless of which adjacent PR lands first.
 function generatePrivateKey(): string {
   return randomBytes(32).toString('hex');
 }

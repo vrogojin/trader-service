@@ -23,6 +23,11 @@ import {
 import { waitForDealInState } from './helpers/scenario-helpers.js';
 import { runTraderCtl } from './helpers/trader-ctl-driver.js';
 import { getControllerWallet } from './helpers/tenant-fixture.js';
+import {
+  snapshotPortfolio,
+  expectBalanceDelta,
+  type Portfolio,
+} from './helpers/portfolio-assertions.js';
 
 /**
  * Wrapper that auto-attaches controller-wallet credentials so the trader
@@ -253,6 +258,15 @@ describe('Multi-agent trading', () => {
         volumeMax: 200n,
       });
 
+      // Snapshot balances before — Audit Claim 4: state==='COMPLETED' alone is
+      // insufficient evidence that real tokens moved. Conservation invariant:
+      // sum of (post - pre) UCT across all 3 traders must be 0; same for USDU.
+      // Plus: each trader's balance MUST have changed (a no-op regression
+      // would leave all three unchanged).
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
+      const bobBalBefore = await snapshotPortfolio(bob.address);
+      const carolBalBefore = await snapshotPortfolio(carol.address);
+
       // Each trader must observe at least one COMPLETED deal.
       const [aliceDeal, bobDeal, carolDeal] = await Promise.all([
         waitForDealInState(alice, 'COMPLETED', TESTNET.SWAP_TIMEOUT_MS),
@@ -262,6 +276,38 @@ describe('Multi-agent trading', () => {
       expect(aliceDeal['state']).toBe('COMPLETED');
       expect(bobDeal['state']).toBe('COMPLETED');
       expect(carolDeal['state']).toBe('COMPLETED');
+
+      // Wait for payments.receive() to finalize inbound payouts (15s loop).
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+
+      const aliceBalAfter = await snapshotPortfolio(alice.address);
+      const bobBalAfter = await snapshotPortfolio(bob.address);
+      const carolBalAfter = await snapshotPortfolio(carol.address);
+
+      // Conservation: total UCT delta = 0; total USDU delta = 0.
+      // Tokens move between wallets; they don't appear or disappear.
+      const totalUctDelta =
+        (aliceBalAfter.UCT - aliceBalBefore.UCT) +
+        (bobBalAfter.UCT - bobBalBefore.UCT) +
+        (carolBalAfter.UCT - carolBalBefore.UCT);
+      const totalUsduDelta =
+        (aliceBalAfter.USDU - aliceBalBefore.USDU) +
+        (bobBalAfter.USDU - bobBalBefore.USDU) +
+        (carolBalAfter.USDU - carolBalBefore.USDU);
+      expect(totalUctDelta, 'conservation: sum of UCT deltas across 3 traders must be 0').toBe(0n);
+      expect(totalUsduDelta, 'conservation: sum of USDU deltas across 3 traders must be 0').toBe(0n);
+
+      // No-op detection: every trader participated in at least one deal, so
+      // at least one coin's balance must have changed for each.
+      const aliceChanged =
+        aliceBalAfter.UCT !== aliceBalBefore.UCT || aliceBalAfter.USDU !== aliceBalBefore.USDU;
+      const bobChanged =
+        bobBalAfter.UCT !== bobBalBefore.UCT || bobBalAfter.USDU !== bobBalBefore.USDU;
+      const carolChanged =
+        carolBalAfter.UCT !== carolBalBefore.UCT || carolBalAfter.USDU !== carolBalBefore.USDU;
+      expect(aliceChanged, 'Alice participated in a COMPLETED deal but her balance did not change').toBe(true);
+      expect(bobChanged, 'Bob participated in COMPLETED deals but his balance did not change').toBe(true);
+      expect(carolChanged, 'Carol participated in a COMPLETED deal but her balance did not change').toBe(true);
     },
     TESTNET.SWAP_TIMEOUT_MS + 60_000,
   );
@@ -272,6 +318,11 @@ describe('Multi-agent trading', () => {
       for (const t of [alice, bob, carol]) {
         await cancelActiveIntents(t);
       }
+
+      // Snapshot balances — Alice should sell exactly 30 UCT for 30 USDU
+      // (rate=1, volume=30); Bob should buy exactly 30 UCT for 30 USDU.
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
+      const bobBalBefore = await snapshotPortfolio(bob.address);
 
       const aliceIntentId = await createIntent(alice, {
         direction: 'sell',
@@ -319,6 +370,18 @@ describe('Multi-agent trading', () => {
           { timeout: TESTNET.SWAP_TIMEOUT_MS, interval: 2_000 },
         )
         .toMatchObject({ volumeFilled: 30n, volumeMax: 100n });
+
+      // Wait for inbound payouts to finalize (15s receive loop + margin).
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+
+      // Audit Claim 4 + 5a(c): exact balance deltas must reflect the partial
+      // fill. Alice sold 30 UCT at rate=1 → -30 UCT, +30 USDU. Bob bought
+      // 30 UCT at rate=1 → +30 UCT, -30 USDU. The intent-ledger assertion
+      // above is bookkeeping — these checks verify real on-chain movement.
+      const aliceBalAfter = await snapshotPortfolio(alice.address);
+      const bobBalAfter = await snapshotPortfolio(bob.address);
+      expectBalanceDelta(aliceBalBefore, aliceBalAfter, { UCT: -30n, USDU: 30n });
+      expectBalanceDelta(bobBalBefore, bobBalAfter, { UCT: 30n, USDU: -30n });
     },
     TESTNET.SWAP_TIMEOUT_MS + 120_000,
   );
@@ -329,6 +392,17 @@ describe('Multi-agent trading', () => {
       for (const t of [alice, bob, carol]) {
         await cancelActiveIntents(t);
       }
+
+      // Snapshot balances BEFORE the swap so we can verify conservation +
+      // exact deltas after the winner is determined.
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
+      const bobBalBefore = await snapshotPortfolio(bob.address);
+      const carolBalBefore = await snapshotPortfolio(carol.address);
+      const buyerBalBefores: Record<string, Portfolio> = {
+        [bob.address]: bobBalBefore,
+        [carol.address]: carolBalBefore,
+      };
+      const aliceBefore = aliceBalBefore;
 
       // alice sells; bob and carol both want to buy. Per spec 5.7 the
       // deterministic proposer election picks ONE counterparty per fan-out
@@ -391,6 +465,7 @@ describe('Multi-agent trading', () => {
         (i) => BigInt(String(i['volume_filled'] ?? '0')) === 200n,
       );
       const loser = bobFilled ? carol : bob;
+      const winner = bobFilled ? bob : carol;
       const loserIntents = await runAuthedTraderCtl(
         'list-intents',
         [],
@@ -407,6 +482,20 @@ describe('Multi-agent trading', () => {
         const filled = BigInt(String(i['volume_filled'] ?? '0'));
         expect(filled).not.toBe(200n);
       }
+
+      // Audit Claim 4 + 5a: verify exact deltas now that we know who won.
+      // Wait for inbound payouts to finalize (15s receive loop + margin).
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+      const aliceBalAfter = await snapshotPortfolio(alice.address);
+      const winnerBalAfter = await snapshotPortfolio(winner.address);
+      const loserBalAfter = await snapshotPortfolio(loser.address);
+
+      // Alice (seller) — sold 200 UCT for 200 USDU at rate=1.
+      expectBalanceDelta(aliceBefore, aliceBalAfter, { UCT: -200n, USDU: 200n });
+      // Winner — bought 200 UCT for 200 USDU.
+      expectBalanceDelta(buyerBalBefores[winner.address]!, winnerBalAfter, { UCT: 200n, USDU: -200n });
+      // Loser — never traded. Balance unchanged.
+      expectBalanceDelta(buyerBalBefores[loser.address]!, loserBalAfter, { UCT: 0n, USDU: 0n });
     },
     TESTNET.SWAP_TIMEOUT_MS + 120_000,
   );

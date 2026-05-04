@@ -24,6 +24,11 @@ import {
 } from './helpers/scenario-helpers.js';
 import { runTraderCtl } from './helpers/trader-ctl-driver.js';
 import { getControllerWallet } from './helpers/tenant-fixture.js';
+import {
+  snapshotPortfolio,
+  expectBalanceUnchanged,
+  pollUntilBalanceRestored,
+} from './helpers/portfolio-assertions.js';
 
 /**
  * Wrapper that auto-attaches controller-wallet credentials so the trader
@@ -230,6 +235,12 @@ describe('Negotiation failures', () => {
       await cancelActiveIntents(alice);
       await cancelActiveIntents(bob);
 
+      // Audit Claim 5b: untrusted-escrow rejection must happen BEFORE deposit,
+      // so neither Alice nor Bob should have moved any tokens. Snapshot before,
+      // assert unchanged after the test confirms no COMPLETED deal.
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
+      const bobBalBefore = await snapshotPortfolio(bob.address);
+
       // Repoint Bob at the untrusted escrow ONLY for this test. Alice still
       // only trusts the original. Bob will create his intent advertising
       // untrustedEscrow, which Alice's intent-engine must reject when it
@@ -293,6 +304,14 @@ describe('Negotiation failures', () => {
         ['--trusted-escrows', trustedEscrow.address],
         { tenant: bob.address, json: true },
       ).catch(() => undefined);
+
+      // No deposit should have occurred — both balances must be unchanged.
+      // The intent engine rejects the deal pre-acceptance when it sees the
+      // untrusted escrow address, so payInvoice is never called on either side.
+      const aliceBalAfter = await snapshotPortfolio(alice.address);
+      const bobBalAfter = await snapshotPortfolio(bob.address);
+      expectBalanceUnchanged(aliceBalBefore, aliceBalAfter);
+      expectBalanceUnchanged(bobBalBefore, bobBalAfter);
     },
     10 * 60_000,
   );
@@ -302,6 +321,18 @@ describe('Negotiation failures', () => {
     async () => {
       await cancelActiveIntents(alice);
       await cancelActiveIntents(faultyTrader);
+
+      // Audit Claim 5b — THE CANONICAL "did Alice get her tokens back?" case.
+      // Alice DOES deposit her tokens to the escrow. The faulty counterparty
+      // intentionally skips its deposit. The escrow's deposit_timeout fires;
+      // the deal goes FAILED. The user's claim — "all assets returned to
+      // their original owners on unhappy paths" — requires Alice's deposit to
+      // be refunded by the escrow's auto-return-on-cancel mechanism. This was
+      // historically asserted only as `state === 'FAILED' && error_code !== ''`,
+      // which a regression that stranded Alice's tokens would silently pass.
+      // We now poll until balance restoration to verify the refund actually
+      // propagates back to Alice.
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
 
       // Pair alice (deposits normally) with `faultyTrader` (TRADER_FAULT_SKIP_DEPOSITS=1
       // — receives swap:announced but skips swapModule.deposit()). The deal
@@ -344,6 +375,27 @@ describe('Negotiation failures', () => {
       // signal, not a test invariant.
       const errorCode = String(failed['error_code'] ?? '');
       expect(errorCode).not.toBe('');
+
+      // CLAIM 5b ASSERTION: Alice's tokens must be returned to her.
+      //
+      // The deal is now FAILED. Alice's deposit (if she made one — depending on
+      // proposer-election) is held by the escrow. The escrow's
+      // closeInvoice({autoReturn:true}) on the deposit invoice (escrow-service
+      // commit b97a84b) plus Alice's own setAutoReturn flag (trader-service
+      // PR #12) should refund the deposit back to her wallet within a few
+      // testnet round-trips. Poll until balance returns to baseline.
+      //
+      // If this assertion fires, it indicates a real product bug: Alice's
+      // tokens are stranded after an unhappy-path deal. That's exactly the
+      // class of regression Claim 5b was designed to catch — the historical
+      // `state === 'FAILED'` check would have hidden it.
+      await pollUntilBalanceRestored(alice.address, aliceBalBefore, {
+        // Allow up to the test budget minus a margin for the FAILED transition
+        // to land. The 11-min outer testTimeout means we have ~5 min headroom
+        // after EXECUTION_TIMEOUT fires.
+        timeoutMs: 5 * 60_000,
+        intervalMs: 5_000,
+      });
     },
     11 * 60_000,
   );
@@ -353,6 +405,24 @@ describe('Negotiation failures', () => {
     async () => {
       await cancelActiveIntents(alice);
       await cancelActiveIntents(bob);
+
+      // Audit Claim 5b: if either trader deposited before the escrow died,
+      // those tokens must come back. With the escrow process killed, the
+      // escrow's deposit-invoice auto-return cannot fire — the only paths
+      // for refund are:
+      //   (a) the trader's own swap-cancel path returning tokens
+      //       client-side (would require the trader to have direct refund
+      //       authority, which it doesn't — the escrow holds the funds), OR
+      //   (b) escrow restart + crash-recovery firing closeInvoice with
+      //       autoReturn (we don't restart the escrow in this scenario, so
+      //       this path is closed).
+      // If neither (a) nor (b) is achievable in production, this scenario
+      // produces stranded tokens — which is itself a product gap the user's
+      // Claim 5b is designed to surface. We snapshot before, observe the
+      // FAILED state, and try to verify balance restoration. If restoration
+      // doesn't happen within the budget, that's a real signal.
+      const aliceBalBefore = await snapshotPortfolio(alice.address);
+      const bobBalBefore = await snapshotPortfolio(bob.address);
 
       // Make sure Bob is back to trusting the original escrow.
       await runAuthedTraderCtl(
@@ -409,8 +479,31 @@ describe('Negotiation failures', () => {
           deals.some((d) => String(d['state']) === 'COMPLETED'),
         ).toBe(false);
       }
+
+      // CLAIM 5b ASSERTION: Alice's and Bob's tokens must be returned.
+      //
+      // KNOWN LIMITATION: with the escrow process killed mid-negotiation, the
+      // escrow's auto-return-on-cancel cannot fire. If either trader deposited
+      // before the kill, their deposit is currently stranded — there is no
+      // crash-recovery escrow restart in this scenario. This is a real
+      // product gap (the system has no client-side recovery for "escrow died
+      // holding my deposit"). Per the user's Claim 5b, all failure paths
+      // must refund — so this assertion is designed to surface the gap.
+      //
+      // We use a generous timeout but fail loud if balances don't restore.
+      // If this assertion fires repeatedly, the right product fix is one of:
+      //   (1) Add escrow auto-recovery restart in this test fixture, OR
+      //   (2) Add client-side refund-from-stuck-escrow path in trader-service.
+      await pollUntilBalanceRestored(alice.address, aliceBalBefore, {
+        timeoutMs: 4 * 60_000,
+        intervalMs: 5_000,
+      });
+      await pollUntilBalanceRestored(bob.address, bobBalBefore, {
+        timeoutMs: 4 * 60_000,
+        intervalMs: 5_000,
+      });
     },
-    10 * 60_000,
+    14 * 60_000, // bumped from 10 to absorb the dual balance polls (8 min worst case)
   );
 
 });
