@@ -383,6 +383,49 @@ export async function startTrader(): Promise<void> {
     accounting: sphere.accounting !== null,
   });
 
+  // Enable global auto-return on every terminated invoice this wallet is
+  // a target of. The SDK's AccountingModule tracks each payer's
+  // contribution to an invoice independently and, on `closeInvoice`,
+  // refunds any surplus (`coveredAmount > requestedAmount`) back to each
+  // over-paying party at either their `refundAddress` or `senderAddress`.
+  // Without this flag set, surplus stays orphaned on our wallet until
+  // manually reconciled — exactly the leak surfaced by
+  // negotiation-failures.e2e-live's "deposit timeout" test (UCT delta=-1000,
+  // USDU delta=+500 instead of fully restored to baseline).
+  //
+  // Why global: the trader receives many payout invoices over its
+  // lifetime (one per completed deal). Setting per-invoice would require
+  // calling `setAutoReturn(invoiceId, true)` on every imported payout
+  // invoice — a brittle contract. Global is fire-and-forget.
+  //
+  // RATE_LIMITED is the SDK's "already enabled in this process" signal
+  // (5s in-memory cooldown). Treat as success — flag is already true.
+  // Any other error is fail-fast: if AccountingModule can't persist
+  // settings, downstream invoice ops would fail unpredictably anyway,
+  // better to surface at startup.
+  //
+  // Startup-cost note: setAutoReturn('*', true) is NOT just a flag flip
+  // — when enabled, the SDK iterates closedInvoices ∪ cancelledInvoices
+  // (capped at 100) and runs _executeAutoReturnFromFrozen for each,
+  // which issues real outbound payments. On a wallet with many
+  // already-closed invoices, startup can stall on aggregator round-trips
+  // for up to 100 sequential refund attempts.
+  if (sphere.accounting) {
+    try {
+      await sphere.accounting.setAutoReturn('*', true);
+      logger.info('accounting_auto_return_enabled');
+    } catch (err: unknown) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code === 'RATE_LIMITED') {
+        logger.info('accounting_auto_return_already_enabled', {
+          note: 'setAutoReturn rate-limited — flag already set in this process',
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // PaymentsAdapter — wraps sphere.payments
   // ---------------------------------------------------------------------------
