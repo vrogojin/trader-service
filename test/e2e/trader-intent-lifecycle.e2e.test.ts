@@ -49,6 +49,12 @@ interface TraderE2EContext {
   comms: MockCommsModule;
   logger: Logger;
   strategy: TraderStrategy;
+  /**
+   * Captures every params object passed to the `withdraw` adapter. Used by
+   * WITHDRAW_TOKEN tests to lock in that the handler trims `to_address`
+   * before forwarding (see Round-6 fix in trader-command-handler.ts:707-714).
+   */
+  capturedWithdrawCalls: Array<{ asset: string; amount: string; to_address: string }>;
 }
 
 function setupTraderE2E(opts?: {
@@ -128,6 +134,8 @@ function setupTraderE2E(opts?: {
   // Mutable strategy holder for saveStrategy
   let currentStrategy = { ...strategy };
 
+  const capturedWithdrawCalls: Array<{ asset: string; amount: string; to_address: string }> = [];
+
   // Build TraderCommandHandler
   const handler = createTraderCommandHandler({
     baseHandler,
@@ -141,6 +149,11 @@ function setupTraderE2E(opts?: {
     agentAddress: AGENT_ADDRESS,
     saveStrategy: async (s: TraderStrategy) => { currentStrategy = s; },
     withdraw: async (params) => {
+      capturedWithdrawCalls.push({
+        asset: params.asset,
+        amount: params.amount,
+        to_address: params.to_address,
+      });
       const transferId = `txn_test_${params.asset}`;
       const remaining = payments.getConfirmedBalance(params.asset) - BigInt(params.amount);
       return { transfer_id: transferId, remaining_balance: remaining < 0n ? 0n : remaining };
@@ -160,6 +173,7 @@ function setupTraderE2E(opts?: {
     comms,
     logger,
     strategy: currentStrategy,
+    capturedWithdrawCalls,
   };
 }
 
@@ -702,6 +716,107 @@ describe('E2E: Trader Intent Lifecycle (T1 + T10)', () => {
       expect(deal1!['amount']).toBe('300');
       expect(deal2).toBeDefined();
       expect(deal2!['amount']).toBe('200');
+    });
+  });
+
+  // =========================================================================
+  // WITHDRAW_TOKEN: handler-level trim contract
+  //
+  // Locks in the Round-6 fix at trader-command-handler.ts:707-714. The
+  // validator's `parseAddress` trims internally, so removing the handler's
+  // explicit `.trim()` would not regress the unit tests in
+  // trader-command-handler.test.ts — but the SDK's
+  // `NostrTransportProvider.resolve()` does NOT trim, so untrimmed
+  // addresses fail INVALID_RECIPIENT downstream. These tests assert the
+  // forwarded `to_address` is the canonical (trimmed) form.
+  // =========================================================================
+
+  describe('WITHDRAW_TOKEN: address trim contract', () => {
+    it('trims leading/trailing whitespace before forwarding to withdraw()', async () => {
+      ctx = setupTraderE2E({ balance: { ALPHA: 1000n } });
+
+      const result = await ctx.handler.execute('WITHDRAW_TOKEN', {
+        command_id: 'cmd-withdraw-trim',
+        asset: 'ALPHA',
+        amount: '100',
+        to_address: '  @alice  ',
+      });
+
+      expect(isOk(result)).toBe(true);
+      expect(ctx.capturedWithdrawCalls).toHaveLength(1);
+      // Critical: the forwarded value must be the trimmed canonical form
+      // so the SDK transport's resolve() (no trim) accepts it.
+      expect(ctx.capturedWithdrawCalls[0]?.to_address).toBe('@alice');
+
+      // The okPayload should also reflect the canonical address so callers
+      // can correlate against logs / chain history without re-trimming.
+      if (isOk(result)) {
+        expect((result.result as Record<string, unknown>)['to_address']).toBe('@alice');
+      }
+    });
+
+    it('trims DIRECT://hex addresses identically', async () => {
+      ctx = setupTraderE2E({ balance: { ALPHA: 1000n } });
+
+      const HEX64 = 'a'.repeat(64);
+      const result = await ctx.handler.execute('WITHDRAW_TOKEN', {
+        command_id: 'cmd-withdraw-trim-direct',
+        asset: 'ALPHA',
+        amount: '100',
+        to_address: `\tDIRECT://${HEX64}\n`,
+      });
+
+      expect(isOk(result)).toBe(true);
+      expect(ctx.capturedWithdrawCalls).toHaveLength(1);
+      expect(ctx.capturedWithdrawCalls[0]?.to_address).toBe(`DIRECT://${HEX64}`);
+    });
+
+    it('passes already-canonical addresses through unchanged', async () => {
+      ctx = setupTraderE2E({ balance: { ALPHA: 1000n } });
+
+      const result = await ctx.handler.execute('WITHDRAW_TOKEN', {
+        command_id: 'cmd-withdraw-canonical',
+        asset: 'ALPHA',
+        amount: '100',
+        to_address: '@bob',
+      });
+
+      expect(isOk(result)).toBe(true);
+      expect(ctx.capturedWithdrawCalls[0]?.to_address).toBe('@bob');
+    });
+
+    it('rejects non-string to_address with INVALID_PARAM (no withdraw call)', async () => {
+      ctx = setupTraderE2E({ balance: { ALPHA: 1000n } });
+
+      const result = await ctx.handler.execute('WITHDRAW_TOKEN', {
+        command_id: 'cmd-withdraw-non-string',
+        asset: 'ALPHA',
+        amount: '100',
+        to_address: 42,
+      });
+
+      expect(isError(result)).toBe(true);
+      if (isError(result)) {
+        expect(result.error_code).toBe('INVALID_PARAM');
+      }
+      expect(ctx.capturedWithdrawCalls).toHaveLength(0);
+    });
+
+    it('rejects whitespace-only to_address', async () => {
+      ctx = setupTraderE2E({ balance: { ALPHA: 1000n } });
+
+      const result = await ctx.handler.execute('WITHDRAW_TOKEN', {
+        command_id: 'cmd-withdraw-ws-only',
+        asset: 'ALPHA',
+        amount: '100',
+        to_address: '    ',
+      });
+
+      expect(isError(result)).toBe(true);
+      if (isError(result)) {
+        expect(result.error_code).toBe('INVALID_PARAM');
+      }
+      expect(ctx.capturedWithdrawCalls).toHaveLength(0);
     });
   });
 });

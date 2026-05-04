@@ -144,6 +144,19 @@ describe('isValidAddress (WITHDRAW_TOKEN gate)', () => {
       expect(isValidAddress('garbage')).toBe(false);
     });
 
+    it('rejects lowercase / mixed-case prefix variants (parseAddress is case-sensitive)', () => {
+      // The SDK's parseAddress and PaymentsModule.send both use
+      // case-sensitive `startsWith`, so `direct://...` is NOT a Sphere
+      // address — only `DIRECT://...` is. Locking this in: a future
+      // "be lenient, accept any case prefix" tweak to parseAddress
+      // would silently change semantics relative to payments.send.
+      const HEX64 = 'a'.repeat(64);
+      expect(isValidAddress(`direct://${HEX64}`)).toBe(false);
+      expect(isValidAddress(`Direct://${HEX64}`)).toBe(false);
+      expect(isValidAddress(`proxy://${HEX64}`)).toBe(false);
+      expect(isValidAddress(`Proxy://${HEX64}`)).toBe(false);
+    });
+
     it('rejects empty / non-string inputs', () => {
       expect(isValidAddress('')).toBe(false);
       expect(isValidAddress(undefined)).toBe(false);
