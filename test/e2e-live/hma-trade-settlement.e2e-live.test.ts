@@ -68,7 +68,8 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { rmSync, existsSync } from 'node:fs';
+import { rmSync, existsSync, readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -194,6 +195,31 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       controllers.push({ cliHome: home, pubkey: c.pubkey, directAddress: c.directAddress });
     }
 
+    // The published trader image at ghcr.io/.../trader:v0.1 lacks both
+    // mintFungibleToken (so TRADER_TEST_FUND fails) AND a working
+    // payments.receive() loop (so faucet deposits never surface in
+    // portfolio). To get end-to-end settlement working we use a
+    // locally-built `trader:local` image with the current sphere-sdk +
+    // trader code. Build via:
+    //   cd /home/vrogojin && docker build -f trader-service/Dockerfile \
+    //     -t ghcr.io/vrogojin/agentic-hosting/trader:local .
+    // Then we materialize a temp templates.json that swaps the image
+    // tag from v0.1 to local. agentic-hosting/config/templates.json is
+    // not modified.
+    const baseTemplatesPath = join(agenticProbe.ok ? agenticProbe.path : '', 'config', 'templates.json');
+    const baseTemplates = JSON.parse(readFileSync(baseTemplatesPath, 'utf8')) as {
+      templates: Array<{ template_id: string; image: string;[k: string]: unknown }>;
+    };
+    for (const t of baseTemplates.templates) {
+      if (t.template_id === 'trader-agent') {
+        t.image = 'ghcr.io/vrogojin/agentic-hosting/trader:local';
+      }
+    }
+    const tplDir = mkdtempSync(join(tmpdir(), 'hma-trade-settlement-tpl-'));
+    cliHomes.push(tplDir);
+    const customTemplatesPath = join(tplDir, 'templates.json');
+    writeFileSync(customTemplatesPath, JSON.stringify(baseTemplates, null, 2));
+
     // HMA accepts AUTHORIZED_CONTROLLERS as a comma-separated list of
     // pubkeys (see agentic-hosting/src/shared/config.ts:52). Authorize
     // every scenario's controller in one HMA — production has one HMA
@@ -202,6 +228,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     console.log('[hma-trade-settlement] booting host-manager…');
     const manager = await spawnHostManager({
       controllerPubkey: controllers.map((c) => c.pubkey).join(','),
+      templatesPath: customTemplatesPath,
     });
     await manager.ready;
     const managerAddr = manager.nametag ? `@${manager.nametag}` : manager.pubkey;
