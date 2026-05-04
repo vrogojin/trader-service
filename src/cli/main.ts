@@ -293,12 +293,13 @@ function addWithdraw(parent: Command): Command {
       const opts = parseGlobalOpts(this);
       const local = this.opts() as Record<string, string | undefined>;
       // The trader-side handler validates these again (asset non-empty,
-      // amount > 0, to_address shape). Catching the trivial cases here
-      // gives a faster local error path; non-trivial validation
-      // (insufficient available balance, unknown asset) requires
-      // round-tripping to the trader.
-      const asset = local['asset'];
-      if (!asset) fail('--asset is required', 2);
+      // amount > 0, to_address matches @nametag / DIRECT://hex / hex
+      // pubkey regex). Catching the trivial cases here gives a faster
+      // local error path; non-trivial validation (insufficient
+      // available balance, unknown asset) requires round-tripping to
+      // the trader.
+      const assetRaw = local['asset'];
+      if (!assetRaw || assetRaw.trim() === '') fail('--asset is required', 2);
       const amountStr = local['amount'];
       if (!amountStr) fail('--amount is required', 2);
       // bigint validation — accept only digit-only strings to avoid
@@ -308,12 +309,17 @@ function addWithdraw(parent: Command): Command {
       if (!/^[1-9]\d*$/.test(amountStr)) {
         fail(`--amount must be a positive integer in smallest units (got "${amountStr}")`, 2);
       }
-      const toAddress = local['toAddress'];
-      if (!toAddress) fail('--to-address is required', 2);
+      const toAddressRaw = local['toAddress'];
+      if (!toAddressRaw || toAddressRaw.trim() === '') fail('--to-address is required', 2);
+      // Trim asset and to_address before forwarding so a leading or
+      // trailing space in the operator's input doesn't reach the wire
+      // (where the trader's address regex would reject with
+      // INVALID_PARAM, surfacing the error from the trader instead of
+      // the CLI). Empty-after-trim cases are already caught above.
       await runCommand(opts, 'WITHDRAW_TOKEN', {
-        asset,
+        asset: assetRaw.trim(),
         amount: amountStr,
-        to_address: toAddress,
+        to_address: toAddressRaw.trim(),
       });
     });
 }
