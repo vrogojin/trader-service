@@ -95,7 +95,7 @@ import {
   withdrawAsync,
   type PortfolioBalance,
 } from './helpers/sphere-trader.js';
-import { UCT_COIN_ID, USDU_COIN_ID } from './helpers/constants.js';
+import { fundWallet } from './helpers/funding.js';
 
 // ---------------------------------------------------------------------------
 // Precondition gates (mirrors hma-trade-flow's structure)
@@ -154,7 +154,6 @@ const SCENARIO_COUNT = 2;
 
 let state: SuiteState | null = null;
 
-const SELF_MINT_AMOUNT = 5000n; // matches basic-roundtrip
 const SWAP_TIMEOUT_MS = 8 * 60_000; // 8 minutes; testnet settlement is 3-5 min typical
 
 // `volume_max` for matching intents in each scenario. Both sides post
@@ -262,10 +261,6 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
   }> {
     if (!state) throw new Error('beforeAll did not initialize state');
     const s = state;
-    const traderEnv = {
-      TRADER_TEST_FUND: `${UCT_COIN_ID}:${SELF_MINT_AMOUNT.toString()},${USDU_COIN_ID}:${SELF_MINT_AMOUNT.toString()}`,
-      TRADER_FAULT_INJECTION_ALLOWED: '1',
-    };
     // Within a scenario, sphere-cli calls share one wallet.json and
     // race on its atomic temp+rename writes (FileStorageProvider.save
     // → fs.renameSync). So within-scenario calls are serialized. The
@@ -284,6 +279,11 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       instanceName: `escrow-${scenarioId}`,
       timeoutMs: 180_000,
     });
+    // Trader templates do NOT receive TRADER_TEST_FUND — the published
+    // trader image (ghcr.io/.../trader:v0.1) uses an older sphere-sdk
+    // without mintFungibleToken, so the self-mint path errors out
+    // ("TRADER_TEST_FUND requires sphere-sdk with mintFungibleToken").
+    // Funding happens AFTER spawn via the testnet faucet (HTTP).
     const alice = await hostSpawnAsync({
       cliPath: s.cliPath,
       cliHome: controller.cliHome,
@@ -291,7 +291,6 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `alice-${scenarioId}`,
       timeoutMs: 180_000,
-      env: traderEnv,
     });
     const bob = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -300,7 +299,6 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `bob-${scenarioId}`,
       timeoutMs: 180_000,
-      env: traderEnv,
     });
     s.spawned.push(escrow, alice, bob);
     console.log(
@@ -336,6 +334,45 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
    *      address; assert transfer_id non-empty + post-withdraw balance
    *      reflects the withdrawal.
    */
+  /**
+   * Fund a trader via the testnet faucet, then poll its portfolio
+   * until the requested asset arrives or `timeoutMs` elapses. Faucet
+   * deposits land via the trader's payments.receive() loop (~15s
+   * cycle) plus aggregator confirmation, so we typically observe the
+   * balance ~30-60s after the faucet POST.
+   *
+   * Faucet expects the BARE nametag (no `@`) in `unicityId`. The
+   * helper unwraps `@nametag` automatically.
+   */
+  async function faucetFundAndWait(
+    label: string,
+    tenant: { tenantNametag: string | null; tenantPubkey: string },
+    asset: 'UCT' | 'USDU',
+    amount: bigint,
+    cliHome: string,
+    timeoutMs = 120_000,
+  ): Promise<void> {
+    if (!state) throw new Error('state missing');
+    const s = state;
+    const recipient = tenant.tenantNametag ? `@${tenant.tenantNametag}` : `DIRECT://${tenant.tenantPubkey}`;
+    console.log(`[${label}] faucet → ${recipient} ${amount}${asset}…`);
+    await fundWallet(recipient, amount, asset);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const p = await portfolioAsync({
+        cliPath: s.cliPath, cliHome, tenant: tenant.tenantPubkey,
+      });
+      if (balanceOf(p, asset) >= amount) {
+        console.log(`[${label}] balance arrived: ${balanceOf(p, asset)}${asset}`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
+    throw new Error(
+      `[${label}] balance ${asset}>=${amount} did not arrive within ${timeoutMs}ms`,
+    );
+  }
+
   async function runSettlementScenario(
     scenarioId: string,
     controller: ScenarioController,
@@ -343,6 +380,16 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     if (!state) throw new Error('beforeAll did not initialize state');
     const s = state;
     const { escrow, alice, bob } = await provisionTriple(scenarioId, controller);
+
+    // ---- 1.5 Faucet-fund both traders before they can trade ---------
+    // Alice (buyer of UCT) needs USDU to pay. Bob (seller of UCT) needs UCT.
+    // Sequential within-scenario (wallet.json contention again). Use
+    // exact trade-required amounts plus headroom for the withdraw step.
+    const aliceUsduFundAmount = TRADE_RATE * TRADE_VOLUME * 2n; // 2× headroom
+    const bobUctFundAmount = TRADE_VOLUME * 2n;
+    console.log(`[${scenarioId}] funding alice + bob via faucet…`);
+    await faucetFundAndWait(scenarioId, alice, 'USDU', aliceUsduFundAmount, controller.cliHome);
+    await faucetFundAndWait(scenarioId, bob, 'UCT', bobUctFundAmount, controller.cliHome);
 
     // ---- 2. Configure trusted escrows on both traders --------------
     // Sequential within-scenario (wallet.json contention; see provisionTriple).
