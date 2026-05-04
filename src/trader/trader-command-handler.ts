@@ -13,6 +13,13 @@
 import type { AcpResultPayload, AcpErrorPayload } from '../protocols/acp.js';
 import type { CommandHandler } from '../tenant/command-handler.js';
 import { pubkeysEqual } from '../shared/crypto.js';
+// Authoritative address validator from sphere-sdk. Accepts the three
+// canonical forms — @nametag, DIRECT://hex, PROXY://hex — using the
+// SDK's own NAMETAG_RE / DIRECT_HEX_RE / PROXY_HEX_RE so the trader's
+// validation is bit-identical to what `payments.send` will accept
+// downstream. Avoids the prior pitfall of rolling our own regex that
+// disagreed with the SDK at the boundary (case sensitivity, length).
+import { isValidAddress as sdkIsValidAddress } from '@unicitylabs/sphere-sdk';
 import type { Logger } from '../shared/logger.js';
 import type { IntentEngine } from './intent-engine.js';
 import type { NegotiationHandler } from './negotiation-handler.js';
@@ -271,34 +278,21 @@ function validateStrategyParams(params: SetStrategyParams): string | null {
 // Address validation
 // ---------------------------------------------------------------------------
 //
-// Accepts the three canonical Sphere address forms used throughout the
-// codebase (verified by sphere-sdk's `payments.send` recipient resolver):
+// Delegate to sphere-sdk's `isValidAddress`, which is the authoritative
+// validator for the three canonical Sphere address forms:
+//   1. `@nametag`        — lowercase alphanumeric + `_`/`-`, 1-30 chars
+//                           (sphere-sdk core/address.ts NAMETAG_RE).
+//   2. `DIRECT://<hex>`  — 64-80 hex chars (sphere-sdk DIRECT_HEX_RE).
+//   3. `PROXY://<hex>`   — 64-80 hex chars (sphere-sdk PROXY_HEX_RE).
 //
-//   1. `@nametag`           — human-readable handle. Validated as
-//                             `@<2-63 alphanumeric/underscore/dash>`.
-//                             SDK resolves to a transport pubkey via
-//                             relay-published binding events.
-//   2. `DIRECT://<hex>`     — canonical transport-agnostic identity.
-//                             Validated as `DIRECT://<60-130 hex>` to
-//                             cover x-only (64), compressed (66), and
-//                             uncompressed (130) secp256k1 forms.
-//   3. Raw hex pubkey       — 60-130 hex chars (same range as DIRECT:).
-//                             SDK treats non-`@`-prefixed strings as
-//                             raw hex.
-//
-// History: a prior overly-strict regex `^[a-zA-Z0-9]{10,128}$` rejected
-// forms (1) and (2) (because `@`, `:`, `/` are not alphanumeric), even
-// though the rest of the protocol uses them. Operators using
-// `sphere trader withdraw --to-address @bob` would receive an
-// INVALID_PARAM error from the trader despite the CLI advertising the
-// form. This regex restores the contract.
-const NAMETAG_RE = /^@[A-Za-z0-9_-]{2,63}$/;
-const HEX_PUBKEY_RE = /^[0-9a-fA-F]{60,130}$/;
-const DIRECT_ADDR_RE = /^DIRECT:\/\/[0-9a-fA-F]{60,130}$/;
-
+// Rolling our own regex previously diverged from the SDK on case
+// (we accepted uppercase nametags the relay would not resolve) and
+// length (60-130 hex range was too permissive at both ends; SDK's
+// signing boundary requires 64-80). Delegating to the SDK keeps the
+// trader's gate bit-identical to what `payments.send` will accept
+// downstream.
 function isValidAddress(addr: unknown): addr is string {
-  if (typeof addr !== 'string') return false;
-  return NAMETAG_RE.test(addr) || DIRECT_ADDR_RE.test(addr) || HEX_PUBKEY_RE.test(addr);
+  return typeof addr === 'string' && sdkIsValidAddress(addr);
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +668,7 @@ export function createTraderCommandHandler(
       return errorPayload(
         commandId,
         'INVALID_PARAM',
-        'to_address must be a valid address: @nametag (2-63 alphanumeric/underscore/dash), DIRECT://<60-130 hex>, or 60-130 hex pubkey',
+        'to_address must be a valid Sphere address: @nametag (lowercase alphanumeric + _/-, 1-30 chars), DIRECT://<64-80 hex>, or PROXY://<64-80 hex>',
       );
     }
 
