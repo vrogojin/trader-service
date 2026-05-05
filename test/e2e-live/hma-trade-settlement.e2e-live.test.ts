@@ -260,6 +260,15 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       if (t.template_id === 'trader-agent') {
         t.image = 'ghcr.io/vrogojin/agentic-hosting/trader:local';
       }
+      // The published escrow:v0.1 has an asymmetric bug in
+      // deliverDepositInvoice — the second recipient's invoice_delivery
+      // DM is never put on the wire, so swaps stall at "ACCEPTED" with
+      // the trader polling for an invoice that the escrow never sent
+      // (diag agent traced this 2026-05-05; see HMA-SETTLEMENT-DIAGNOSTIC.md).
+      // Build escrow:local from current source and use it here.
+      if (t.template_id === 'escrow-service') {
+        t.image = 'ghcr.io/vrogojin/agentic-hosting/escrow:local';
+      }
     }
     if (!baseTemplates.templates.some((t) => t.template_id === 'faucet-agent')) {
       baseTemplates.templates.push({

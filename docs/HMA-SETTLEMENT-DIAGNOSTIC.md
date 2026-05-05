@@ -106,6 +106,68 @@ The difference is whether it has a manager_pubkey to filter against.
 
 ## Hypotheses for the remaining bug
 
+### Update 2026-05-05: ROOT CAUSE FOUND — escrow side, not trader side
+
+A focused investigation agent traced the full flow on both ends and found
+the bug is in the **escrow's `deliverDepositInvoice` function** (compiled
+into `escrow:v0.1` at `/app/dist/sphere/message-handler.js`). It is
+**asymmetric**: party A's invoice always delivers; party B's never does.
+
+Evidence (from one round-12 escrow's logs, repeats across multiple swaps):
+
+```
+diag_invoice_delivery_attempt   party=A   ← logged
+diag_outbound_dm_sending        message_type=invoice_delivery   recipient=A   ← logged
+diag_outbound_dm_sent           message_type=invoice_delivery   recipient=A   ← logged
+diag_invoice_delivery_complete  party=A   ← logged
+
+diag_invoice_delivery_attempt   party=B   ← logged
+[NO diag_outbound_dm_sending for invoice_delivery to B — never appears]
+diag_invoice_delivery_complete  party=B   ← logged anyway
+```
+
+The `complete` log fires (no thrown exception); the `sending` log doesn't
+(no actual `sendDM` call). The function exits "normally" without delivering
+the invoice to party B.
+
+The deployed `escrow:v0.1` image was built from an unsynced source commit
+(JS at `/app/dist/sphere/message-handler.js` does NOT match
+`/home/vrogojin/escrow-service/src/sphere/message-handler.ts` at HEAD).
+The exact mechanism inside the diverged image (early-return that was missed,
+fire-and-forget reference instead of `await reply(...)`, build-step DCE, etc.)
+requires access to the unsynced commit to confirm — but the fix is the same
+either way: rebuild + re-tag.
+
+**Why basic-roundtrip works direct-docker with the same image**:
+basic-roundtrip uses ONE trader pair. The HMA test uses two pairs concurrently.
+Party-A vs party-B is determined by the canonical pubkey ordering in the
+swap manifest — concurrent swaps may always produce the same A/B alignment.
+But basic-roundtrip's single pair may happen to land in a way where the
+party-B-broken path doesn't matter (e.g., the test only asserts the buyer's
+side, not the seller's). Worth re-running basic-roundtrip with the
+rebuilt image to confirm; the asymmetry is a real defect regardless.
+
+**Remediation (in priority order)**:
+
+1. Rebuild `escrow:local` from `/home/vrogojin/escrow-service` source and
+   re-tag as the test's image. Re-run hma-trade-settlement and expect
+   COMPLETED.
+2. After settlement works: file an upstream issue + PR against escrow-service
+   to harden `deliverDepositInvoice` — use `Promise.allSettled([reply(B,...),
+   reply(A,...)])` and log the rejection reasons explicitly so silent failures
+   are impossible.
+3. Sphere-sdk secondary defect (independent): `SwapModule.handleIncomingDM`
+   walks `accepted → announced` via `status_result.state` (SwapModule.ts:3119–3171)
+   even when `swap.depositInvoiceId` is unset. This is what made the trader's
+   diag log say "registered, polling for invoice" while accounting actually
+   has no invoice record. Constrain the walk to require both
+   `swap.depositInvoiceId !== undefined` AND `accounting.getInvoice(id) !== null`
+   before transitioning. Medium priority — only relevant once the escrow
+   regression is fixed.
+
+The hypotheses below (H2/H3) are now **superseded** by the escrow-side root
+cause. Kept for historical context.
+
 ### ~~H1 — ACP listener consumes the invoice DM before the swap module sees it~~ — RULED OUT
 
 **Update**: investigated sphere-sdk's event architecture. Incoming DMs are
