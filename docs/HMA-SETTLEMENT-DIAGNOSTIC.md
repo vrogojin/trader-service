@@ -106,22 +106,31 @@ The difference is whether it has a manager_pubkey to filter against.
 
 ## Hypotheses for the remaining bug
 
-### H1 — ACP listener consumes the invoice DM before the swap module sees it
+### ~~H1 — ACP listener consumes the invoice DM before the swap module sees it~~ — RULED OUT
 
-The trader's `acp-adapter/main.ts` attaches `sphere.on('message:dm', ...)` early.
-The Sphere SDK's swap module also subscribes to incoming DMs.
+**Update**: investigated sphere-sdk's event architecture. Incoming DMs are
+dispatched via TWO INDEPENDENT paths in `dist/index.js`:
 
-If the order is: ACP listener fires first → marks DM as read → swap module's
-listener sees `dm.isRead === true` → skips, the invoice_delivery never reaches
-the swap-executor's state machine.
+  - line 13910: `deps.emitEvent("message:dm", message)` — generic event bus
+    (this is what `sphere.on('message:dm', ...)` subscribes to).
+  - line 13911-13918: iterates `dmHandlers` set
+    (this is what `sphere.communications.onDirectMessage(handler)` registers
+    into; used internally by PaymentsModule (line 18816) and SwapModule
+    (line 24212)).
 
-In direct-docker, the ACP listener has no `manager_pubkey` to filter against,
-so its early-return path is different (it may not "consume" the DM).
+Both fire unconditionally for every DM. No propagation control, no ordering
+between the two paths. The ACP listener (on the event bus) and the SDK's
+SwapModule (on `dmHandlers`) are on independent channels — they each get
+their own copy. The ACP listener CANNOT preempt the SwapModule.
 
-**Bisect**: temporarily make the trader's ACP listener bail BEFORE any SDK
-state mutation when the DM is not addressed at the manager. Or: instrument
-the SDK's incoming-DM dispatch to log every observed DM and see whether
-invoice_delivery from the escrow's pubkey is observed at the SDK level at all.
+So this hypothesis is incorrect. The remaining candidates are below.
+
+**Note on architecture**: the dual-path dispatch with no propagation control
+is itself a design smell — there's no way for a handler to say "I consumed
+this, don't deliver it to other consumers." A koa-compose-style middleware
+chain (`use(handler, priority)` with `next()` semantics) would be cleaner
+and would let the trader's ACP filter declaratively consume non-ACP DMs.
+Tracked separately; not on the critical path for THIS bug.
 
 ### H2 — Periodic `payments.receive({finalize:true})` races with swap module's DM consumption
 
@@ -154,28 +163,46 @@ is the cause.
 
 ## Proposed debugging plan for the follow-up session
 
-1. **Instrument the trader** to log EVERY incoming DM at the raw level:
-   ```typescript
-   sphere.on('message:dm', (msg) => {
-     log.info({
-       sender: msg.senderPubkey.slice(0, 16),
-       size: msg.content.length,
-       firstByte: msg.content[0],
-     }, 'raw_dm_observed');
-   });
-   ```
-   Place this BEFORE any other listener attaches. Re-run the test.
-   - If invoice_delivery DMs appear in `raw_dm_observed`: the receive-side works,
-     bug is in dispatch (H1 or H2).
-   - If they don't appear: bug is in transport/subscription (H3).
+H1 is ruled out (see updated hypothesis above), so start with the SDK's
+internal DM dispatch.
 
-2. **For H1 (most likely)**: temporarily comment out the ACP listener's
-   `sphere.on('message:dm', ...)` subscription in `acp-adapter/main.ts` and
-   re-run. If settlement completes, the ACP listener is consuming the DM.
+1. **Instrument sphere-sdk's `CommunicationsModule.handleIncoming` (or
+   equivalent) to log EVERY incoming DM at the raw level**, BEFORE any
+   filtering / dedup. The log line should include sender prefix, payload
+   size, and the message id. With this in place, re-run the test:
 
-3. **For H3**: capture network-level evidence — point both HMA and
-   direct-docker at the SAME relay URL and compare event-arrival timestamps
-   (instrument the relay or use Wireshark on `wss://nostr-relay.testnet.unicity.network`).
+   - If the escrow's invoice_delivery DM appears in the trader's raw log:
+     → the SDK is receiving it. Bug is downstream (handleIncomingDM rejecting,
+     SwapModule not registering it as the active swap, etc.). Continue to
+     step 2.
+   - If it does NOT appear: bug is at the transport layer (relay subscription
+     latency, DM-decryption failure, recipient mismatch). Skip to step 3.
+
+2. **For the "received but not processed" case (most likely)**: instrument
+   `SwapModule.handleIncomingDM` in `sphere-sdk/dist/index.js:24212` (or
+   wherever its body is) to log every entry and the path it takes. Possible
+   silent rejections:
+   - signature verification fails (wrong chain pubkey)
+   - swap-id-not-found (the trader doesn't have the swap registered when
+     the invoice arrives — race between announce-ack and invoice_delivery)
+   - protocol version mismatch (trader v1 vs escrow v2 or vice versa)
+   - dedup hit (`dm.isRead === true` because the SDK persisted it from a
+     prior backfill — relevant if the escrow re-sends after a wallet reload)
+
+3. **For the transport-layer case**: capture network-level evidence —
+   instrument the trader's NostrTransportProvider to log every Nostr event
+   it receives at the wire level. If the kind:1059 wraps for the escrow's
+   pubkey arrive but never decrypt to the trader, decryption is failing.
+   If they don't arrive at all, the relay subscription has a hole.
+
+4. **Architectural follow-up (separate effort)**: introduce a propagation-
+   aware middleware chain in sphere-sdk's CommunicationsModule (koa-compose
+   style — `use(mw, priority)` with `next()`), so that future consumers
+   (ACP listener, app code) can declaratively filter / consume / pass DMs
+   in an ordered pipeline. The current dual-path dispatch
+   (`emitEvent` + `dmHandlers` running in parallel with no coordination)
+   isn't the cause of THIS bug but is an obvious source of future bugs as
+   more consumers attach.
 
 ## Key files
 
