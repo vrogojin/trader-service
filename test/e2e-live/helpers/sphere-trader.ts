@@ -162,6 +162,13 @@ export interface CreateIntentOpts extends TraderInvocationOpts {
   /** Total intent volume; matches the trader's ACP `volume_max` wire field. */
   volumeMax: bigint;
   expiryMs?: number;
+  /**
+   * Escrow address (pubkey hex / DIRECT:// / PROXY://). When omitted,
+   * the trader defaults to 'any' (wildcard) which routes the swap to
+   * NO real escrow — settlement fails with "Swap not found". Tests
+   * and production callers MUST pass this for end-to-end settlement.
+   */
+  escrowAddress?: string;
 }
 
 export interface CreatedIntent {
@@ -179,6 +186,7 @@ export function createIntent(opts: CreateIntentOpts): CreatedIntent {
     '--volume-max', opts.volumeMax.toString(),
   ];
   if (opts.expiryMs !== undefined) args.push('--expiry-ms', String(opts.expiryMs));
+  if (opts.escrowAddress !== undefined) args.push('--escrow-address', opts.escrowAddress);
   const { result } = runTraderCommand('create-intent', args, opts);
   if (typeof result !== 'object' || result === null) {
     throw new Error(`create-intent: result is not an object. Got: ${JSON.stringify(result)}`);
@@ -435,6 +443,7 @@ export async function createIntentAsync(opts: CreateIntentOpts): Promise<Created
     '--volume-max', opts.volumeMax.toString(),
   ];
   if (opts.expiryMs !== undefined) args.push('--expiry-ms', String(opts.expiryMs));
+  if (opts.escrowAddress !== undefined) args.push('--escrow-address', opts.escrowAddress);
   const { result } = await runTraderCommandAsync('create-intent', args, opts);
   if (typeof result !== 'object' || result === null) {
     throw new Error(`create-intent: result is not an object. Got: ${JSON.stringify(result)}`);

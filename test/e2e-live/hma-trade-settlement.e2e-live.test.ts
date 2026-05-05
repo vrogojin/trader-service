@@ -571,6 +571,17 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     // ---- 4. Post matching intents (sequential — wallet.json) ------
     // Alice buys UCT (pays USDU). Bob sells UCT (receives USDU).
     console.log(`[${scenarioId}] posting matching intents…`);
+    // CRITICAL: pass escrow_address. Trader's intent-engine defaults
+    // it to the literal string 'any' when omitted (intent-engine.ts:836)
+    // — that's a wildcard that means "any escrow", but the swap-executor
+    // uses terms.escrow_address as a routing target and tries to send
+    // swap.announce to 'any', which doesn't resolve. The escrow then
+    // never sees the announce and rejects subsequent status queries
+    // with "Swap not found", which trips deal CANCELLED. Round 10
+    // diagnosed this from escrow logs (zero announce_received events
+    // despite ping/pong round-trips working). Fix: route via the
+    // actual HMA-spawned escrow's pubkey (must match a value in
+    // trustedEscrows from the earlier set-strategy call).
     const aliceIntent = await createIntentAsync({
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
       direction: 'buy',
@@ -578,6 +589,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       rateMin: tradeRate, rateMax: tradeRate,
       volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
       expiryMs: SWAP_TIMEOUT_MS,
+      escrowAddress: escrow.tenantPubkey,
     });
     const bobIntent = await createIntentAsync({
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
@@ -586,6 +598,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       rateMin: tradeRate, rateMax: tradeRate,
       volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
       expiryMs: SWAP_TIMEOUT_MS,
+      escrowAddress: escrow.tenantPubkey,
     });
     console.log(
       `[${scenarioId}] intents posted: alice=${aliceIntent.intentId.slice(0, 12)}… ` +
