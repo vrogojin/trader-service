@@ -537,12 +537,12 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     console.log(`[${scenarioId}] set-strategy on alice + bob…`);
     await setStrategyAsync({
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
-      trustedEscrows: [escrow.tenantPubkey],
+      trustedEscrows: [escrow.tenantDirectAddress],
       maxConcurrent: 5,
     });
     await setStrategyAsync({
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
-      trustedEscrows: [escrow.tenantPubkey],
+      trustedEscrows: [escrow.tenantDirectAddress],
       maxConcurrent: 5,
     });
 
@@ -589,7 +589,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       rateMin: tradeRate, rateMax: tradeRate,
       volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
       expiryMs: SWAP_TIMEOUT_MS,
-      escrowAddress: escrow.tenantPubkey,
+      escrowAddress: escrow.tenantDirectAddress,
     });
     const bobIntent = await createIntentAsync({
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: bob.tenantPubkey,
@@ -598,7 +598,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       rateMin: tradeRate, rateMax: tradeRate,
       volumeMin: TRADE_VOLUME, volumeMax: TRADE_VOLUME,
       expiryMs: SWAP_TIMEOUT_MS,
-      escrowAddress: escrow.tenantPubkey,
+      escrowAddress: escrow.tenantDirectAddress,
     });
     console.log(
       `[${scenarioId}] intents posted: alice=${aliceIntent.intentId.slice(0, 12)}… ` +
