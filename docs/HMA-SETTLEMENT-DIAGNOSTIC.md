@@ -1,0 +1,227 @@
+# HMA Trade-Settlement Diagnostic
+
+**Status as of 2026-05-05** — `feat/hma-trade-settlement-live` branch, latest commit `5fb50f0`.
+
+The `hma-trade-settlement.e2e-live` test still fails. Settlement reaches
+ACCEPTED on both scenarios but never COMPLETED. This document captures
+what works, what doesn't, what we tried, and the remaining hypotheses
+so a follow-up session can pick up where we stopped.
+
+---
+
+## Goal
+
+End-to-end live proof that operators can:
+1. Launch HMA over Sphere DM (no HTTP)
+2. Spawn escrow + 2 traders + faucet via `sphere host spawn`
+3. Fund traders via the new js-faucet agent over DM
+4. Match buy/sell intents
+5. Settle the swap (deal → COMPLETED on both sides)
+6. Withdraw post-trade tokens to a controller-owned address
+
+Steps 1-4 work. Step 5 is where we're stuck.
+
+## Current state (round 12)
+
+| Layer | Direct-docker (basic-roundtrip) | HMA-spawned (this test) |
+|---|---|---|
+| Spawn | ✓ | ✓ |
+| Funding | ✓ (selfMintFund) | ✓ (faucet via `FAUCET_REQUEST` DM) |
+| set-strategy / portfolio / list-intents | ✓ | ✓ |
+| Match found | ✓ | ✓ |
+| Deal accepted | ✓ | ✓ (round 12 first time) |
+| Swap announced to escrow | ✓ | ✓ (round 12) |
+| Escrow creates deposit invoice | ✓ | ✓ (round 12 — log: `"Swap announced, deposit invoice created"`) |
+| Escrow sends invoice DM to trader | ✓ | ✓ (round 12 — log: `diag_outbound_dm_sent invoice_delivery`) |
+| **Trader receives invoice DM** | ✓ | ✗ (log: `invoice_target_addresses: null`) |
+| Trader deposits | ✓ | ✗ (blocked) |
+| Swap COMPLETED | ✓ | ✗ (blocked) |
+
+The break is at **trader-side ingest of the escrow's invoice_delivery DM**.
+
+## Round-by-round progression
+
+| Round | Outcome | Bug found / fix |
+|---|---|---|
+| 1-7 | Various early failures | controller wallet races, faucet name mapping, etc. — all fixed |
+| 8 | 29 deals each, locked in PROPOSED→FAILED→CANCELLED loop | TRADER_TEST_FUND self-mint produces issuer==sender tokens that confuse swap |
+| 9 | Same as 8 | Cross-scenario rate differentiation didn't help |
+| 10 | 2 deals each, never reach ACCEPTED, escrow logs `Swap not found` | Diagnosed: trader sends `status` query but never `swap.announce` |
+| 11 | 1 scenario reaches ACCEPTED for first time | Trader's `intent-engine.ts:836` defaults `escrow_address` to literal `'any'` when CLI omits `--escrow-address` |
+| 12 | **Both scenarios reach ACCEPTED**, escrow creates+sends invoice, but trader doesn't process it | Layer-mismatch fixed (`escrow.tenantPubkey` vs `escrow.tenantDirectAddress` — swap-executor compares to DIRECT://hex) |
+
+## Bugs already fixed (committed on `feat/hma-trade-settlement-live`)
+
+1. **Faucet integration** (commit `b2659a3`) — replaces `TRADER_TEST_FUND` self-mint and broken public-faucet HTTP. Fund traders via `FAUCET_REQUEST` DMs to a shared js-faucet agent. Killed the spam-loop.
+
+2. **`--escrow-address` flag in sphere-cli** (commit `c58a463` in trader-service; sphere-cli rebuild required) — `sphere trader create-intent` previously had no way to set `escrow_address`, so the trader defaulted to `'any'` (per `trader-service/src/trader/intent-engine.ts:836`). The swap-executor then tried to route `swap.announce` to the literal string `'any'`. Now passes through to ACP wire field correctly.
+
+3. **escrow_address must be DIRECT://hex, not chain pubkey** (commit `5fb50f0`) — `swap-executor.ts:714` compares `terms.escrow_address === match.escrowDirectAddress`. The DIRECT://hex address is structurally derived (`UnmaskedPredicateReference(pubkey).toAddress()`), NOT just `DIRECT://${pubkey}`. Test now passes `escrow.tenantDirectAddress` to both `setStrategy({trustedEscrows: [...]})` and `createIntent({escrowAddress: ...})`.
+
+## The remaining symptom (in detail)
+
+Round 12 trader log (`alice` container) shows:
+
+```
+swap_id_registered (deal_id=..., swap_id=169ea57a..., matched_by="proposal_info")
+swap_deposit_target_diag (every ~3s):
+  swap_id: 169ea57a...
+  escrowDirectAddress: DIRECT://000055759f52413cab92...   ← correct
+  manifest_party_a_currency: UCT
+  manifest_party_a_value: 10
+  manifest_party_b_currency: USDU
+  manifest_party_b_value: 10
+  invoice_target_addresses: null   ← never populated
+  invoice_target_assets: null
+```
+
+Round 12 escrow log (same swap_id) shows:
+
+```
+Swap announced, deposit invoice created    invoice_id: 00004af2b309ee84
+diag_invoice_delivery_attempt   party: A    recipient_prefix: 8ff3bcef9e1aa95d
+diag_outbound_dm_sending        message_type: invoice_delivery   payload_bytes: 5789
+diag_outbound_dm_sent           message_type: invoice_delivery
+diag_invoice_delivery_complete
+[same for party B]
+```
+
+Escrow believes it sent the DM successfully. Trader has no log entry showing receipt.
+
+## Why direct-docker works but HMA-spawned doesn't (open question)
+
+Same trader image (`trader:local`), same escrow image. The difference is the runtime environment:
+
+| | direct-docker | HMA-spawned |
+|---|---|---|
+| `UNICITY_MANAGER_PUBKEY` | unset | set |
+| `UNICITY_MANAGER_DIRECT_ADDRESS` | unset | set |
+| `UNICITY_BOOT_TOKEN` | unset | set |
+| ACP heartbeats every 5s | none (no manager to talk to) | active |
+| ACP DM listener (`sphere.on('message:dm')`) | active but bails (no manager pubkey to match) | active and validating against manager pubkey |
+| Periodic `payments.receive({finalize:true})` loop | active | active |
+
+Both setups have the ACP listener attached (it's compiled into `startTrader()`).
+The difference is whether it has a manager_pubkey to filter against.
+
+## Hypotheses for the remaining bug
+
+### H1 — ACP listener consumes the invoice DM before the swap module sees it
+
+The trader's `acp-adapter/main.ts` attaches `sphere.on('message:dm', ...)` early.
+The Sphere SDK's swap module also subscribes to incoming DMs.
+
+If the order is: ACP listener fires first → marks DM as read → swap module's
+listener sees `dm.isRead === true` → skips, the invoice_delivery never reaches
+the swap-executor's state machine.
+
+In direct-docker, the ACP listener has no `manager_pubkey` to filter against,
+so its early-return path is different (it may not "consume" the DM).
+
+**Bisect**: temporarily make the trader's ACP listener bail BEFORE any SDK
+state mutation when the DM is not addressed at the manager. Or: instrument
+the SDK's incoming-DM dispatch to log every observed DM and see whether
+invoice_delivery from the escrow's pubkey is observed at the SDK level at all.
+
+### H2 — Periodic `payments.receive({finalize:true})` races with swap module's DM consumption
+
+The trader's main loop (`src/trader/main.ts:545`) calls
+`sphere.payments.receive({ finalize: true })` every 5s. We've seen
+`ENOENT: wallet.json.tmp` errors in trader logs from this and the heartbeat
+loop racing on atomic temp+rename writes.
+
+If the `wallet.json` write race corrupts the swap module's DM-state cache,
+incoming swap DMs may be silently dropped.
+
+**Bisect**: lengthen `SYNC_INTERVAL_MS` (currently 5s) to 60s and see if
+settlement starts working. If yes, race is the cause.
+
+### H3 — HMA-spawned container's relay subscription latency
+
+HMA's docker create injects more env vars and starts the container with
+`tini` as PID 1. The relay subscription inside the trader may not be fully
+established by the time the escrow sends the invoice. NIP-17 events that
+arrive before the subscription is active are NOT replayable for that
+subscriber session.
+
+`sphere.fetchPendingEvents()` is supposed to catch missed events, but its
+periodic call (also 5s in the sync loop) may be racing or filtering.
+
+**Bisect**: add an explicit `await sphere.fetchPendingEvents()` after the
+trader's first STATUS query and before the swap-executor begins polling for
+invoice_target. If the invoice arrives after this explicit fetch, latency
+is the cause.
+
+## Proposed debugging plan for the follow-up session
+
+1. **Instrument the trader** to log EVERY incoming DM at the raw level:
+   ```typescript
+   sphere.on('message:dm', (msg) => {
+     log.info({
+       sender: msg.senderPubkey.slice(0, 16),
+       size: msg.content.length,
+       firstByte: msg.content[0],
+     }, 'raw_dm_observed');
+   });
+   ```
+   Place this BEFORE any other listener attaches. Re-run the test.
+   - If invoice_delivery DMs appear in `raw_dm_observed`: the receive-side works,
+     bug is in dispatch (H1 or H2).
+   - If they don't appear: bug is in transport/subscription (H3).
+
+2. **For H1 (most likely)**: temporarily comment out the ACP listener's
+   `sphere.on('message:dm', ...)` subscription in `acp-adapter/main.ts` and
+   re-run. If settlement completes, the ACP listener is consuming the DM.
+
+3. **For H3**: capture network-level evidence — point both HMA and
+   direct-docker at the SAME relay URL and compare event-arrival timestamps
+   (instrument the relay or use Wireshark on `wss://nostr-relay.testnet.unicity.network`).
+
+## Key files
+
+- Test: `test/e2e-live/hma-trade-settlement.e2e-live.test.ts`
+- Test helpers:
+  - `test/e2e-live/helpers/faucet-client.ts` (in-process Sphere wallet for `FAUCET_REQUEST`)
+  - `test/e2e-live/helpers/manager-process.ts`
+  - `test/e2e-live/helpers/hma-spawn.ts`
+  - `test/e2e-live/helpers/sphere-trader.ts`
+- Trader code likely involved:
+  - `src/trader/main.ts:545` — `payments.receive({ finalize: true })` periodic
+  - `src/trader/swap-executor.ts:714` — `negotiatedEscrow === escrowDirectAddress` check
+  - `src/trader/intent-engine.ts:836` — `escrow_address ?? DEFAULT_ESCROW`
+  - `src/acp-adapter/main.ts` (Phase 4h decoupling) — ACP DM listener
+- Sphere SDK: `@unicitylabs/sphere-sdk` payments + swap modules
+
+## Reproducing the failure
+
+```bash
+# Build all required images
+cd /home/vrogojin && docker build -f trader-service/Dockerfile \
+  -t ghcr.io/vrogojin/agentic-hosting/trader:local .
+cd /home/vrogojin && docker build -f js-faucet/Dockerfile \
+  -t ghcr.io/unicitynetwork/agentic-hosting/faucet:local .
+cd /home/vrogojin/agentic_hosting && npm run build
+cd /home/vrogojin/sphere-cli-work/sphere-cli && npm run build
+
+# Run the test
+cd /home/vrogojin/trader-service
+git checkout feat/hma-trade-settlement-live
+npm run test:e2e-live -- test/e2e-live/hma-trade-settlement.e2e-live.test.ts
+# Expect: FAIL ~590s, both pairs reach ACCEPTED, neither reaches COMPLETED.
+
+# Inspect trader log:
+docker ps -a --filter "name=alice-p" --filter "status=exited" --format "{{.Names}}" | head -1 \
+  | xargs -I {} docker logs {} 2>&1 | grep -E "swap_deposit_target_diag|swap_id_register|swap_announced"
+
+# Inspect escrow log:
+docker ps -a --filter "name=escrow-p" --filter "status=exited" --format "{{.Names}}" | head -1 \
+  | xargs -I {} docker logs {} 2>&1 | grep -iE "announce|invoice_delivery|outbound_dm"
+```
+
+## Out of scope for this debugging session
+
+- Production hardening of js-faucet (rate limiting, batched mints, etc.)
+- Pushing js-faucet image to ghcr.io/unicitynetwork (needs PAT)
+- Adding `faucet-agent` template entry to agentic-hosting/config/templates.json
+- `sphere faucet request` subcommand in sphere-cli
+- Withdraw-via-HMA live test
