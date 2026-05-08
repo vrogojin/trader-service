@@ -178,6 +178,12 @@ interface SuiteState {
   faucet: SpawnedTenant;
   /** In-process Sphere wallet that signs+encrypts FAUCET_REQUEST DMs. */
   faucetClient: FaucetClient;
+  /**
+   * Env to inject into every HMA-spawned tenant. Carries
+   * `UNICITY_NOSTR_RELAYS` when the local-infra relay is active;
+   * empty object otherwise. Forwarded via hostSpawnAsync's `env` field.
+   */
+  spawnEnv: Record<string, string>;
 }
 
 // Number of concurrent settlement scenarios. Each gets its own controller
@@ -306,6 +312,17 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
 
     // Spawn ONE shared faucet (the faucet is open — anyone can request,
     // so we don't need one per scenario).
+    //
+    // When the local-infra Nostr relay is active (TRADER_E2E_LOCAL_RELAY=1
+    // → global-setup.ts boots a Docker relay and sets
+    // UNICITY_NOSTR_RELAYS to its bridge-gateway URL), forward that env
+    // into every spawned tenant via HMA's `--env` passthrough so the
+    // tenant connects to the local relay instead of the public testnet.
+    // No-op when the env var is unset (falls through to network preset).
+    const localRelayEnv: Record<string, string> = process.env['UNICITY_NOSTR_RELAYS']
+      ? { UNICITY_NOSTR_RELAYS: process.env['UNICITY_NOSTR_RELAYS']! }
+      : {};
+
     console.log('[hma-trade-settlement] spawning shared faucet-agent…');
     const faucet = await hostSpawnAsync({
       cliPath,
@@ -314,6 +331,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'faucet-agent',
       instanceName: `faucet-${randomUUID().slice(0, 6)}`,
       timeoutMs: 180_000,
+      env: localRelayEnv,
     });
     console.log(
       `[hma-trade-settlement] faucet ready: pubkey=${faucet.tenantPubkey.slice(0, 16)}… ` +
@@ -336,6 +354,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       spawned: [faucet],
       faucet,
       faucetClient,
+      spawnEnv: localRelayEnv,
     };
   }, 900_000); // 15 min — adds ~30-60s for faucet spawn + client bootstrap on top of controller-wallet inits
 
@@ -403,6 +422,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'escrow-service',
       instanceName: `escrow-${scenarioId}`,
       timeoutMs: 180_000,
+      env: s.spawnEnv,
     });
     const alice = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -411,6 +431,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `alice-${scenarioId}`,
       timeoutMs: 180_000,
+      env: s.spawnEnv,
     });
     const bob = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -419,6 +440,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `bob-${scenarioId}`,
       timeoutMs: 180_000,
+      env: s.spawnEnv,
     });
     s.spawned.push(escrow, alice, bob);
     console.log(

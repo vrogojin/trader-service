@@ -263,6 +263,15 @@ export async function spawnHostManager(opts: SpawnHostManagerOptions): Promise<H
     LOG_LEVEL: 'info',
   };
   if (process.env['UNICITY_API_KEY']) env['UNICITY_API_KEY'] = process.env['UNICITY_API_KEY'];
+  // Forward optional relay override — set by global-setup when the local-infra
+  // harness boots a Docker-hosted relay. Goes to the HMA's own Sphere wallet.
+  // The bridge-gateway URL (typically 172.17.0.1:7777) works from both host
+  // and container side.
+  if (process.env['UNICITY_NOSTR_RELAYS']) {
+    env['UNICITY_NOSTR_RELAYS'] = process.env['UNICITY_NOSTR_RELAYS'];
+  } else if (process.env['SPHERE_NOSTR_RELAYS']) {
+    env['SPHERE_NOSTR_RELAYS'] = process.env['SPHERE_NOSTR_RELAYS'];
+  }
 
   const child = spawn('node', [binPath], { env, cwd: sessionDir, stdio: ['ignore', 'pipe', 'pipe'] });
 
