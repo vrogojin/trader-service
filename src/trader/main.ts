@@ -247,6 +247,21 @@ export async function startTrader(): Promise<void> {
   const trustbasePath = join(config.data_dir, 'trustbase.json');
   writeFileSync(trustbasePath, await tbResponse.text());
 
+  // Optional Nostr-relay override. Set `UNICITY_NOSTR_RELAYS` (or
+  // `SPHERE_NOSTR_RELAYS` as a fallback) to a comma-separated list of
+  // WebSocket URLs to replace the network preset's relays — used by the
+  // local-infra e2e harness to point at a Docker-hosted relay when the
+  // public testnet relay's write path is degraded. Empty/unset → default.
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
+  if (relayOverride) {
+    logger.info('nostr_relays_override_active', { relays: relayOverride });
+  }
+
   // Initialize Sphere wallet with market, swap, and accounting modules
   logger.info('initializing_sphere', { network: config.network, data_dir: config.data_dir });
   const providers = createNodeProviders({
@@ -257,6 +272,7 @@ export async function startTrader(): Promise<void> {
       trustBasePath: trustbasePath,
       apiKey: resolveApiKey(),
     },
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
 
   // 2026-04-30 FIX (basic-roundtrip flake investigation): expand the
