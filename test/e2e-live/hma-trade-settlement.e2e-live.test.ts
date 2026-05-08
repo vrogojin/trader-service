@@ -318,9 +318,17 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     // UNICITY_NOSTR_RELAYS to its bridge-gateway URL), forward that env
     // into every spawned tenant via HMA's `--env` passthrough so the
     // tenant connects to the local relay instead of the public testnet.
-    // No-op when the env var is unset (falls through to network preset).
-    const localRelayEnv: Record<string, string> = process.env['UNICITY_NOSTR_RELAYS']
-      ? { UNICITY_NOSTR_RELAYS: process.env['UNICITY_NOSTR_RELAYS']! }
+    //
+    // IMPORTANT: HMA's validatePayloadEnv at
+    // agentic-hosting/src/host-manager/manager.ts:90 blocks every env
+    // var starting with `UNICITY_` (it protects HMA-internal vars like
+    // UNICITY_BOOT_TOKEN from controller-side override). So we use the
+    // sibling `SPHERE_NOSTR_RELAYS` alias which is treated identically
+    // by every service's relay-override pickup but isn't on the
+    // forbidden-prefix list. No-op when neither env var is set.
+    const relayUrl = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    const localRelayEnv: Record<string, string> = relayUrl
+      ? { SPHERE_NOSTR_RELAYS: relayUrl }
       : {};
 
     console.log('[hma-trade-settlement] spawning shared faucet-agent…');

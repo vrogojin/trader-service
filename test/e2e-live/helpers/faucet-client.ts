@@ -79,11 +79,23 @@ export async function createFaucetClient(): Promise<FaucetClient> {
   const trustbasePath = join(dataDir, 'trustbase.json');
   writeFileSync(trustbasePath, await tbResp.text());
 
+  // Forward Nostr-relay override so the in-process FaucetClient connects
+  // to the same relay as the spawned tenants when the local-infra harness
+  // is active. Without this, the client connects to testnet defaults and
+  // can't reach a faucet-agent that's only on the local relay → its
+  // FAUCET_REQUEST DMs go out into testnet and the response never arrives.
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
   const providers = createNodeProviders({
     network: 'testnet',
     dataDir,
     tokensDir,
     oracle: { trustBasePath: trustbasePath },
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
   const { sphere } = await Sphere.init({
     ...providers,
