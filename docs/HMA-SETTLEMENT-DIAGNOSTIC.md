@@ -163,6 +163,53 @@ went down again (intermittent — every WS publish-kind:* returns no OK).
 The instrumented build is committed and pushed; next live attempt against
 this branch will produce log lines pinpointing party B's actual path.
 
+**Update 2026-05-08 (rounds 16-17, local-infra harness)**:
+ported uxf's local-infra Nostr relay setup to trader-service to
+escape the testnet write-path outages. Added
+`UNICITY_NOSTR_RELAYS` env override across every component
+(trader-service, escrow-service, agentic-hosting host-manager,
+js-faucet, sphere-cli host/legacy inits) plus `helpers/sphere-cli.ts
+buildEnv()` forwards the env into sphere-cli subprocesses.
+Global-setup boots the relay when `TRADER_E2E_LOCAL_RELAY=1`.
+
+What works:
+  - Local relay container boots, tests skip preflight, env propagates
+    to host-manager + spawned tenants
+  - Wallet events (kind:30078) and DM gift-wraps (kind:1059) ARE
+    published to the local relay (verified by tailing relay logs)
+  - HMA dist needed a rebuild (was 4 days stale on disk)
+
+What does NOT yet work — SDK-level gap:
+  - Nametag binding events (kind:31113/31115/31116) bypass the
+    `transport.relays` override. They route through
+    `MultiAddressTransportMux` (sphere-sdk/transport/MultiAddressTransportMux.ts:9)
+    which has its OWN relay list independent of the per-provider
+    transport config. Because of this, the manager registers a
+    nametag against the (default/testnet) mux-relay but sphere-cli's
+    `queryPubkeyByNametag` (also via the mux) doesn't find it on
+    the local relay → "Unicity ID not found: @m-…".
+  - `nostr-js-sdk`'s `publishNametagBinding` calls
+    `queryPubkeyByNametag` first to detect conflicts; both
+    operations target the mux's hard-coded relay list, not the
+    SDK consumer's override.
+
+Fix path:
+  1. **SDK change** — extend `MultiAddressTransportMux` to accept a
+     relay override so it picks up `transport.relays` (or a sibling
+     `transport.muxRelays`) from the createNodeProviders config.
+     Default behavior unchanged.
+  2. **Tactical workaround** — for tests that use the local relay,
+     identify peers by raw `DIRECT://hex` (which the SDK resolves
+     transport-side, not via the nametag mux) and avoid `@nametag`.
+     The hma-trade-settlement test already passes
+     `escrow.tenantDirectAddress` for the swap routing; the only
+     remaining `@nametag` usage is sphere-cli's manager-address
+     resolution. The test could read `manager.directAddress` and
+     pass that instead of `@${manager.nametag}` — quick fix.
+
+Local-infra commits already pushed; the workaround in (2) is the
+fastest path to a green run.
+
 **Remediation (in priority order)**:
 
 1. Rebuild `escrow:local` from `/home/vrogojin/escrow-service` source and
