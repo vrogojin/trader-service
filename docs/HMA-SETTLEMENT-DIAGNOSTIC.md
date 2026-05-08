@@ -147,6 +147,22 @@ party-B-broken path doesn't matter (e.g., the test only asserts the buyer's
 side, not the seller's). Worth re-running basic-roundtrip with the
 rebuilt image to confirm; the asymmetry is a real defect regardless.
 
+**Update 2026-05-08 (round 14)**: rebuilt `escrow:local` from current
+`escrow-service` HEAD; bug REPRODUCED unchanged. So the bug is in current
+source, not the divergence between the deployed image and HEAD as the
+original agent suspected. The deployed `escrow:v0.1` image had additional
+`diag_invoice_delivery_*` log lines that do NOT exist in HEAD — that's
+what made the divergence look like the cause; the bug is structural.
+
+**Update 2026-05-08 (round 15)**: branched `escrow-service` to
+`debug/instrument-deliver-invoice` (`c0e19ea`), instrumented every code
+path of `deliverDepositInvoice` (enter / no-id / no-token / sending /
+sent / threw) plus per-party try/catch in the announce-handler's for-loop.
+Round 15 itself failed at preflight — testnet Nostr relay's write path
+went down again (intermittent — every WS publish-kind:* returns no OK).
+The instrumented build is committed and pushed; next live attempt against
+this branch will produce log lines pinpointing party B's actual path.
+
 **Remediation (in priority order)**:
 
 1. Rebuild `escrow:local` from `/home/vrogojin/escrow-service` source and
