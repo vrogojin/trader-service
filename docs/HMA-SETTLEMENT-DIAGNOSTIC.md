@@ -163,6 +163,49 @@ went down again (intermittent — every WS publish-kind:* returns no OK).
 The instrumented build is committed and pushed; next live attempt against
 this branch will produce log lines pinpointing party B's actual path.
 
+**Update 2026-05-08 (round 19, local-infra fully working)**:
+The local-infra harness now runs end-to-end on a Docker-hosted Nostr relay
+(no testnet dependency for messaging). Fix chain that closed it:
+
+  - sphere-cli (host/sphere-init.ts AND legacy/legacy-cli.ts) reads
+    UNICITY_NOSTR_RELAYS / SPHERE_NOSTR_RELAYS;
+  - helpers/sphere-cli.ts buildEnv() forwards the env into sphere-cli
+    subprocesses;
+  - helpers/manager-process.ts: spawnHostManager forwards env to HMA
+    binary, AND provisionManagerWallet (which pre-creates the manager
+    wallet + publishes the nametag binding) ALSO reads it — without
+    this, the nametag binding lands on testnet, the HMA's later
+    Sphere.init loads the existing wallet (wallet_created: false) and
+    skips re-publish, sphere-cli's queryPubkeyByNametag returns null
+    on the local relay;
+  - helpers/manager-process.ts: UNICITY_HEALTH_PORT default → 0 (OS-
+    assigned) so leaked HMA processes don't EADDRINUSE the next run;
+  - hma-trade-settlement test: use SPHERE_NOSTR_RELAYS (NOT
+    UNICITY_NOSTR_RELAYS) in HMA spawn-env passthrough — HMA's
+    validatePayloadEnv blocks any env starting with UNICITY_;
+  - helpers/faucet-client.ts: same env-pickup pattern so the in-process
+    Sphere wallet that signs FAUCET_REQUEST DMs talks to the local relay.
+
+Round 19 evidence:
+  - Local relay log: 534+ kind:1059 (gift-wrap DMs) + 10+ kind:30078
+    (wallet/nametag bindings) — full settlement traffic on local infra.
+  - Escrow's instrumentation: every swap shows `deliver_deposit_invoice_enter
+    → _sending → _sent` for BOTH parties (the asymmetric bug from
+    rounds 11-12 IS GONE in escrow:local from current source).
+  - Trader log: `diag_invoice_delivery_received` → `_imported` →
+    `swap_deposit_target_diag` populated → `swap_deposit_sent`. The
+    deposit IS sent. The trader DOES process the invoice.
+  - Final failure: `[Accounting] Direction mismatch: transport memo says
+    return_cancelled, on-chain says forward for invoice <id> — using
+    on-chain` → `swap_cancelled`.
+
+**The local-infra goal is met.** What remains is a swap-protocol
+settlement-layer issue (transport memo vs on-chain direction
+mismatch) that's independent of the relay infra. This is the next
+real bug to chase, and it now reproduces deterministically against
+a controlled local relay — debug iterations no longer wait on
+testnet propagation or burn through testnet rate limits.
+
 **Update 2026-05-08 (rounds 16-17, local-infra harness)**:
 ported uxf's local-infra Nostr relay setup to trader-service to
 escape the testnet write-path outages. Added
