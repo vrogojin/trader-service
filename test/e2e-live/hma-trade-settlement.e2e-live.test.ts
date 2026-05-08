@@ -127,6 +127,7 @@ import {
   type PortfolioBalance,
 } from './helpers/sphere-trader.js';
 import { createFaucetClient, type FaucetClient } from './helpers/faucet-client.js';
+import { UCT_COIN_ID, USDU_COIN_ID } from './helpers/constants.js';
 
 // ---------------------------------------------------------------------------
 // Precondition gates (mirrors hma-trade-flow's structure)
@@ -432,6 +433,23 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       timeoutMs: 180_000,
       env: s.spawnEnv,
     });
+    // Trader-side selfMint funding via TRADER_TEST_FUND. Diagnostic note
+    // (rounds 17-19, 2026-05-04): faucet-funded tokens caused Bob's
+    // deposit to fail with "Ownership verification failed: Authenticator
+    // does not match source state predicate" — tokens minted+sent by the
+    // faucet had a source-state predicate that the trader's swap-deposit
+    // signing path could not match. basic-roundtrip uses selfMintFund
+    // and settles correctly because each trader mints with its OWN key
+    // as the source-state predicate. Switching this test to selfMint
+    // isolates the predicate-mismatch issue from the rest of the
+    // HMA-orchestrated flow. TRADER_TEST_FUND is gated by
+    // TRADER_FAULT_INJECTION_ALLOWED=1 + UNICITY_NETWORK ∈ {testnet,dev}
+    // (trader/main.ts:1524). HMA's payload-env validator allows both
+    // (UNICITY_* prefix is forbidden but TRADER_* is not).
+    const fundEnv: Record<string, string> = {
+      TRADER_TEST_FUND: `${UCT_COIN_ID}:${INITIAL_FUND_AMOUNT.toString()},${USDU_COIN_ID}:${INITIAL_FUND_AMOUNT.toString()}`,
+      TRADER_FAULT_INJECTION_ALLOWED: '1',
+    };
     const alice = await hostSpawnAsync({
       cliPath: s.cliPath,
       cliHome: controller.cliHome,
@@ -439,7 +457,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `alice-${scenarioId}`,
       timeoutMs: 180_000,
-      env: s.spawnEnv,
+      env: { ...s.spawnEnv, ...fundEnv },
     });
     const bob = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -448,34 +466,14 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `bob-${scenarioId}`,
       timeoutMs: 180_000,
-      env: s.spawnEnv,
+      env: { ...s.spawnEnv, ...fundEnv },
     });
     s.spawned.push(escrow, alice, bob);
     console.log(
       `[${scenarioId}] up: escrow=${escrow.instanceName} ` +
-      `alice=${alice.instanceName} bob=${bob.instanceName}`,
+      `alice=${alice.instanceName} bob=${bob.instanceName} ` +
+      `(selfMint UCT+USDU=${INITIAL_FUND_AMOUNT})`,
     );
-
-    // Fund both traders via FAUCET_REQUEST DMs. The faucet mints the
-    // tokens and sends to each trader's DIRECT://. We then poll each
-    // trader's portfolio until the balance arrives in `confirmed`.
-    console.log(`[${scenarioId}] funding alice + bob via faucet DM…`);
-    for (const t of [{ name: 'alice', tenant: alice }, { name: 'bob', tenant: bob }]) {
-      const recipient = t.tenant.tenantNametag
-        ? `@${t.tenant.tenantNametag}`
-        : `DIRECT://${t.tenant.tenantPubkey}`;
-      const deliveries = await s.faucetClient.request(s.faucet.tenantPubkey, {
-        recipient,
-        items: [
-          { asset: 'UCT', amount: INITIAL_FUND_AMOUNT.toString() },
-          { asset: 'USDU', amount: INITIAL_FUND_AMOUNT.toString() },
-        ],
-      }, 240_000);
-      console.log(
-        `[${scenarioId}] ${t.name}: faucet delivered ${deliveries.length} item(s) ` +
-        `(transfer_ids: ${deliveries.map((d) => d.transfer_id.slice(0, 8)).join(', ')})`,
-      );
-    }
     return { escrow, alice, bob };
   }
 
@@ -536,13 +534,13 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     const s = state;
     const { escrow, alice, bob } = await provisionTriple(scenarioId, controller);
 
-    // The faucet returned `acp.result` for each FAUCET_REQUEST, but the
-    // trader's payments.receive() loop runs on a 15s cycle — the
-    // delivered tokens may be in `unconfirmed` for up to ~30s after
-    // the send completes. Poll each trader's portfolio until both
-    // assets reach the funded amount in `confirmed` so set-strategy /
-    // create-intent operate on a fully-settled balance.
-    console.log(`[${scenarioId}] waiting for faucet-funded balances to confirm…`);
+    // selfMint funding: the trader runs sphere.payments.mintFungibleToken
+    // for each TRADER_TEST_FUND entry BEFORE agent.start() (see
+    // trader/main.ts:1524). Tokens are confirmed on the L3 aggregator
+    // before the trader logs sphere_initialized, so the balance is
+    // typically present on the first GET_PORTFOLIO. Keep the polling
+    // loop anyway as a safety net for slow aggregator round-trips.
+    console.log(`[${scenarioId}] waiting for selfMint balances to confirm…`);
     for (const t of [{ name: 'alice', tenant: alice }, { name: 'bob', tenant: bob }]) {
       const deadline = Date.now() + FUNDING_BALANCE_TIMEOUT_MS;
       let lastSnapshot: readonly PortfolioBalance[] = [];

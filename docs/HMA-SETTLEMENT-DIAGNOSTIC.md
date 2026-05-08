@@ -413,6 +413,146 @@ docker ps -a --filter "name=escrow-p" --filter "status=exited" --format "{{.Name
   | xargs -I {} docker logs {} 2>&1 | grep -iE "announce|invoice_delivery|outbound_dm"
 ```
 
+---
+
+## Round 20 (2026-05-08) — selfMint funding unblocks deposits; SDK verifyPayout is the new wall
+
+**Hypothesis tested:** the round-19 deposit failure
+(`Ownership verification failed: Authenticator does not match source state predicate`)
+is caused by faucet-funded tokens having a predicate the swap-deposit
+key path can't sign. `basic-roundtrip` works because traders selfMint
+(predicate matches their own key); switching this test to selfMint
+should unblock the deposit step.
+
+**Change:** patched `provisionTriple` in
+`test/e2e-live/hma-trade-settlement.e2e-live.test.ts` to fund alice/bob
+via `TRADER_TEST_FUND` injected through HMA's `--env` passthrough,
+identical to the basic-roundtrip mechanism. Faucet spawn left in place
+(unused) for minimal-diff diagnostic. Run on local-infra relay with
+`TRADER_E2E_LOCAL_RELAY=1`.
+
+**Result — escrow side (full happy path):**
+
+```
+escrow-p1 log:
+  announce DM received from sender A   (alice)
+  announce DM received from sender B   (bob)
+  Swap announced, deposit invoice created
+  deliver_deposit_invoice_enter A → recipient 53272861... USDU 10
+  deliver_deposit_invoice_sent  A
+  deliver_deposit_invoice_enter B → recipient 786576ea... UCT 10
+  deliver_deposit_invoice_sent  B
+  First valid deposit received, timeout timer started   (party A USDU)
+  Valid deposit received (not first)                    (party B UCT)
+  invoice:covered with unconfirmed deposits — waiting for aggregator confirmation
+  Deposit invoice already closed, proceeding to payouts
+  Timeout cancelled
+  Swap concluding — paying payout invoices    (payoutA UCT, payoutB USDU)
+  Swap completed successfully                  ← ESCROW: settlement is DONE
+```
+
+So the deposit-predicate issue is **conclusively the faucet's fault**:
+with selfMint, both deposits verify, escrow concludes, payouts route.
+This unblocks the entire swap protocol from L4 down.
+
+**Result — trader side (new wall):**
+
+```
+alice-p1 log (Pair-1, after escrow logged "Swap completed"):
+  swap_payout_verify_diag attempt=8..15
+  invoice_status: { state:'COVERED', isCovered:true,
+    coveredAmount:'10', netCoveredAmount:'10',
+    transfers:[{ transferId:'a20d9b0d-…', paymentDirection:'forward',
+                 senderPubkey:'…escrow…', confirmed:false }] }
+  [Swap] verifyPayout for dacaf7d67760: 3 invalid token(s) but
+    tokenInvoiceMap is empty for this payout invoice — failing closed
+    until reverse index rebuilds
+  swap-executor: execution_timeout_skipped_terminal_swap
+    sdk_progress="completed", note="SDK swap is already terminal —
+    letting verifyPayout retries finish"
+  swap_payout_verify_retry_failed attempt=15 remaining=25
+```
+
+The trader **received** the payout token. The SDK's swap progress is
+`completed`. But `getTokenIdsForInvoice(payoutInvoiceId)` returns an
+empty Set, so the SECURITY-fail-closed branch in
+`sphere-sdk/modules/swap/SwapModule.ts:1997-2003` returns false on
+every retry. The retry budget exhausts at attempt 40 (~20 min); the
+test's 8-min timeout expires first → both Pair-1 + Pair-2 fail with
+`did not reach state="COMPLETED" within 480000ms. last seen 1 deal(s)
+in states [ACCEPTED]`.
+
+**Where the index should populate:** SDK's
+`AccountingModule.ts:5755-5773` adds entries to `tokenInvoiceMap` when
+an inbound transfer matches an invoice target (instant-mode v5split
+path):
+
+```ts
+for (const tok of transfer.tokens) {
+  if (!tok.id) continue;            // ← short-circuit if token.id absent
+  if (!this.tokenInvoiceMap.has(tok.id)) {
+    this.tokenInvoiceMap.set(tok.id, new Set());
+  }
+  this.tokenInvoiceMap.get(tok.id)!.add(invoiceId);
+}
+```
+
+So either:
+
+1. The payout transfer arrives **without** `tok.id` populated on the
+   `transfer.tokens` entries (in which case the loop skips silently
+   and the index stays empty), OR
+2. The transfer arrives **before** the payout invoice is registered
+   on the trader's accounting module (so `terms.targets` doesn't match
+   yet — but `invoice_imported:true` in the diag rules this out), OR
+3. There's a race where `_processTokenTransactions`'s on-chain path
+   also failed to populate the map (instant-mode tokens have no genesis
+   so the on-chain path is a no-op — the synthetic-ledger path at line
+   5755 is the only chance). The W23-R3 fix added that synthetic path
+   precisely for this case; it's apparently not firing here.
+
+**Reproducer (deterministic on local-infra):**
+
+```bash
+docker rm -f $(docker ps -aq --filter "name=agentic-") 2>/dev/null || true
+cd /home/vrogojin/trader-service
+TRADER_E2E_LOCAL_RELAY=1 npx vitest run --config vitest.e2e-live.config.ts \
+  test/e2e-live/hma-trade-settlement.e2e-live.test.ts 2>&1 | tee /tmp/r20.log
+# Wait ~7 min. Both scenarios fail at COMPLETED gate.
+ALICE=$(docker ps -a --filter "name=agentic-alice-p1" --format "{{.Names}}" | head -1)
+docker logs "$ALICE" 2>&1 | grep -E "swap_payout_verify|tokenInvoiceMap"
+# Expect: many "tokenInvoiceMap is empty for this payout invoice" warnings.
+```
+
+**Next investigative steps (in order of leverage):**
+
+1. **Inspect transfer.tokens in the actual payout** — run with
+   `LOG_LEVEL=debug` and add a one-line dump of `transfer.tokens` at
+   the top of the synthetic-ledger branch in `AccountingModule.ts:5715`.
+   Confirm whether `tok.id` is populated when the swap payout lands.
+   This is a 1-line probe with ~0 risk.
+2. **Verify the synthetic-ledger branch is even being entered** — it's
+   guarded by `matchesTarget && matchesAsset` (line 5715). If the
+   trader's wallet address doesn't match `terms.targets[].address`
+   for the payout, neither the ledger nor the reverse map gets
+   populated. The diag log already shows `coveredAmount:"10"` against
+   the alice address `DIRECT://0000b753a86a721a72…`, so the match
+   IS happening — but maybe in `computeInvoiceStatus` only, not in
+   the dispatcher that runs synthetic-ledger update.
+3. **Check the on-chain path** — `_processTokenTransactions` at
+   line 4628 also populates `tokenInvoiceMap`. Instant-mode payouts
+   have no TXF transaction so that path is a no-op; but if the swap
+   payouts go via TXF (not instant), this branch is what should run.
+   Decide which mode the escrow is using by inspecting payout messages.
+
+**Status:** the swap protocol works end-to-end on the wire (deposits
+verify, escrow concludes, payouts deliver). The remaining gap is a
+reverse-index population bug in the SDK. This is a different layer
+from the round-1..19 issues (HMA / relay / faucet predicate); it's
+inside `sphere-sdk` itself.
+
+---
+
 ## Out of scope for this debugging session
 
 - Production hardening of js-faucet (rate limiting, batched mints, etc.)
