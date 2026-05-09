@@ -1036,6 +1036,43 @@ export async function startTrader(): Promise<void> {
     market,
     swap,
     comms: { sendDm: sender.sendDm.bind(sender) },
+    // Invoice-based withdraw path. When the SDK's accounting module is
+    // available, expose a narrow facade so the trader's WITHDRAW_TOKEN
+    // handler can use createInvoice + payInvoice instead of payments.send
+    // directly. Mirrors the swap-deposit flow and avoids the "Authenticator
+    // does not match source state predicate" flake on spends of received
+    // swap-payout tokens.
+    ...(sphere.accounting
+      ? {
+          accounting: {
+            createInvoice: async (req: import('./types.js').AccountingCreateInvoiceRequest) => {
+              const result = await sphere.accounting!.createInvoice({
+                targets: req.targets.map((t) => ({
+                  address: t.address,
+                  assets: t.assets.map((a) => ({ coin: a.coin as [string, string] })),
+                })),
+                ...(req.memo !== undefined ? { memo: req.memo } : {}),
+              });
+              return {
+                success: result.success,
+                ...(result.invoiceId !== undefined ? { invoiceId: result.invoiceId } : {}),
+                ...(result.error !== undefined ? { error: result.error } : {}),
+              };
+            },
+            payInvoice: async (
+              invoiceId: string,
+              params: import('./types.js').AccountingPayInvoiceParams,
+            ) => {
+              const result = await sphere.accounting!.payInvoice(invoiceId, params);
+              return {
+                id: result.id,
+                status: String(result.status),
+                ...(result.error !== undefined ? { error: result.error } : {}),
+              };
+            },
+          },
+        }
+      : {}),
     // subscribeEvent is retained for interface compatibility but swap events
     // are ALL handled by direct sphere.on() listeners below (lines 418+).
     // This bridge is only needed for non-swap events in the future.

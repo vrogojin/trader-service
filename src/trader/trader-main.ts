@@ -23,6 +23,7 @@ import { createCommandHandler } from '../tenant/command-handler.js';
 import type { CommandHandler } from '../tenant/command-handler.js';
 
 import type {
+  AccountingAdapter,
   PaymentsAdapter,
   MarketAdapter,
   MarketSearchResult,
@@ -60,6 +61,14 @@ export interface TraderMainDeps {
   readonly market: MarketAdapter;
   readonly swap: SwapAdapter;
   readonly comms: { sendDm: (to: string, content: string) => Promise<void> };
+  /**
+   * Optional invoice-based withdraw path. When present, WITHDRAW_TOKEN
+   * routes through accounting.createInvoice + payInvoice instead of
+   * payments.send directly — the same code path swap deposits use, so
+   * predicate-handling is well-tested. Optional so unit tests with
+   * stub adapters don't need to wire this layer.
+   */
+  readonly accounting?: AccountingAdapter;
 
   // Sphere instance controls
   readonly subscribeEvent: (eventType: string, handler: (...args: unknown[]) => void) => () => void;
@@ -145,6 +154,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
     market,
     swap,
     comms,
+    accounting,
     // subscribeEvent is available but unused — all swap events are handled
     // by direct sphere.on() listeners in main.ts, not via this bridge.
     signMessage,
@@ -196,6 +206,74 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
   async function withdraw(
     params: WithdrawTokenParams,
   ): Promise<{ transfer_id: string; remaining_balance: bigint }> {
+    // Invoice-based path (preferred). The trader creates a local invoice
+    // with a single target = `params.to_address`, then pays it via
+    // `accounting.payInvoice`. This is the same code path swap deposits
+    // use, so it inherits the SDK's well-tested handling for invoice-target
+    // predicates. The recipient sees the inbound transfer with an invoice
+    // memo and (if their wallet has accounting enabled) auto-imports the
+    // invoice — matching how swap-payouts are received.
+    //
+    // The direct `payments.send` path used to be the implementation but
+    // can flake with "Authenticator does not match source state predicate"
+    // when the spend queue picks a token whose source-state predicate
+    // doesn't match the wallet's main key (typical of swap-payout tokens
+    // received with a per-transfer salted predicate).
+    if (accounting !== undefined) {
+      // The accounting module's createInvoice validates `coin[0]` as a
+      // SYMBOL (≤20 chars, alphanumeric), not a 64-hex coinId. We resolve
+      // the symbol to a coinIdHex separately for the post-pay balance
+      // computation, but pass the symbol to createInvoice itself.
+      const balances = payments.getAllBalances();
+      const matched = balances.find((b) => b.symbol === params.asset || b.coinId === params.asset);
+      if (matched === undefined) {
+        throw new Error(`withdraw: unknown asset "${params.asset}" — no token in wallet matches`);
+      }
+      const symbol = matched.symbol ?? params.asset;
+      const coinIdHexForBalance = matched.coinId;
+      const invoice = await accounting.createInvoice({
+        targets: [{
+          address: params.to_address,
+          assets: [{ coin: [symbol, params.amount] }],
+        }],
+        memo: `withdraw ${params.amount} ${symbol} → ${params.to_address}`,
+      });
+      if (!invoice.success || invoice.invoiceId === undefined) {
+        throw new Error(`accounting.createInvoice failed: ${invoice.error ?? 'unknown'}`);
+      }
+      const payResult = await accounting.payInvoice(invoice.invoiceId, {
+        targetIndex: 0,
+        amount: params.amount,
+      });
+      if (payResult.error !== undefined && payResult.error !== '') {
+        logger.warn('withdraw_pay_invoice_returned_error', {
+          asset: params.asset,
+          amount: params.amount,
+          to_address: params.to_address,
+          invoice_id: invoice.invoiceId,
+          transfer_id: payResult.id,
+          status: payResult.status,
+          error: payResult.error,
+        });
+        throw new Error(`accounting.payInvoice failed: ${payResult.error}`);
+      }
+      logger.info('withdraw_sent_via_invoice', {
+        asset: params.asset,
+        amount: params.amount,
+        to_address: params.to_address,
+        invoice_id: invoice.invoiceId,
+        transfer_id: payResult.id,
+        status: payResult.status,
+      });
+      const remaining = payments.getConfirmedBalance(coinIdHexForBalance) - BigInt(params.amount);
+      return {
+        transfer_id: payResult.id,
+        remaining_balance: remaining < 0n ? 0n : remaining,
+      };
+    }
+
+    // Legacy direct-send path. Kept for unit tests with stub adapters and
+    // for environments where the accounting module is unavailable.
     const sendResult = await payments.send({
       coinId: params.asset,
       amount: params.amount,
