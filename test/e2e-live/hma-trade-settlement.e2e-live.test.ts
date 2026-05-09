@@ -127,7 +127,6 @@ import {
   type PortfolioBalance,
 } from './helpers/sphere-trader.js';
 import { createFaucetClient, type FaucetClient } from './helpers/faucet-client.js';
-import { UCT_COIN_ID, USDU_COIN_ID } from './helpers/constants.js';
 
 // ---------------------------------------------------------------------------
 // Precondition gates (mirrors hma-trade-flow's structure)
@@ -437,23 +436,12 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       timeoutMs: 180_000,
       env: s.spawnEnv,
     });
-    // Trader-side selfMint funding via TRADER_TEST_FUND. Diagnostic note
-    // (rounds 17-19, 2026-05-04): faucet-funded tokens caused Bob's
-    // deposit to fail with "Ownership verification failed: Authenticator
-    // does not match source state predicate" — tokens minted+sent by the
-    // faucet had a source-state predicate that the trader's swap-deposit
-    // signing path could not match. basic-roundtrip uses selfMintFund
-    // and settles correctly because each trader mints with its OWN key
-    // as the source-state predicate. Switching this test to selfMint
-    // isolates the predicate-mismatch issue from the rest of the
-    // HMA-orchestrated flow. TRADER_TEST_FUND is gated by
-    // TRADER_FAULT_INJECTION_ALLOWED=1 + UNICITY_NETWORK ∈ {testnet,dev}
-    // (trader/main.ts:1524). HMA's payload-env validator allows both
-    // (UNICITY_* prefix is forbidden but TRADER_* is not).
-    const fundEnv: Record<string, string> = {
-      TRADER_TEST_FUND: `${UCT_COIN_ID}:${INITIAL_FUND_AMOUNT.toString()},${USDU_COIN_ID}:${INITIAL_FUND_AMOUNT.toString()}`,
-      TRADER_FAULT_INJECTION_ALLOWED: '1',
-    };
+    // Funding is delivered separately via FAUCET_REQUEST DM (see below)
+    // — traders boot with no balance, then the test sends FAUCET_REQUEST
+    // ACP DMs to the shared faucet-agent which mints + transfers tokens.
+    // This matches production reality (faucet as token issuer) more
+    // closely than TRADER_TEST_FUND self-mint and exercises the SDK's
+    // payments.receive({finalize:true}) ingestion path.
     const alice = await hostSpawnAsync({
       cliPath: s.cliPath,
       cliHome: controller.cliHome,
@@ -461,7 +449,7 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `alice-${scenarioId}`,
       timeoutMs: 180_000,
-      env: { ...s.spawnEnv, ...fundEnv },
+      env: s.spawnEnv,
     });
     const bob = await hostSpawnAsync({
       cliPath: s.cliPath,
@@ -470,14 +458,50 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       templateId: 'trader-agent',
       instanceName: `bob-${scenarioId}`,
       timeoutMs: 180_000,
-      env: { ...s.spawnEnv, ...fundEnv },
+      env: s.spawnEnv,
     });
     s.spawned.push(escrow, alice, bob);
     console.log(
       `[${scenarioId}] up: escrow=${escrow.instanceName} ` +
-      `alice=${alice.instanceName} bob=${bob.instanceName} ` +
-      `(selfMint UCT+USDU=${INITIAL_FUND_AMOUNT})`,
+      `alice=${alice.instanceName} bob=${bob.instanceName}`,
     );
+
+    // Fund each trader via FAUCET_REQUEST — sends an ACP-0 DM to the
+    // shared faucet-agent which mints UCT+USDU and sends them to the
+    // trader. Sequential within scenario to avoid relay-side contention
+    // (the in-process FaucetClient holds a single Sphere wallet whose
+    // DM-send path serializes anyway). The faucet handles mint + send;
+    // the trader's periodic payments.receive({finalize:true}) loop
+    // ingests the inbound transfer and surfaces it in portfolio.
+    //
+    // Recipient address: use the trader's @nametag (canonical identity
+    // per project guidelines). The trader publishes its nametag binding
+    // event during Sphere.init and verifies the binding is queryable on
+    // the relay before announcing sphere_initialized — so by the time
+    // the trader is "spawned" (HMA acp.hello received), the relay has
+    // the binding. Sending to DIRECT://<pubkey> would also work IF the
+    // SDK's resolveAddressInfo could find the binding, but the binding
+    // event publishes the L3-predicate-derived directAddress (not the
+    // bare pubkey-prefixed shape), so that lookup misses. @nametag goes
+    // through queryPubkeyByNametag which is what the trader registered.
+    for (const t of [{ name: 'alice', tenant: alice }, { name: 'bob', tenant: bob }]) {
+      const recipient = t.tenant.tenantNametag !== null
+        ? `@${t.tenant.tenantNametag}`
+        : t.tenant.tenantDirectAddress;
+      console.log(`[${scenarioId}] FAUCET_REQUEST → ${t.name} (recipient=${recipient}, UCT+USDU=${INITIAL_FUND_AMOUNT})…`);
+      const deliveries = await s.faucetClient.request(s.faucet.tenantPubkey, {
+        recipient,
+        items: [
+          { asset: 'UCT', amount: INITIAL_FUND_AMOUNT.toString() },
+          { asset: 'USDU', amount: INITIAL_FUND_AMOUNT.toString() },
+        ],
+      });
+      console.log(
+        `[${scenarioId}] ${t.name} faucet deliveries: ` +
+        deliveries.map((d) => `${d.asset}=${d.amount} (transfer=${d.transfer_id.slice(0, 12)}…)`).join(', '),
+      );
+    }
+
     return { escrow, alice, bob };
   }
 
@@ -538,13 +562,13 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     const s = state;
     const { escrow, alice, bob } = await provisionTriple(scenarioId, controller);
 
-    // selfMint funding: the trader runs sphere.payments.mintFungibleToken
-    // for each TRADER_TEST_FUND entry BEFORE agent.start() (see
-    // trader/main.ts:1524). Tokens are confirmed on the L3 aggregator
-    // before the trader logs sphere_initialized, so the balance is
-    // typically present on the first GET_PORTFOLIO. Keep the polling
-    // loop anyway as a safety net for slow aggregator round-trips.
-    console.log(`[${scenarioId}] waiting for selfMint balances to confirm…`);
+    // FAUCET_REQUEST funding: the test already issued FAUCET_REQUEST DMs
+    // in provisionTriple and the faucet returned acp.result with
+    // delivery records. The trader's periodic
+    // payments.receive({finalize:true}) loop must ingest the inbound
+    // transfer before the balance surfaces in portfolio — poll until
+    // confirmed >= INITIAL_FUND_AMOUNT for both UCT and USDU.
+    console.log(`[${scenarioId}] waiting for faucet-funded balances to confirm…`);
     for (const t of [{ name: 'alice', tenant: alice }, { name: 'bob', tenant: bob }]) {
       const deadline = Date.now() + FUNDING_BALANCE_TIMEOUT_MS;
       let lastSnapshot: readonly PortfolioBalance[] = [];
@@ -708,10 +732,10 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
     ).toBe(expectedUsduPaid);
 
     // ---- 7. Withdraw from alice (now has UCT) ---------------------
-    // Alice had 0 UCT pre-trade and acquired TRADE_VOLUME via the swap.
-    // Withdraw a fraction (WITHDRAW_AMOUNT) to the controller's DIRECT
-    // address — exercises the WITHDRAW_TOKEN ACP command end-to-end
-    // including the round-6 trim+validation gate.
+    // Alice had INITIAL_FUND_AMOUNT UCT pre-trade and acquired
+    // TRADE_VOLUME via the swap. Withdraw a fraction (WITHDRAW_AMOUNT)
+    // to the controller's DIRECT address — exercises the WITHDRAW_TOKEN
+    // ACP command end-to-end including the round-6 trim+validation gate.
     console.log(`[${scenarioId}] withdraw ${WITHDRAW_AMOUNT} UCT from alice → controller…`);
     const wr = await withdrawAsync({
       cliPath: s.cliPath, cliHome: controller.cliHome, tenant: alice.tenantPubkey,
