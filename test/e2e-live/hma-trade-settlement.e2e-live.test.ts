@@ -196,7 +196,11 @@ const SCENARIO_COUNT = 2;
 
 let state: SuiteState | null = null;
 
-const SWAP_TIMEOUT_MS = 8 * 60_000; // 8 minutes; testnet settlement is 3-5 min typical
+const SWAP_TIMEOUT_MS = 3 * 60_000; // 3 minutes — bisect-friendly. On a healthy local relay
+                                    // the swap protocol completes in ~30-60s end-to-end (deposits
+                                    // verify + payouts confirm). 3 min gives 2× headroom while
+                                    // failing fast when verifyPayout's reverse-index bug strands
+                                    // the deal at COVERED-but-unverified.
 /** Per-asset funding amount delivered to each trader by the faucet. */
 const INITIAL_FUND_AMOUNT = 5000n;
 /** How long we wait for faucet-delivered tokens to surface in `confirmed` balance. */
