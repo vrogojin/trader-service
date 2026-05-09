@@ -553,10 +553,168 @@ inside `sphere-sdk` itself.
 
 ---
 
+## Round 21 (2026-05-08) — swap deps facade missing `getTokenIdsForInvoice` → `verifyPayout` permanently fail-closed
+
+**Context:** after the round-20 selfMint switch, escrow logged
+`Swap completed successfully` and the trader received the payout. But
+`swap_payout_verify_diag` retried 40 times with
+`tokenInvoiceMap is empty for this payout invoice — failing closed until
+reverse index rebuilds`. The 8-min test timeout expired; both pairs
+failed at `did not reach state="COMPLETED"`.
+
+**Investigation:** added 4 `logger.warn` probes inside
+`sphere-sdk/modules/accounting/AccountingModule.ts` to trace which path
+was populating `tokenInvoiceMap`:
+
+- `_handleTransferConfirmed` (on-chain confirmed event handler)
+- `_processInvoiceTransferEvent` synthetic-ledger branch
+- `_processInvoiceHistoryEvent` (history-update path)
+- per-token populate inside the synthetic-ledger loop
+
+Three runs showed only ONE `transfer:confirmed` line per trader (the
+deposit-send confirmation, sender side). NONE of the receive-side
+populate paths fired for the swap payout. Yet `swap_payout_verify_diag`
+showed `coveredAmount: 10` from `getInvoiceStatus`. So the invoice
+ledger HAD an entry — but `getTokenIdsForInvoice(payoutInvoiceId)`
+returned an empty Set.
+
+Added a 5th probe directly inside `verifyPayout`'s fail-closed branch
+to dump `tokenInvoiceMap` state. Result:
+
+```
+R20-DIAG verifyPayout-fail-closed swap=… (no tokenInvoiceMap accessor)
+```
+
+The optional-chain `acct.tokenInvoiceMap?.` fell through. The accessor
+did not exist on whatever object `acct` was.
+
+**Root cause:** `Sphere.ts` constructs the `accounting` dep facade for
+`SwapModule` at lines 2537-2543 and 4361-4367 as a hand-written narrow
+object exposing only 5 methods (`importInvoice`, `getInvoice`,
+`getInvoiceStatus`, `payInvoice`, `on`). `getTokenIdsForInvoice` was
+NOT on the facade. The `verifyPayout` call site used a defensive
+optional-chain type cast which silently returned `undefined` → empty
+`Set` → fail-closed forever. There was no way for the index to "rebuild"
+because the SDK was checking a method that didn't exist on the object
+the swap module had been handed at construction.
+
+**Fix:** added `getTokenIdsForInvoice` to the
+`SwapModuleDependencies.accounting` interface and wired it through both
+facade construction sites in `Sphere.ts`. Defensive `tokenInvoiceMap`
+migration also added in `importInvoice` (defense-in-depth for the
+orphan-buffer race where token-receive lands before invoice-import).
+
+**Outcome:** `hma-trade-settlement.e2e-live`'s settlement phase now
+completes end-to-end. Both pairs reach `deal COMPLETED` in ~140s, down
+from the 600s+ timeout. Pair-2 settled successfully in this round;
+Pair-1 failed only on a transient testnet Market API HTTP 502
+(unrelated to the SDK fix).
+
+---
+
+## Round 22 (2026-05-09) — `finalizeReceivedToken` error paths flipped `status='confirmed'` on un-finalized tokens → withdraw flake
+
+**Context:** with round-21's SDK fix in place, settlement reaches
+COMPLETED reliably. But the next step — withdraw of 3 UCT from alice →
+controller — FLAKED. Sometimes the withdraw succeeded with
+`transfer_id=…`; sometimes it failed with the SAME error pattern as the
+round-19 faucet-funded predicate issue:
+
+```
+Ownership verification failed: Authenticator does not match source
+state predicate.
+```
+
+**Earlier mis-diagnosis:** at first I thought the bug must be
+`payments.send`'s direct-spend path vs the invoicing path. The user
+correctly pushed back: *"We apparently using the SDK wrong. SDK itself
+supposedly have no issue."* Switched the trader's `WITHDRAW_TOKEN`
+handler to use `accounting.payInvoice` (create local invoice with
+`target=to_address`, then pay it) — same code path swap deposits use.
+Test still flaked with the same error. Confirmed by code trace that
+`accounting.payInvoice` ultimately calls `payments.send`, so the bug
+couldn't be in the entry-point choice.
+
+**Investigation:** added a probe in `payments.send`'s commitment-submit
+path to log
+`commitment.transactionData.sourceState.predicate.publicKey` vs
+`commitment.authenticator.publicKey`. The probe didn't fire on most
+runs (different code path), but careful inspection of the receive flow
+led to the right place.
+
+**Root cause:** `sphere-sdk/modules/payments/PaymentsModule.ts:5362-5388,
+5423-5431` — `finalizeReceivedToken`. Three error paths set
+`token.status = 'confirmed'` WITHOUT updating `sdkData`:
+
+1. Missing `waitForProofSdk` (line 5362-5367)
+2. Missing `stClient` / `trustBase` (line 5382-5388)
+3. Caught exception during `finalizeTransferToken` (line 5424-5430,
+   with comment *"Mark as confirmed anyway (user has the token)"*)
+
+The original intent was "user has the token, mark confirmed for UI."
+The flaw: `sdkData` was never updated, so the token kept the SENDER's
+source-state predicate. The spend queue's filter
+(`SpendQueue.ts:91 status !== 'confirmed' continue`) let these
+mislabeled tokens through. When picked, the resulting commitment built
+`sourceState.predicate` from the SENDER's stored state and
+`authenticator.publicKey` from the RECEIVER's signing service.
+`predicate.isOwner(...)` is a hex compare → false → state-transition-sdk
+threw the predicate-mismatch error.
+
+The flake explanation: alice's wallet had selfMint UCT 5000 (truly
+finalized, predicate=alice's key) AND swap-payout UCT 10 (status flipped
+to 'confirmed' by the buggy error paths even though finalization didn't
+fully complete). The spend queue's pick varied: selfMint → success;
+swap-payout → fail. Same wallet, same withdraw call, two distinct
+outcomes depending on which token the queue iterator yielded first.
+
+**Fix:** all three error paths now leave `status='submitted'`. The
+next periodic `resolveUnconfirmed()` / `receive({finalize:true})` will
+retry the finalize properly. Until then, the spend queue correctly
+skips the un-finalized token and picks a truly-finalized one.
+
+**Outcome:** `hma-trade-settlement.e2e-live` Pair-1 reaches:
+
+```
+deal COMPLETED
+withdraw transfer_id=22bc307f-d865-41c5-…
+✓ end-to-end settlement+withdraw verified
+```
+
+in 128s. **The user's stated goal — operators launch HMA → spawn → fund
+→ trade → settle → withdraw, all over Sphere DMs — is reached.**
+
+Pair-2 still fails on a separate concurrent-settlement race (deals go
+ACCEPTED → CANCELLED). That race is being investigated as a follow-up
+and is independent of the three SDK fixes landed in this session.
+
+---
+
+## Final SDK changes summary
+
+The three SDK fixes are split into three focused PRs against
+`sphere-sdk`:
+
+| Branch | Fix |
+|---|---|
+| `fix/swap-getTokenIdsForInvoice` | Wire `getTokenIdsForInvoice` through the `SwapModuleDependencies.accounting` facade in `Sphere.ts` (2 construction sites). Stops `verifyPayout` from permanently fail-closing on an empty Set returned by an absent accessor. |
+| `fix/accounting-importInvoice-token-map-migration` | Defense-in-depth: when `importInvoice` runs after the inbound transfer already landed in the orphan buffer, migrate any orphaned token entries into `tokenInvoiceMap` for the freshly-imported invoice. |
+| `fix/payments-finalize-error-status` | `finalizeReceivedToken` no longer sets `status='confirmed'` on the three error paths (missing `waitForProofSdk`, missing `stClient`/`trustBase`, caught finalize exception). Leaves `status='submitted'` so the spend queue skips and the next `resolveUnconfirmed()` retries. |
+
+The trader + CLI work that made the settlement+withdraw test usable
+ships separately:
+
+| Branch | Repo | Contents |
+|---|---|---|
+| `feat/hma-trade-settlement-live` | trader-service | `hma-trade-settlement.e2e-live.test.ts` + invoicing-based `WITHDRAW_TOKEN` handler in trader. |
+| `feat/trader-withdraw-cli` | sphere-cli | `sphere trader withdraw` subcommand exposing the WITHDRAW_TOKEN ACP message over DM. |
+
+---
+
 ## Out of scope for this debugging session
 
 - Production hardening of js-faucet (rate limiting, batched mints, etc.)
 - Pushing js-faucet image to ghcr.io/unicitynetwork (needs PAT)
 - Adding `faucet-agent` template entry to agentic-hosting/config/templates.json
 - `sphere faucet request` subcommand in sphere-cli
-- Withdraw-via-HMA live test
+- Concurrent-settlement race on Pair-2 (ACCEPTED → CANCELLED) — follow-up

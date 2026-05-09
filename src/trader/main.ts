@@ -1292,7 +1292,23 @@ export async function startTrader(): Promise<void> {
               return;
             }
 
-            registered = agent.registerSwapId(data.swapId, {
+            // R23 fix (Pair-2 race): the swap_proposal DM and np.propose_deal
+            // DM can arrive in either order. When swap_proposal arrives FIRST,
+            // the np.propose_deal handler is still running (validation →
+            // transitionDeal('ACCEPTED') → onDealAccepted → executeDeal →
+            // registerActive); `activeByDealId` is empty so the very first
+            // registerSwapId call returns false and we'd reject the swap
+            // even though we're about to accept the deal.
+            //
+            // Fix: bounded retry — registerSwapId still cross-checks
+            // counterparty pubkey, currencies, amounts, escrow address, and
+            // timeout against negotiated DealTerms, so retrying is safe; we
+            // only paper over the microsecond-scale ordering hazard. If the
+            // deal really wasn't accepted (hostile peer, stale state), we
+            // still reject after the bounded wait.
+            const REGISTER_MAX_ATTEMPTS = 40;
+            const REGISTER_BACKOFF_MS = 50;
+            const registerArgs = {
               partyACurrency: s.deal?.partyACurrency,
               partyAAmount: s.deal?.partyAAmount,
               partyBCurrency: s.deal?.partyBCurrency,
@@ -1307,13 +1323,32 @@ export async function startTrader(): Promise<void> {
               escrowPubkey: (s as unknown as { escrowPubkey?: string }).escrowPubkey,
               depositTimeoutSec: (s.deal as unknown as { timeout?: number; depositTimeoutSec?: number })?.depositTimeoutSec
                 ?? (s.deal as unknown as { timeout?: number })?.timeout,
-            });
+            };
+            for (let attempt = 0; attempt < REGISTER_MAX_ATTEMPTS; attempt++) {
+              registered = agent.registerSwapId(data.swapId, registerArgs);
+              if (registered) break;
+              if (attempt + 1 < REGISTER_MAX_ATTEMPTS) {
+                await new Promise((r) => setTimeout(r, REGISTER_BACKOFF_MS));
+              }
+            }
           } catch (err: unknown) {
             logger.warn('swap_proposal_status_fetch_failed', {
               swap_id: data.swapId,
               error: err instanceof Error ? err.message : String(err),
             });
-            registered = agent.registerSwapId(data.swapId);
+            // R23 fix (legacy fallback): same bounded retry as the
+            // status-based path above — without it, a transient
+            // getSwapStatus failure compounds the np.propose_deal /
+            // swap_proposal arrival-order race.
+            const REGISTER_MAX_ATTEMPTS = 40;
+            const REGISTER_BACKOFF_MS = 50;
+            for (let attempt = 0; attempt < REGISTER_MAX_ATTEMPTS; attempt++) {
+              registered = agent.registerSwapId(data.swapId);
+              if (registered) break;
+              if (attempt + 1 < REGISTER_MAX_ATTEMPTS) {
+                await new Promise((r) => setTimeout(r, REGISTER_BACKOFF_MS));
+              }
+            }
           }
 
           if (!registered) {
