@@ -290,6 +290,15 @@ export interface AccountingPayInvoiceParams {
   readonly targetIndex: number;
   readonly assetIndex?: number;
   readonly amount?: string;
+  /**
+   * Transfer-delivery mode. `'conservative'` collects the inclusion
+   * proof on the sender's side before delivery; the recipient gets a
+   * fully-finalized bundle and can spend it immediately. `'instant'`
+   * (default) ships an unconfirmed bundle that the recipient finalizes
+   * via background proof-poll. Use `'conservative'` for withdraw flows
+   * so the recipient's spend doesn't race the proof-poll.
+   */
+  readonly transferMode?: 'instant' | 'conservative';
 }
 
 export interface AccountingPayInvoiceResult {

@@ -244,6 +244,17 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
       const payResult = await accounting.payInvoice(invoice.invoiceId, {
         targetIndex: 0,
         amount: params.amount,
+        // Conservative mode: the SDK collects the inclusion proof on the
+        // SENDER's side before delivery, so the recipient receives a
+        // fully-finalized {sourceToken, transferTx} bundle and can produce
+        // a 'confirmed' Token immediately bound to its own predicate. This
+        // mirrors the faucet and escrow's payout flows. The default
+        // 'instant' mode ships an unconfirmed bundle whose recipient-side
+        // proof-poll races with any chained spend (e.g. another withdraw or
+        // a swap deposit) and intermittently surfaces "Authenticator does
+        // not match source state predicate" errors when the spend queue
+        // picks a not-yet-finalized token.
+        transferMode: 'conservative',
       });
       if (payResult.error !== undefined && payResult.error !== '') {
         logger.warn('withdraw_pay_invoice_returned_error', {
