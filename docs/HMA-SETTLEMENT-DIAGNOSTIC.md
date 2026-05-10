@@ -718,3 +718,87 @@ ships separately:
 - Adding `faucet-agent` template entry to agentic-hosting/config/templates.json
 - `sphere faucet request` subcommand in sphere-cli
 - Concurrent-settlement race on Pair-2 (ACCEPTED → CANCELLED) — follow-up
+
+---
+
+## Round 23 — RESOLUTION (2026-05-10)
+
+### TL;DR
+
+**Both Pair-1 and Pair-2 ✓ PASS end-to-end** in the latest live e2e
+run after baking `transferMode: 'conservative'` into the trader's
+withdraw path. The intermittent **"Authenticator does not match
+source state predicate"** error is gone.
+
+```
+✓ test/e2e-live/hma-trade-settlement.e2e-live.test.ts (2 tests) 169s
+  ✓ Pair-1: full spawn → trade → settle → withdraw via HMA (rate=1)  153456ms
+  ✓ Pair-2: parallel scenario settles on the same HMA at distinct rate (rate=3)  154783ms
+
+[p1-d54068] withdraw transfer_id=5a151db3-ce88-41…   ✓ end-to-end settlement+withdraw verified
+[p2-a64a0b] withdraw transfer_id=67eb1c73-2645-46…   ✓ end-to-end settlement+withdraw verified
+```
+
+### Root cause (final)
+
+The trader's invoiced withdraw was the **only** forwarding flow in the
+chain still using the default `transferMode: 'instant'`. Faucet and
+escrow already used `'conservative'` on their direct `payments.send`
+paths.
+
+Under `'instant'` mode, `PaymentsModule.send` ships a V6
+combined-transfer bundle whose recipient saves the token at
+`status='submitted'` with the **sender's** `sdkData` and finalizes via
+background proof-poll. If the trader's spend queue (or, for withdraw,
+the controller's spend queue) picks a not-yet-finalized incoming token
+— such as a swap-payout that arrived seconds earlier — it produces:
+
+> Authenticator does not match source state predicate
+
+because the recipient-side `Token` isn't yet bound to the recipient's
+predicate.
+
+`'conservative'` mode collects the inclusion proof on the **sender's**
+side before delivery, so the recipient receives a fully-finalized
+`{sourceToken, transferTx}` bundle and produces a `'confirmed'` Token
+immediately bound to its own predicate. Chained spends are then
+race-free.
+
+### Fix
+
+A single new field on `PayInvoiceParams` plus three call-site
+opt-ins:
+
+| Repo | Branch / Commit | Change |
+|---|---|---|
+| sphere-sdk | `feat/accounting-payinvoice-transfermode` (#131) | Add `transferMode?: 'instant' \| 'conservative'` to `PayInvoiceParams`; forward to `PaymentsModule.send`. Default unchanged. |
+| trader-service | `feat/hma-trade-settlement-live` (`de9f0b7`) | Withdraw path uses `transferMode: 'conservative'` through `accounting.payInvoice`. |
+| escrow-service | `fix/conservative-payout-mode` (#18) | Swap-payout `payments.send` uses `'conservative'`. |
+| js-faucet | `fix/faucet-funded-predicate` (#2) | `FAUCET_REQUEST` sends use `'conservative'`. |
+
+### Why earlier rounds appeared to fix it sometimes
+
+Previous Pair-2 success was misleading — when the trader image was
+rebuilt during Round 22, Pair-2 happened to win the
+finalization-vs-spend race purely on timing. The conservative-mode
+opt-in eliminates the race architecturally rather than narrowing the
+window.
+
+### Side fixes that landed alongside
+
+- `feat/market-tolerance` (#132): retry + circuit breaker for transient
+  Market API 502/503/504/408 errors, so a single load-balancer hiccup
+  no longer kills an in-progress e2e run.
+- `feat/hma-trade-settlement-live` (`38be0b5`): bounded retry in
+  `swap:proposal_received` to handle the two-DM arrival-order race
+  that caused Pair-2 deals to flake ACCEPTED→CANCELLED.
+
+### Verification command
+
+```bash
+cd /home/vrogojin/trader-service
+TRADER_E2E_LOCAL_RELAY=1 \
+  npx vitest run --config vitest.e2e-live.config.ts \
+                 test/e2e-live/hma-trade-settlement.e2e-live.test.ts
+```
+
