@@ -56,8 +56,29 @@ export const USDU_COIN_ID = '8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290
 /** Default trader image (matches templates.json shortcut). */
 export const TRADER_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/trader:v0.2';
 
-/** Default escrow image. */
-export const ESCROW_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.1';
+/**
+ * Default escrow image.
+ *
+ * Bumped 2026-05-16 from v0.1 (2026-04-25, predates UXF protocol +
+ * the deliverDepositInvoice asymmetric-delivery fix surfaced in
+ * round 19 of the HMA settlement diagnostic) to v0.2 (2026-05-16,
+ * published from escrow-service@d427e5d + uxf sphere-sdk@3a575cd —
+ * integration/all-fixes HEAD). Digest:
+ *
+ *   sha256:311903b6f98b33a63791bf79db6522a66d118588ba56fcf6e56654ed6670ebac
+ *
+ * What v0.2 adds vs v0.1:
+ *   - Conservative transferMode for swap payouts (fix/conservative-
+ *     payout-mode HEAD)
+ *   - UNICITY_NOSTR_RELAYS env override (matches the local-infra
+ *     plumbing this harness already uses)
+ *   - deliverDepositInvoice instrumentation + per-party try/catch
+ *     (round-19 evidence confirms the asymmetric bug is GONE in
+ *     current source vs the v0.1 deployed image)
+ *   - sphere-sdk UXF protocol PRs (#105, #115, #119, #128,
+ *     #146/147/149/152) + all payments/* faucet-flow regression fixes
+ */
+export const ESCROW_IMAGE = 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.2';
 
 /** Per-test default timeout (slow because real-network). */
 export const DEFAULT_TIMEOUT_MS = 30_000;
