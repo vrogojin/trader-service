@@ -127,6 +127,7 @@ import {
   type PortfolioBalance,
 } from './helpers/sphere-trader.js';
 import { createFaucetClient, type FaucetClient } from './helpers/faucet-client.js';
+import { ESCROW_IMAGE } from './helpers/constants.js';
 
 // ---------------------------------------------------------------------------
 // Precondition gates (mirrors hma-trade-flow's structure)
@@ -270,14 +271,27 @@ describe.skipIf(skip).concurrent('HMA-orchestrated trade settlement (live testne
       if (t.template_id === 'trader-agent') {
         t.image = 'ghcr.io/vrogojin/agentic-hosting/trader:local';
       }
-      // The published escrow:v0.1 has an asymmetric bug in
-      // deliverDepositInvoice — the second recipient's invoice_delivery
-      // DM is never put on the wire, so swaps stall at "ACCEPTED" with
-      // the trader polling for an invoice that the escrow never sent
-      // (diag agent traced this 2026-05-05; see HMA-SETTLEMENT-DIAGNOSTIC.md).
-      // Build escrow:local from current source and use it here.
+      // Use the same v0.2 image pin as the rest of the e2e-live suite
+      // (constants.ts ESCROW_IMAGE) so the HMA-spawned escrow runs the
+      // same code as the direct-Docker-spawned escrow in basic-roundtrip.
+      //
+      // Why this override exists at all: agentic-hosting's
+      // config/templates.json still pins escrow:v0.1 (its own release
+      // cadence is independent). Until that templates.json bumps, we
+      // override here so HMA-spawned escrows pick up v0.2's
+      // deliverDepositInvoice fix + conservative-payout + UXF protocol
+      // (PR #105, #115, #119, #128, #146/147/149/152).
+      //
+      // History: previously this overrode to `escrow:local` because the
+      // published v0.1 had an asymmetric deliverDepositInvoice bug
+      // (every other party's invoice_delivery DM was dropped) — see
+      // HMA-SETTLEMENT-DIAGNOSTIC.md rounds 11-19. Round 19 evidence
+      // confirmed the bug is GONE in current source (= what we shipped
+      // as v0.2 on 2026-05-16). The `escrow:local` build dependency
+      // is now removed — devs/CI no longer need to docker-build the
+      // escrow image before running this test.
       if (t.template_id === 'escrow-service') {
-        t.image = 'ghcr.io/vrogojin/agentic-hosting/escrow:local';
+        t.image = ESCROW_IMAGE;
       }
     }
     if (!baseTemplates.templates.some((t) => t.template_id === 'faucet-agent')) {
