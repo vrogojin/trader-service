@@ -261,6 +261,65 @@ export interface PaymentsAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// AccountingAdapter — narrow abstraction over Sphere SDK AccountingModule
+// ---------------------------------------------------------------------------
+
+/**
+ * Subset of `accounting.createInvoice` request needed by the trader's
+ * invoice-based withdraw path. Mirrors the SDK's CreateInvoiceRequest
+ * but stays narrow so tests can inject a recording stub.
+ */
+export interface AccountingInvoiceTarget {
+  readonly address: string;
+  /** Each entry's `coin` is `[coinIdHex, amountStr]`. */
+  readonly assets: ReadonlyArray<{ readonly coin: readonly [string, string] }>;
+}
+
+export interface AccountingCreateInvoiceRequest {
+  readonly targets: readonly AccountingInvoiceTarget[];
+  readonly memo?: string;
+}
+
+export interface AccountingCreateInvoiceResult {
+  readonly success: boolean;
+  readonly invoiceId?: string;
+  readonly error?: string;
+}
+
+export interface AccountingPayInvoiceParams {
+  readonly targetIndex: number;
+  readonly assetIndex?: number;
+  readonly amount?: string;
+  /**
+   * Transfer-delivery mode. `'conservative'` collects the inclusion
+   * proof on the sender's side before delivery; the recipient gets a
+   * fully-finalized bundle and can spend it immediately. `'instant'`
+   * (default) ships an unconfirmed bundle that the recipient finalizes
+   * via background proof-poll. Use `'conservative'` for withdraw flows
+   * so the recipient's spend doesn't race the proof-poll.
+   */
+  readonly transferMode?: 'instant' | 'conservative';
+}
+
+export interface AccountingPayInvoiceResult {
+  readonly id: string;
+  readonly status: string;
+  readonly error?: string;
+}
+
+/**
+ * Narrow facade over `sphere.accounting`. Used by the trader's withdraw
+ * flow to route value via the invoicing system (create invoice locally
+ * → pay it via payInvoice) instead of `payments.send` directly. The
+ * invoicing path is the same one swap deposits use, so it inherits the
+ * SDK's well-tested predicate-handling for invoice-target predicates.
+ */
+export interface AccountingAdapter {
+  createInvoice(request: AccountingCreateInvoiceRequest): Promise<AccountingCreateInvoiceResult>;
+  payInvoice(invoiceId: string, params: AccountingPayInvoiceParams): Promise<AccountingPayInvoiceResult>;
+}
+
+// ---------------------------------------------------------------------------
 // MarketAdapter — narrow abstraction over Sphere SDK MarketModule
 // ---------------------------------------------------------------------------
 

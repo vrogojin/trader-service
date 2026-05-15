@@ -247,6 +247,21 @@ export async function startTrader(): Promise<void> {
   const trustbasePath = join(config.data_dir, 'trustbase.json');
   writeFileSync(trustbasePath, await tbResponse.text());
 
+  // Optional Nostr-relay override. Set `UNICITY_NOSTR_RELAYS` (or
+  // `SPHERE_NOSTR_RELAYS` as a fallback) to a comma-separated list of
+  // WebSocket URLs to replace the network preset's relays — used by the
+  // local-infra e2e harness to point at a Docker-hosted relay when the
+  // public testnet relay's write path is degraded. Empty/unset → default.
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
+  if (relayOverride) {
+    logger.info('nostr_relays_override_active', { relays: relayOverride });
+  }
+
   // Initialize Sphere wallet with market, swap, and accounting modules
   logger.info('initializing_sphere', { network: config.network, data_dir: config.data_dir });
   const providers = createNodeProviders({
@@ -257,6 +272,7 @@ export async function startTrader(): Promise<void> {
       trustBasePath: trustbasePath,
       apiKey: resolveApiKey(),
     },
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
 
   // 2026-04-30 FIX (basic-roundtrip flake investigation): expand the
@@ -1020,6 +1036,43 @@ export async function startTrader(): Promise<void> {
     market,
     swap,
     comms: { sendDm: sender.sendDm.bind(sender) },
+    // Invoice-based withdraw path. When the SDK's accounting module is
+    // available, expose a narrow facade so the trader's WITHDRAW_TOKEN
+    // handler can use createInvoice + payInvoice instead of payments.send
+    // directly. Mirrors the swap-deposit flow and avoids the "Authenticator
+    // does not match source state predicate" flake on spends of received
+    // swap-payout tokens.
+    ...(sphere.accounting
+      ? {
+          accounting: {
+            createInvoice: async (req: import('./types.js').AccountingCreateInvoiceRequest) => {
+              const result = await sphere.accounting!.createInvoice({
+                targets: req.targets.map((t) => ({
+                  address: t.address,
+                  assets: t.assets.map((a) => ({ coin: a.coin as [string, string] })),
+                })),
+                ...(req.memo !== undefined ? { memo: req.memo } : {}),
+              });
+              return {
+                success: result.success,
+                ...(result.invoiceId !== undefined ? { invoiceId: result.invoiceId } : {}),
+                ...(result.error !== undefined ? { error: result.error } : {}),
+              };
+            },
+            payInvoice: async (
+              invoiceId: string,
+              params: import('./types.js').AccountingPayInvoiceParams,
+            ) => {
+              const result = await sphere.accounting!.payInvoice(invoiceId, params);
+              return {
+                id: result.id,
+                status: String(result.status),
+                ...(result.error !== undefined ? { error: result.error } : {}),
+              };
+            },
+          },
+        }
+      : {}),
     // subscribeEvent is retained for interface compatibility but swap events
     // are ALL handled by direct sphere.on() listeners below (lines 418+).
     // This bridge is only needed for non-swap events in the future.
@@ -1239,7 +1292,23 @@ export async function startTrader(): Promise<void> {
               return;
             }
 
-            registered = agent.registerSwapId(data.swapId, {
+            // R23 fix (Pair-2 race): the swap_proposal DM and np.propose_deal
+            // DM can arrive in either order. When swap_proposal arrives FIRST,
+            // the np.propose_deal handler is still running (validation →
+            // transitionDeal('ACCEPTED') → onDealAccepted → executeDeal →
+            // registerActive); `activeByDealId` is empty so the very first
+            // registerSwapId call returns false and we'd reject the swap
+            // even though we're about to accept the deal.
+            //
+            // Fix: bounded retry — registerSwapId still cross-checks
+            // counterparty pubkey, currencies, amounts, escrow address, and
+            // timeout against negotiated DealTerms, so retrying is safe; we
+            // only paper over the microsecond-scale ordering hazard. If the
+            // deal really wasn't accepted (hostile peer, stale state), we
+            // still reject after the bounded wait.
+            const REGISTER_MAX_ATTEMPTS = 40;
+            const REGISTER_BACKOFF_MS = 50;
+            const registerArgs = {
               partyACurrency: s.deal?.partyACurrency,
               partyAAmount: s.deal?.partyAAmount,
               partyBCurrency: s.deal?.partyBCurrency,
@@ -1254,13 +1323,32 @@ export async function startTrader(): Promise<void> {
               escrowPubkey: (s as unknown as { escrowPubkey?: string }).escrowPubkey,
               depositTimeoutSec: (s.deal as unknown as { timeout?: number; depositTimeoutSec?: number })?.depositTimeoutSec
                 ?? (s.deal as unknown as { timeout?: number })?.timeout,
-            });
+            };
+            for (let attempt = 0; attempt < REGISTER_MAX_ATTEMPTS; attempt++) {
+              registered = agent.registerSwapId(data.swapId, registerArgs);
+              if (registered) break;
+              if (attempt + 1 < REGISTER_MAX_ATTEMPTS) {
+                await new Promise((r) => setTimeout(r, REGISTER_BACKOFF_MS));
+              }
+            }
           } catch (err: unknown) {
             logger.warn('swap_proposal_status_fetch_failed', {
               swap_id: data.swapId,
               error: err instanceof Error ? err.message : String(err),
             });
-            registered = agent.registerSwapId(data.swapId);
+            // R23 fix (legacy fallback): same bounded retry as the
+            // status-based path above — without it, a transient
+            // getSwapStatus failure compounds the np.propose_deal /
+            // swap_proposal arrival-order race.
+            const REGISTER_MAX_ATTEMPTS = 40;
+            const REGISTER_BACKOFF_MS = 50;
+            for (let attempt = 0; attempt < REGISTER_MAX_ATTEMPTS; attempt++) {
+              registered = agent.registerSwapId(data.swapId);
+              if (registered) break;
+              if (attempt + 1 < REGISTER_MAX_ATTEMPTS) {
+                await new Promise((r) => setTimeout(r, REGISTER_BACKOFF_MS));
+              }
+            }
           }
 
           if (!registered) {
