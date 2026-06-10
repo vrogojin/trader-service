@@ -24,8 +24,14 @@ jobs:
           path: trader-service
 
       - name: Clone sphere-sdk sibling
+        # Pinned to sphere-sdk main tip 550114c (2026-06-10) — includes
+        # the four rotations agentic_hosting#26 requires the v0.2 trader
+        # image to pick up: sphere-sdk#456 PR #468 (DEFAULT_ESCROW_ADDRESS
+        # = @escrow-test-02), #457 PR #459 (SwapModule fail-fast on missing
+        # counterparty transport pubkey), #464 PR #465 (MuxAdapter dispatch
+        # awaits async handler), #447 PR #461 (terminal swap visibility).
         env:
-          SPHERE_SDK_SHA: 44b4705352c1582575eeeafbc46dddc8d95e8995
+          SPHERE_SDK_SHA: 550114c75e0b47151488d0c5d656475fd5a5077b
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git sphere-sdk
           git -C sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
