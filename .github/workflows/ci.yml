@@ -45,12 +45,13 @@ jobs:
           cache: npm
 
       - name: Clone sphere-sdk sibling
-        # Pinned to feat/swap-module-spec tip (44b4705) — that branch carries
-        # the swap / market / accounting module exports the trader requires.
-        # Mirrors the escrow-service and agentic-hosting CI pins so all three
-        # repos build against the same SHA.
+        # Pinned to sphere-sdk main tip 550114c (2026-06-10) — bumps from
+        # the prior 44b4705 (feat/swap-module-spec tip) so CI builds the
+        # same SHA as the docker-publish workflow. Picks up #456/#457/#464
+        # /#447 rotations needed for agentic_hosting#26 (trader:v0.2 image
+        # rebuild). Keep the docker-publish.yml pin aligned on every bump.
         env:
-          SPHERE_SDK_SHA: 44b4705352c1582575eeeafbc46dddc8d95e8995
+          SPHERE_SDK_SHA: 550114c75e0b47151488d0c5d656475fd5a5077b
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../sphere-sdk
           git -C ../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
