@@ -57,7 +57,20 @@ COPY --from=build /build/sphere-sdk/ ./sphere-sdk/
 # Rewrite the file: dependency to the local copy in the image (the original
 # `file:../sphere-sdk` would point outside the container). Then install only
 # production deps.
+#
+# `npm pkg set version=…` defensively normalises sphere-sdk's own
+# version field before the file: install resolves it. Upstream sphere-sdk
+# main currently carries `"version": "0.0.a1"` (commit b8b526d) — `a1`
+# isn't a valid semver prerelease tag, so the strict-resolve mode of
+# `npm install` (as opposed to `npm ci` in the build stage) fails with
+# `Invalid Version: 0.0.a1`. We pin to `0.0.0-dev` here — a valid
+# prerelease tag — without modifying the SDK source. The version on a
+# file: dep is informational only (npm resolves by path, not by version
+# constraint), so this rewrite has zero functional effect beyond letting
+# the install proceed. Robust against any future invalid-semver drift
+# upstream.
 RUN sed -i 's|"file:../sphere-sdk"|"file:./sphere-sdk"|' package.json \
+ && npm pkg set version=0.0.0-dev --prefix sphere-sdk \
  && npm install --omit=dev --ignore-scripts
 
 # Standard host-manager-injected directory layout. Mounted at runtime by the
