@@ -268,7 +268,16 @@ export interface MarketPostRequest {
   readonly description: string;
   readonly intentType: 'buy' | 'sell';
   readonly category: string;
-  readonly price: number;
+  /**
+   * Price as a decimal-string bigint in the quote currency's smallest
+   * units. Same convention as token amounts in sphere-sdk (TXF amount
+   * fields, transfer payloads): internally bigint, over the wire
+   * decimal-string. Avoids JavaScript's `Number` precision loss for
+   * values above 2^53 (an 18-decimal coin hits that ceiling around
+   * 0.09 in human units). See sphere-sdk PR #483 for the SDK-side
+   * type that aligns with this.
+   */
+  readonly price: string;
   readonly currency: string;
   readonly contactHandle: string;
   readonly expiresInDays: number;
@@ -282,8 +291,10 @@ export interface MarketSearchOptions {
 export interface MarketSearchFilters {
   readonly intentType?: 'buy' | 'sell';
   readonly category?: string;
-  readonly minPrice?: number;
-  readonly maxPrice?: number;
+  /** Decimal-string bigint — see {@link MarketPostRequest.price}. */
+  readonly minPrice?: string;
+  /** Decimal-string bigint — see {@link MarketPostRequest.price}. */
+  readonly maxPrice?: string;
   readonly minScore?: number;
 }
 
@@ -295,7 +306,8 @@ export interface MarketSearchResult {
   readonly description: string;
   readonly intentType: 'buy' | 'sell';
   readonly category?: string;
-  readonly price?: number;
+  /** Decimal-string bigint — see {@link MarketPostRequest.price}. */
+  readonly price?: string;
   readonly currency: string;
   readonly contactHandle?: string;
   readonly createdAt: string;
