@@ -249,10 +249,12 @@ describe('E2E: Trader Intent Lifecycle (T1 + T10)', () => {
       expect(postCall.category).toBe('ALPHA/USDC');
       expect(postCall.currency).toBe('USDC');
       expect(postCall.contactHandle).toBe(AGENT_ADDRESS);
-      // Midpoint of 450-500 = 475, serialized as decimal-string bigint
-      // per sphere-sdk PostIntentRequest.price convention (no Number
-      // cast — see trader/intent-engine.ts comment block).
-      expect(postCall.price).toBe('475');
+      // No structured `price` field — the trader leans on the
+      // semantic-search engine in the deployed market-api. The
+      // description (asserted below) already carries the rate band
+      // in TIP-0 form, so a structured price hint would be redundant
+      // (and trips the server). See intent-engine.ts comment block.
+      expect(postCall.price).toBeUndefined();
       // Description must match canonical format
       expect(postCall.description).toContain('Selling 100-1000 ALPHA for USDC');
       expect(postCall.description).toContain('Rate: 450-500 USDC per ALPHA');

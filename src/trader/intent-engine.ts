@@ -891,18 +891,23 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       intents.set(intentId, draftRecord);
 
       // Transition DRAFT → ACTIVE (validates transition)
-      // Build description for market posting
+      // Build description for market posting.
+      //
+      // The market-api is a semantic-search database: counterparties
+      // discover us by matching the description. We do NOT send a
+      // structured `price` field — the description embeds all the
+      // structured rate/volume info already (encodeDescription is the
+      // canonical TIP-0 form, parseDescription extracts the fields on
+      // the receiving side). Sending price separately is redundant AND
+      // hits an unhandled exception in the deployed market-api server
+      // (HTTP 500 with HTML body) — sphere-sdk#475 §6 surfaced this.
+      //
+      // category + currency are still sent because they're useful
+      // semantic tags for the search index (and the server accepts
+      // strings there without issue). The `price` field stays
+      // OPTIONAL in PostIntentRequest for callers with a separate
+      // numeric pricing flow — the trader doesn't.
       const description = encodeDescription(tradingIntent);
-      // Bigint midpoint of the rate band, serialized to a decimal
-      // string for the wire. NEVER cast to Number — for a typical
-      // 18-decimal quote asset, the midpoint of a 0.08–0.12 band is
-      // 1e17 which is past Number.MAX_SAFE_INTEGER (≈9e15). Coercing
-      // loses precision, the market-api server rejects with HTTP 500,
-      // and the trader logs only an opaque status code. The SDK's
-      // PostIntentRequest.price field is `string` for exactly this
-      // reason (see sphere-sdk PR #483); pass `.toString()` through
-      // and the JSON serialization is correct end-to-end.
-      const midpointRate = (rateMin + rateMax) / 2n;
       const expiresInDays = Math.max(
         1,
         Math.ceil((expiryMs - nowMs()) / 86_400_000),
@@ -914,7 +919,6 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
           description,
           intentType: params.direction,
           category: `${params.base_asset}/${params.quote_asset}`,
-          price: midpointRate.toString(),
           currency: params.quote_asset,
           // Prefer @nametag for contactHandle — it resolves faster than DIRECT://
           // which requires a binding event lookup that may not have propagated yet.
