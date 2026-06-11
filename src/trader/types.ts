@@ -269,15 +269,15 @@ export interface MarketPostRequest {
   readonly intentType: 'buy' | 'sell';
   readonly category: string;
   /**
-   * Price as a decimal-string bigint in the quote currency's smallest
-   * units. Same convention as token amounts in sphere-sdk (TXF amount
-   * fields, transfer payloads): internally bigint, over the wire
-   * decimal-string. Avoids JavaScript's `Number` precision loss for
-   * values above 2^53 (an 18-decimal coin hits that ceiling around
-   * 0.09 in human units). See sphere-sdk PR #483 for the SDK-side
-   * type that aligns with this.
+   * Optional structured price hint (decimal-string bigint in the
+   * quote currency's smallest units). The trader does NOT set this —
+   * the market-api is a semantic-search database, so we let the
+   * description (which encodes the full rate band per TIP-0) be the
+   * source of truth. `price` stays in the shape for callers that have
+   * a single-point pricing use case, but emitting it from the trader
+   * is both redundant and trips the deployed market-api server.
    */
-  readonly price: string;
+  readonly price?: string;
   readonly currency: string;
   readonly contactHandle: string;
   readonly expiresInDays: number;
