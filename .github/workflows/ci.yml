@@ -51,7 +51,7 @@ jobs:
         # /#447 rotations needed for agentic_hosting#26 (trader:v0.2 image
         # rebuild). Keep the docker-publish.yml pin aligned on every bump.
         env:
-          SPHERE_SDK_SHA: 550114c75e0b47151488d0c5d656475fd5a5077b
+          SPHERE_SDK_SHA: b2fd028fdf8dc86a598e7bf34c069dce50442b59
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../sphere-sdk
           git -C ../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
