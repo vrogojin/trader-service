@@ -69,11 +69,24 @@ export interface TradingIntent {
   readonly direction: 'buy' | 'sell';
   readonly base_asset: string;
   readonly quote_asset: string;
-  readonly rate_min: bigint;
-  readonly rate_max: bigint;
-  readonly volume_min: bigint;
-  readonly volume_max: bigint;
-  readonly volume_filled: bigint;
+  /**
+   * Trading rate as a decimal string in QUOTE per BASE (whole units —
+   * no smallest-unit conversion). Per project convention: bigints are
+   * for token amounts at the transfer/storage layer; rates are
+   * dimensionless ratios and stay as plain decimal strings. The trader
+   * passes these straight through to encodeDescription/buildSearchQuery,
+   * and the semantic-search engine handles them as human-readable text.
+   */
+  readonly rate_min: string;
+  readonly rate_max: string;
+  /**
+   * Trading volume as a decimal string in BASE whole units. Smallest-
+   * unit conversion (for actual SDK token transfers) happens at swap
+   * settlement time via the SDK's TokenRegistry.
+   */
+  readonly volume_min: string;
+  readonly volume_max: string;
+  readonly volume_filled: string;
   readonly escrow_address: string;
   readonly deposit_timeout_sec: number;
   readonly expiry_ms: number;
@@ -105,8 +118,10 @@ export interface DealTerms {
   readonly acceptor_address: string;
   readonly base_asset: string;
   readonly quote_asset: string;
-  readonly rate: bigint;
-  readonly volume: bigint;
+  /** Agreed rate as a decimal string (quote per base whole units). */
+  readonly rate: string;
+  /** Agreed volume as a decimal string (base whole units). */
+  readonly volume: string;
   readonly proposer_direction: 'buy' | 'sell';
   readonly escrow_address: string;
   readonly deposit_timeout_sec: number;
@@ -246,6 +261,13 @@ export interface PaymentsAdapter {
   getConfirmedBalance(coinId: string): bigint;
   /** Get all asset balances (no filter). */
   getAllBalances(): SdkAssetBalance[];
+  /**
+   * Decimals for a given coin (smallest-unit ↔ whole-unit conversion
+   * factor). Backed by sphere-sdk's TokenRegistry.getTokenDecimals().
+   * Returns 18 as a sensible default when the registry has no entry
+   * (matches the default for un-curated test coins on testnet).
+   */
+  getDecimals(coinId: string): number;
   /** Trigger a receive to fetch pending Nostr transfers. */
   refresh(): Promise<void>;
   /**

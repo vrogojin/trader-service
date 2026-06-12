@@ -106,10 +106,10 @@ function buildSearchResult(opts: {
   direction: 'buy' | 'sell';
   baseAsset: string;
   quoteAsset: string;
-  rateMin: bigint;
-  rateMax: bigint;
-  volumeMin: bigint;
-  volumeMax: bigint;
+  rateMin: string;
+  rateMax: string;
+  volumeMin: string;
+  volumeMax: string;
   escrowAddress?: string;
   depositTimeoutSec?: number;
   expiresAt?: string;
@@ -132,7 +132,7 @@ function buildSearchResult(opts: {
     rate_max: opts.rateMax,
     volume_min: opts.volumeMin,
     volume_max: opts.volumeMax,
-    volume_filled: 0n,
+    volume_filled: '0',
     escrow_address: escrow,
     deposit_timeout_sec: timeout,
     expiry_ms: expiryMs,
@@ -238,10 +238,10 @@ describe('T2 — Intent Matching', () => {
       direction: 'buy',
       baseAsset: 'ALPHA',
       quoteAsset: 'USDC',
-      rateMin: 460n,
-      rateMax: 490n,
-      volumeMin: 200n,
-      volumeMax: 800n,
+      rateMin: '460',
+      rateMax: '490',
+      volumeMin: '200',
+      volumeMax: '800',
     });
     ctx.market.setSearchResults([counterpartyResult]);
 
@@ -284,10 +284,10 @@ describe('T2 — Intent Matching', () => {
       direction: 'sell',
       baseAsset: 'ALPHA',
       quoteAsset: 'USDC',
-      rateMin: 450n,
-      rateMax: 550n,
-      volumeMin: 100n,
-      volumeMax: 800n,
+      rateMin: '450',
+      rateMax: '550',
+      volumeMin: '100',
+      volumeMax: '800',
     });
     ctx.market.setSearchResults([counterpartyResult]);
 
@@ -302,12 +302,12 @@ describe('T2 — Intent Matching', () => {
     // calculation happens in the negotiation layer; the engine delegates.
     // The overlap_min = max(400, 450) = 450, overlap_max = min(500, 550) = 500.
     // We verify the match was detected (overlap exists).
-    expect(match.own.intent.rate_min).toBe(400n);
-    expect(match.own.intent.rate_max).toBe(500n);
+    expect(match.own.intent.rate_min).toBe('400');
+    expect(match.own.intent.rate_max).toBe('500');
 
     // Verify midpoint calculation from the own intent (as done in trader-main onMatchFound)
-    const midRate = (intent.intent.rate_min + intent.intent.rate_max) / 2n;
-    expect(midRate).toBe(450n); // floor((400 + 500) / 2)
+    const midRate = String((Number(intent.intent.rate_min) + Number(intent.intent.rate_max)) / 2);
+    expect(midRate).toBe('450'); // floor((400 + 500) / 2)
 
     ctx.engine.stop();
   });
@@ -326,10 +326,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'sell',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 450n,
-        rateMax: 500n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '450',
+        rateMax: '500',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -357,10 +357,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 150n,
-        volumeMax: 50n, // max volume from counterparty < own volume_min(200)
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '150',
+        volumeMax: '50', // max volume from counterparty < own volume_min(200)
       }),
     ]);
 
@@ -386,10 +386,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -416,10 +416,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -443,10 +443,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -490,10 +490,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -517,10 +517,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
         expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
         expiryMs: Date.now() - 3_600_000,
       }),
@@ -547,10 +547,10 @@ describe('T2 — Intent Matching', () => {
         direction: 'sell',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -737,10 +737,10 @@ describe('T14 — Edge Cases', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 300n,
-        rateMax: 400n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '300',
+        rateMax: '400',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -764,10 +764,10 @@ describe('T14 — Edge Cases', () => {
         direction: 'buy',
         baseAsset: 'BTC_L2',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -791,10 +791,10 @@ describe('T14 — Edge Cases', () => {
         direction: 'sell',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 
@@ -824,10 +824,10 @@ describe('T14 — Edge Cases', () => {
         direction: 'buy',
         baseAsset: 'ALPHA',
         quoteAsset: 'USDC',
-        rateMin: 460n,
-        rateMax: 490n,
-        volumeMin: 100n,
-        volumeMax: 800n,
+        rateMin: '460',
+        rateMax: '490',
+        volumeMin: '100',
+        volumeMax: '800',
       }),
     ]);
 

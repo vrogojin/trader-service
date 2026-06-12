@@ -147,11 +147,11 @@ function makeAliceIntent(): IntentRecord {
     direction: 'sell',
     base_asset: 'ALPHA',
     quote_asset: 'USDC',
-    rate_min: 400n,
-    rate_max: 500n,
-    volume_min: 100n,
-    volume_max: 1000n,
-    volume_filled: 0n,
+    rate_min: '400',
+    rate_max: '500',
+    volume_min: '100',
+    volume_max: '1000',
+    volume_filled: '0',
     escrow_address: 'escrow-address-001',
     deposit_timeout_sec: 120,
     expiry_ms: Date.now() + 86_400_000,
@@ -213,8 +213,8 @@ function computeDealId(terms: {
   proposer_intent_id: string;
   proposer_pubkey: string;
   quote_asset: string;
-  rate: bigint;
-  volume: bigint;
+  rate: string;
+  volume: string;
 }): string {
   const obj = {
     acceptor_intent_id: terms.acceptor_intent_id,
@@ -260,8 +260,8 @@ describe('NP-0 Negotiation E2E', () => {
       const dealRecord = await ctx.alice.proposeDeal(
         aliceIntent,
         bobCounterparty,
-        475n,
-        300n,
+        '475',
+        '300',
         'escrow-address-001',
       );
 
@@ -321,7 +321,7 @@ describe('NP-0 Negotiation E2E', () => {
       const aliceIntent = makeAliceIntent();
       const bobCounterparty = makeBobCounterparty();
 
-      const deal = await alice.proposeDeal(aliceIntent, bobCounterparty, 475n, 300n, 'escrow-001');
+      const deal = await alice.proposeDeal(aliceIntent, bobCounterparty, '475', '300', 'escrow-001');
       expect(deal.state).toBe('PROPOSED');
 
       // Parse the sent proposal to get deal_id and msg_id
@@ -359,7 +359,7 @@ describe('NP-0 Negotiation E2E', () => {
       const aliceIntent = makeAliceIntent();
       const bobCounterparty = makeBobCounterparty();
 
-      const deal = await ctx.alice.proposeDeal(aliceIntent, bobCounterparty, 475n, 300n, 'escrow-001');
+      const deal = await ctx.alice.proposeDeal(aliceIntent, bobCounterparty, '475', '300', 'escrow-001');
 
       // Independently compute the expected deal_id
       const expectedId = computeDealId({
@@ -377,8 +377,8 @@ describe('NP-0 Negotiation E2E', () => {
         proposer_intent_id: aliceIntent.intent.market_intent_id,
         proposer_pubkey: PK_ALICE,
         quote_asset: aliceIntent.intent.quote_asset,
-        rate: 475n,
-        volume: 300n,
+        rate: '475',
+        volume: '300',
       });
 
       expect(deal.terms.deal_id).toBe(expectedId);
@@ -413,7 +413,7 @@ describe('NP-0 Negotiation E2E', () => {
         });
 
         const deal = await alice.proposeDeal(
-          makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+          makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
         );
         expect(deal.state).toBe('PROPOSED');
 
@@ -439,7 +439,7 @@ describe('NP-0 Negotiation E2E', () => {
         const ctx = createTwoAgentContext();
 
         const deal = await ctx.alice.proposeDeal(
-          makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+          makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
         );
 
         // After cross-routing, both should be ACCEPTED
@@ -475,7 +475,7 @@ describe('NP-0 Negotiation E2E', () => {
       });
 
       await alice.proposeDeal(
-        makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+        makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
       );
 
       const proposeMsg: NpMessage = JSON.parse(aliceSentDms[0]!.content);
@@ -519,7 +519,7 @@ describe('NP-0 Negotiation E2E', () => {
       });
 
       await alice.proposeDeal(
-        makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+        makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
       );
 
       const proposeMsg: NpMessage = JSON.parse(aliceSentDms[0]!.content);
@@ -565,7 +565,7 @@ describe('NP-0 Negotiation E2E', () => {
       });
 
       const deal = await alice.proposeDeal(
-        makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+        makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
       );
 
       // Create an oversized message (> 64 KiB)
@@ -595,7 +595,7 @@ describe('NP-0 Negotiation E2E', () => {
       });
 
       const deal = await alice.proposeDeal(
-        makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+        makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
       );
 
       // Deliver malformed JSON
@@ -624,7 +624,7 @@ describe('NP-0 Negotiation E2E', () => {
       });
 
       const deal = await alice.proposeDeal(
-        makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+        makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
       );
 
       // Construct message with __proto__ pollution key using raw string
@@ -678,8 +678,8 @@ describe('NP-0 Negotiation E2E', () => {
         proposer_intent_id: 'intent-alice-001',
         proposer_pubkey: PK_ALICE,
         quote_asset: 'USDC',
-        rate: 475n,
-        volume: 300n,
+        rate: '475',
+        volume: '300',
       };
       const dealId1 = computeDealId(terms1);
 
@@ -738,8 +738,8 @@ describe('NP-0 Negotiation E2E', () => {
         proposer_intent_id: 'intent-charlie-001',
         proposer_pubkey: PK_CHARLIE,
         quote_asset: 'USDC',
-        rate: 480n,
-        volume: 200n,
+        rate: '480',
+        volume: '200',
       };
       const dealId2 = computeDealId(terms2);
 
@@ -831,8 +831,8 @@ describe('NP-0 Negotiation E2E', () => {
           proposer_intent_id: `intent-alice-rate-${i}`,
           proposer_pubkey: PK_ALICE,
           quote_asset: 'USDC',
-          rate: BigInt(475 + i),
-          volume: BigInt(300 + i),
+          rate: String(475 + i),
+          volume: String(300 + i),
         };
         const dealId = computeDealId(terms);
         const msgId = `f${i}345678-1234-1234-1234-123456789abc`;
@@ -921,7 +921,7 @@ describe('NP-0 Negotiation E2E', () => {
 
       // Create a deal and force it to CANCELLED (terminal) state.
       const deal = await alice.proposeDeal(
-        makeAliceIntent(), makeBobCounterparty(), 475n, 300n, 'escrow-001',
+        makeAliceIntent(), makeBobCounterparty(), '475', '300', 'escrow-001',
       );
       const dealId = deal.terms.deal_id;
 

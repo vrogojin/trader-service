@@ -262,10 +262,10 @@ describe('createMatchingIntents', () => {
     const result = await createMatchingIntents(buyer, seller, {
       base_asset: 'UCT',
       quote_asset: 'USDC',
-      rate_min: 100n,
-      rate_max: 200n,
-      volume_min: 10n,
-      volume_max: 1000n,
+      rate_min: '100',
+      rate_max: '200',
+      volume_min: '10',
+      volume_max: '1000',
     });
 
     expect(result.buyerIntentId).toBe('intent-buyer-1');
@@ -325,10 +325,10 @@ describe('createMatchingIntents', () => {
       createMatchingIntents(buyer, seller, {
         base_asset: 'UCT',
         quote_asset: 'USDC',
-        rate_min: 100n,
-        rate_max: 200n,
-        volume_min: 10n,
-        volume_max: 1000n,
+        rate_min: '100',
+        rate_max: '200',
+        volume_min: '10',
+        volume_max: '1000',
       }),
     ).rejects.toThrow(/buyer CREATE_INTENT not ok/);
   });
@@ -353,10 +353,10 @@ describe('createMatchingIntents', () => {
     const result = await createMatchingIntents(buyer, seller, {
       base_asset: 'UCT',
       quote_asset: 'USDC',
-      rate_min: 100n,
-      rate_max: 200n,
-      volume_min: 10n,
-      volume_max: 1000n,
+      rate_min: '100',
+      rate_max: '200',
+      volume_min: '10',
+      volume_max: '1000',
     });
 
     expect(result.buyerIntentId).toBe('wrapped-buy');

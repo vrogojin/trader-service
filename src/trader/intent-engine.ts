@@ -49,7 +49,7 @@ export interface IntentEngine {
   /** Mark a counterparty as failed for a given intent so it won't be matched again. */
   markCounterpartyFailed(intentId: string, counterpartyPubkey: string): void;
   /** Record a partial or full fill after a successful swap. */
-  recordFill(intentId: string, filledVolume: bigint): void;
+  recordFill(intentId: string, filledVolume: string): void;
   /** Look up an intent by its MarketModule ID (UUID). */
   getIntentByMarketId?(marketIntentId: string): IntentRecord | null;
   /** Update the strategy (e.g., after SET_STRATEGY command). */
@@ -284,15 +284,18 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     if (own.base_asset !== parsed.base_asset) return false;
     if (own.quote_asset !== parsed.quote_asset) return false;
 
-    // 3. Overlapping rate ranges
-    if (own.rate_min > parsed.rate_max) return false;
-    if (parsed.rate_min > own.rate_max) return false;
+    // 3. Overlapping rate ranges (decimal-string comparison via Number;
+    //    rates are dimensionless ratios, well within Number precision)
+    if (Number(own.rate_min) > Number(parsed.rate_max)) return false;
+    if (Number(parsed.rate_min) > Number(own.rate_max)) return false;
 
-    // 4. Sufficient volume
-    const ownAvailable = own.volume_max - own.volume_filled;
-    const otherAvailable = parsed.volume_max - 0n; // search results show max volume; filled unknown, assume 0
-    const minRequired =
-      own.volume_min > parsed.volume_min ? own.volume_min : parsed.volume_min;
+    // 4. Sufficient volume (volumes are decimal strings in BASE whole
+    //    units; Number precision is fine for any realistic trading volume)
+    const ownAvailable = Number(own.volume_max) - Number(own.volume_filled);
+    const otherAvailable = Number(parsed.volume_max); // search results show max volume; filled unknown, assume 0
+    const ownMin = Number(own.volume_min);
+    const parsedMin = Number(parsed.volume_min);
+    const minRequired = ownMin > parsedMin ? ownMin : parsedMin;
     const availableForTrade =
       ownAvailable < otherAvailable ? ownAvailable : otherAvailable;
     if (availableForTrade < minRequired) return false;
@@ -510,10 +513,10 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     const fanOutLimit = Math.max(1, strategy.max_concurrent_swaps * 3);
     const candidates = proposingMatches.slice(0, fanOutLimit);
 
-    const remainingVolume = current.intent.volume_max - current.intent.volume_filled;
+    const remainingVolume = Number(current.intent.volume_max) - Number(current.intent.volume_filled);
 
     // If remaining volume is zero, skip fan-out and restore to ACTIVE.
-    if (remainingVolume <= 0n) {
+    if (remainingVolume <= 0) {
       logger.info('fan_out_skipped_zero_remaining_volume', {
         intent_id: own.intent_id,
         remaining_volume: remainingVolume.toString(),
@@ -555,15 +558,15 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     // therefore deterministic AND aligned with spec — no rotation
     // needed because the most-likely-best candidate gets first claim
     // by design.
-    const candidatesWithVolume: Array<MarketSearchResult & { __perCandidateVolume?: bigint }> = [];
+    const candidatesWithVolume: Array<MarketSearchResult & { __perCandidateVolume?: number }> = [];
     let remainingToAllocate = remainingVolume;
-    const ownMin = current.intent.volume_min;
+    const ownMin = Number(current.intent.volume_min);
     for (const entry of candidates) {
-      if (remainingToAllocate <= 0n) break;
+      if (remainingToAllocate <= 0) break;
       const parsedCp = parseDescription(entry.description);
       if (!parsedCp) continue;
-      const cpMax = parsedCp.volume_max;
-      const cpMin = parsedCp.volume_min;
+      const cpMax = Number(parsedCp.volume_max);
+      const cpMin = Number(parsedCp.volume_min);
       const minRequired = ownMin > cpMin ? ownMin : cpMin;
       const share = remainingToAllocate < cpMax ? remainingToAllocate : cpMax;
       if (share < minRequired) continue;
@@ -828,11 +831,15 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       // Compute expiry_ms from expiry_sec
       const expiryMs = nowMs() + params.expiry_sec * 1000;
 
-      // Build intent fields for ID computation
-      const rateMin = BigInt(params.rate_min);
-      const rateMax = BigInt(params.rate_max);
-      const volumeMin = BigInt(params.volume_min);
-      const volumeMax = BigInt(params.volume_max);
+      // Build intent fields for ID computation. Rates are
+      // dimensionless ratios; volumes are in BASE whole units. Both
+      // stay as decimal strings throughout — no smallest-unit conversion
+      // at the trader layer. The SDK converts to smallest units at
+      // transfer time via TokenRegistry, where decimals are known.
+      const rateMin = params.rate_min;
+      const rateMax = params.rate_max;
+      const volumeMin = params.volume_min;
+      const volumeMax = params.volume_max;
       const escrowAddress = params.escrow_address ?? DEFAULT_ESCROW;
       const depositTimeoutSec = params.deposit_timeout_sec ?? DEFAULT_DEPOSIT_TIMEOUT_SEC;
 
@@ -874,7 +881,7 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
         rate_max: rateMax,
         volume_min: volumeMin,
         volume_max: volumeMax,
-        volume_filled: 0n,
+        volume_filled: '0',
         escrow_address: escrowAddress,
         deposit_timeout_sec: depositTimeoutSec,
         expiry_ms: expiryMs,
@@ -1066,20 +1073,21 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       logger.info('counterparty_marked_failed', { intent_id: localId, counterparty: counterpartyPubkey });
     },
 
-    recordFill(intentId: string, filledVolume: bigint): void {
+    recordFill(intentId: string, filledVolume: string): void {
       const record = resolveIntentByEitherId(intentId);
       if (!record) return;
-      const newFilled = record.intent.volume_filled + filledVolume;
-      const remaining = record.intent.volume_max - newFilled;
+      const newFilledNum = Number(record.intent.volume_filled) + Number(filledVolume);
+      const newFilled = String(newFilledNum);
+      const remaining = Number(record.intent.volume_max) - newFilledNum;
       const targetState: IntentState =
-        (remaining <= 0n || remaining < record.intent.volume_min)
+        (remaining <= 0 || remaining < Number(record.intent.volume_min))
           ? 'FILLED'
           : 'PARTIALLY_FILLED';
       transitionIntent(record, targetState, { volume_filled: newFilled });
       logger.info('intent_fill_recorded', {
         intent_id: intentId,
-        filled_volume: filledVolume.toString(),
-        total_filled: newFilled.toString(),
+        filled_volume: filledVolume,
+        total_filled: newFilled,
         new_state: targetState,
       });
 

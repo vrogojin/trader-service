@@ -64,11 +64,11 @@ function makeOwnIntent(): IntentRecord {
       direction: 'sell',
       base_asset: 'ALPHA',
       quote_asset: 'BRAVO',
-      rate_min: 100n,
-      rate_max: 200n,
-      volume_min: 10n,
-      volume_max: 100n,
-      volume_filled: 0n,
+      rate_min: '100',
+      rate_max: '200',
+      volume_min: '10',
+      volume_max: '100',
+      volume_filled: '0',
       escrow_address: 'escrow-addr-1',
       deposit_timeout_sec: 60,
       expiry_ms: Date.now() + 3_600_000,
@@ -149,8 +149,8 @@ function buildProposeDealTerms(overrides: Partial<DealTerms> = {}): DealTerms {
     acceptor_address: AGENT_ADDRESS,
     base_asset: 'ALPHA',
     quote_asset: 'BRAVO',
-    rate: 150n,
-    volume: 50n,
+    rate: '150',
+    volume: '50',
     proposer_direction: 'sell',
     escrow_address: 'escrow-addr-1',
     deposit_timeout_sec: 60,
@@ -198,7 +198,7 @@ describe('NegotiationHandler', () => {
     it('creates a deal with correct DealTerms and content-addressed deal_id', async () => {
       const ownIntent = makeOwnIntent();
       const counterparty = makeCounterparty();
-      const deal = await handler.proposeDeal(ownIntent, counterparty, 150n, 50n, 'escrow-1');
+      const deal = await handler.proposeDeal(ownIntent, counterparty, '150', '50', 'escrow-1');
 
       expect(deal.terms.proposer_pubkey).toBe(AGENT_PUBKEY);
       expect(deal.terms.acceptor_pubkey).toBe(COUNTERPARTY_PUBKEY);
@@ -210,8 +210,8 @@ describe('NegotiationHandler', () => {
       expect(deal.terms.acceptor_intent_id).toBe(counterparty.id);
       expect(deal.terms.base_asset).toBe('ALPHA');
       expect(deal.terms.quote_asset).toBe('BRAVO');
-      expect(deal.terms.rate).toBe(150n);
-      expect(deal.terms.volume).toBe(50n);
+      expect(deal.terms.rate).toBe('150');
+      expect(deal.terms.volume).toBe('50');
       expect(deal.terms.escrow_address).toBe('escrow-1');
 
       // deal_id is content-addressed
@@ -222,7 +222,7 @@ describe('NegotiationHandler', () => {
 
     it('sends np.propose_deal DM with correct NpMessage envelope', async () => {
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
 
       expect(deps.sendDm).toHaveBeenCalledTimes(1);
@@ -240,7 +240,7 @@ describe('NegotiationHandler', () => {
 
     it('transitions to PROPOSED state', async () => {
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
 
       expect(deal.state).toBe('PROPOSED');
@@ -254,7 +254,7 @@ describe('NegotiationHandler', () => {
       try {
         const localHandler = createNegotiationHandler(createDeps());
         const deal = await localHandler.proposeDeal(
-          makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+          makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
         );
 
         // Before timeout: still PROPOSED
@@ -458,7 +458,7 @@ describe('NegotiationHandler', () => {
     it('validates sender is acceptor and transitions PROPOSED -> ACCEPTED', async () => {
       // First, propose a deal (our agent is proposer)
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
       expect(deal.state).toBe('PROPOSED');
 
@@ -480,7 +480,7 @@ describe('NegotiationHandler', () => {
 
     it('calls onDealAccepted callback', async () => {
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
 
       const acceptMsg = buildNpMessage(
@@ -499,7 +499,7 @@ describe('NegotiationHandler', () => {
 
     it('rejects accept from non-acceptor pubkey', async () => {
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
 
       const acceptMsg = buildNpMessage(
@@ -522,7 +522,7 @@ describe('NegotiationHandler', () => {
   describe('handleIncomingDm() — np.reject_deal', () => {
     it('transitions PROPOSED deal to CANCELLED', async () => {
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
 
       const rejectMsg = buildNpMessage(
@@ -670,7 +670,7 @@ describe('NegotiationHandler', () => {
         const localDeps = createDeps();
         const localHandler = createNegotiationHandler(localDeps);
         const deal = await localHandler.proposeDeal(
-          makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+          makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
         );
 
         expect(localHandler.getDeal(deal.terms.deal_id)!.state).toBe('PROPOSED');
@@ -714,7 +714,7 @@ describe('NegotiationHandler', () => {
     it('cancelPending() cancels all non-terminal deals', async () => {
       // Create a PROPOSED deal
       const deal1 = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
 
       // Create an ACCEPTED deal (via incoming propose)
@@ -734,7 +734,7 @@ describe('NegotiationHandler', () => {
     it('cancelPending() does not touch terminal deals', async () => {
       // Create and then reject a deal so it becomes CANCELLED
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
       const rejectMsg = buildNpMessage(
         deal.terms.deal_id,
@@ -757,7 +757,7 @@ describe('NegotiationHandler', () => {
         const localHandler = createNegotiationHandler(localDeps);
 
         await localHandler.proposeDeal(
-          makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+          makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
         );
 
         // stop() should clear the timer — advancing time should not cause transition
@@ -887,7 +887,7 @@ describe('NegotiationHandler', () => {
 
     it('handleAcceptDeal attaches received np.accept_deal as counterparty_envelope', async () => {
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
       const acceptMsg = buildNpMessage(
         deal.terms.deal_id,
@@ -911,7 +911,7 @@ describe('NegotiationHandler', () => {
       // envelope until np.accept_deal arrives. hydrateDeal will refuse to
       // trust this record on restart — reconciliation must skip the reject.
       const deal = await handler.proposeDeal(
-        makeOwnIntent(), makeCounterparty(), 150n, 50n, 'escrow-1',
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
       );
       expect(deal.counterparty_envelope).toBeUndefined();
     });

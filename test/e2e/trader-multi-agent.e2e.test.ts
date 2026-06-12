@@ -288,11 +288,11 @@ function makeIntentRecord(opts: {
   direction: 'buy' | 'sell';
   baseAsset?: string;
   quoteAsset?: string;
-  rateMin?: bigint;
-  rateMax?: bigint;
-  volumeMin?: bigint;
-  volumeMax?: bigint;
-  volumeFilled?: bigint;
+  rateMin?: string;
+  rateMax?: string;
+  volumeMin?: string;
+  volumeMax?: string;
+  volumeFilled?: string;
 }): IntentRecord {
   const intent: TradingIntent = {
     intent_id: opts.intentId,
@@ -303,11 +303,11 @@ function makeIntentRecord(opts: {
     direction: opts.direction,
     base_asset: opts.baseAsset ?? 'ALPHA',
     quote_asset: opts.quoteAsset ?? 'USDC',
-    rate_min: opts.rateMin ?? 450n,
-    rate_max: opts.rateMax ?? 500n,
-    volume_min: opts.volumeMin ?? 100n,
-    volume_max: opts.volumeMax ?? 1000n,
-    volume_filled: opts.volumeFilled ?? 0n,
+    rate_min: opts.rateMin ?? '450',
+    rate_max: opts.rateMax ?? '500',
+    volume_min: opts.volumeMin ?? '100',
+    volume_max: opts.volumeMax ?? '1000',
+    volume_filled: opts.volumeFilled ?? '0',
     escrow_address: 'escrow-001',
     deposit_timeout_sec: 120,
     expiry_ms: Date.now() + 86_400_000,
@@ -328,10 +328,10 @@ function makeCounterpartyResult(opts: {
   direction: 'buy' | 'sell';
   baseAsset?: string;
   quoteAsset?: string;
-  rateMin?: bigint;
-  rateMax?: bigint;
-  volumeMin?: bigint;
-  volumeMax?: bigint;
+  rateMin?: string;
+  rateMax?: string;
+  volumeMin?: string;
+  volumeMax?: string;
 }): MarketSearchResult {
   const description = encodeDescription({
     intent_id: opts.id,
@@ -342,11 +342,11 @@ function makeCounterpartyResult(opts: {
     direction: opts.direction,
     base_asset: opts.baseAsset ?? 'ALPHA',
     quote_asset: opts.quoteAsset ?? 'USDC',
-    rate_min: opts.rateMin ?? 450n,
-    rate_max: opts.rateMax ?? 500n,
-    volume_min: opts.volumeMin ?? 100n,
-    volume_max: opts.volumeMax ?? 1000n,
-    volume_filled: 0n,
+    rate_min: opts.rateMin ?? '450',
+    rate_max: opts.rateMax ?? '500',
+    volume_min: opts.volumeMin ?? '100',
+    volume_max: opts.volumeMax ?? '1000',
+    volume_filled: '0',
     escrow_address: 'escrow-001',
     deposit_timeout_sec: 120,
     expiry_ms: Date.now() + 86_400_000,
@@ -440,8 +440,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     agentA.intentEngine.stop();
 
     // Now also test the full negotiation flow manually
-    const agreedRate = 475n;
-    const agreedVolume = 300n;
+    const agreedRate = '475';
+    const agreedVolume = '300';
     const dealRecord = await agentA.negotiationHandler.proposeDeal(
       intentA,
       counterpartyB,
@@ -546,8 +546,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     const dealB = await agentB.negotiationHandler.proposeDeal(
       intentB,
       counterpartyA_forB,
-      475n,
-      300n,
+      '475',
+      '300',
       'escrow-001',
     );
 
@@ -564,8 +564,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     const dealC = await agentC.negotiationHandler.proposeDeal(
       intentC,
       counterpartyA_forC,
-      480n,
-      200n,
+      '480',
+      '200',
       'escrow-001',
     );
 
@@ -699,8 +699,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     const dealFromA = await agentA.negotiationHandler.proposeDeal(
       intentA,
       counterpartyB,
-      475n,
-      300n,
+      '475',
+      '300',
       'escrow-001',
     );
 
@@ -755,7 +755,7 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       direction: 'buy',
       baseAsset: 'USDC',
       quoteAsset: 'ALPHA',
-      volumeMax: 500n,
+      volumeMax: '500',
     });
 
     // B's buy intent matches A's sell intent-X
@@ -792,8 +792,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     const dealX = await agentB.negotiationHandler.proposeDeal(
       intentB,
       counterpartyAX_forB,
-      475n,
-      500n,
+      '475',
+      '500',
       'escrow-001',
     );
 
@@ -805,8 +805,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     const dealY = await agentA.negotiationHandler.proposeDeal(
       intentY,
       counterpartyC,
-      10n,
-      500n,
+      '10',
+      '500',
       'escrow-001',
     );
 
@@ -867,8 +867,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPubkey: agentA.pubkey,
       agentAddress: agentA.address,
       direction: 'sell',
-      rateMin: 450n,
-      rateMax: 500n,
+      rateMin: '450',
+      rateMax: '500',
     });
 
     // Three counterparty buy intents with different rates:
@@ -880,8 +880,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPublicKey: agentB.pubkey,
       agentAddress: agentB.address,
       direction: 'buy',
-      rateMin: 455n,
-      rateMax: 460n,
+      rateMin: '455',
+      rateMax: '460',
     });
 
     const counterpartyC = makeCounterpartyResult({
@@ -889,8 +889,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPublicKey: agentC.pubkey,
       agentAddress: agentC.address,
       direction: 'buy',
-      rateMin: 485n,
-      rateMax: 490n,
+      rateMin: '485',
+      rateMax: '490',
     });
 
     const counterpartyD = makeCounterpartyResult({
@@ -898,8 +898,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPublicKey: agentD.pubkey,
       agentAddress: agentD.address,
       direction: 'buy',
-      rateMin: 470n,
-      rateMax: 475n,
+      rateMin: '470',
+      rateMax: '475',
     });
 
     // For a seller, the best rate is the highest buyer rate.
@@ -940,8 +940,8 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     const deal = await agentA.negotiationHandler.proposeDeal(
       intentA,
       counterpartyC,
-      490n,
-      300n,
+      '490',
+      '300',
       'escrow-001',
     );
 
@@ -1013,15 +1013,15 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPubkey: agentB.pubkey,
       agentAddress: agentB.address,
       direction: 'buy',
-      volumeMin: 100n,
-      volumeMax: 700n,
+      volumeMin: '100',
+      volumeMax: '700',
     });
 
     const dealB = await agentB.negotiationHandler.proposeDeal(
       intentB,
       counterpartyBView,
-      475n,
-      700n,
+      '475',
+      '700',
       'escrow-001',
     );
 
@@ -1186,14 +1186,14 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPubkey: agentB.pubkey,
       agentAddress: agentB.address,
       direction: 'buy',
-      volumeMax: 700n,
+      volumeMax: '700',
     });
 
     const dealB = await agentB.negotiationHandler.proposeDeal(
       intentB,
       counterpartyA_forB,
-      475n,
-      700n,
+      '475',
+      '700',
       'escrow-001',
     );
 
@@ -1215,14 +1215,14 @@ describe('T13 — Multi-Agent Swap Flows', () => {
       agentPubkey: agentC.pubkey,
       agentAddress: agentC.address,
       direction: 'buy',
-      volumeMax: 500n,
+      volumeMax: '500',
     });
 
     const dealC = await agentC.negotiationHandler.proposeDeal(
       intentC,
       counterpartyA_forC,
-      480n,
-      500n,
+      '480',
+      '500',
       'escrow-001',
     );
 
