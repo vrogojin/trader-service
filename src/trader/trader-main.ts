@@ -14,6 +14,22 @@ import { join } from 'node:path';
 
 import { pubkeysEqual } from '../shared/crypto.js';
 import { withTimeout } from '../shared/with-timeout.js';
+
+/**
+ * Convert a whole-unit number to a smallest-units bigint at the given
+ * decimal precision. Used at the wallet-reservation boundary where the
+ * SDK's bigint balances must be compared against the trader's
+ * human-units terms. Decimals are the only thing we ever look up;
+ * everywhere ELSE the trader works in plain decimal strings.
+ */
+function toSmallestUnitsBigInt(amount: number, decimals: number): bigint {
+  // `amount.toFixed(decimals)` rounds to the target precision; we then
+  // strip the decimal point and BigInt the resulting integer-string.
+  const fixed = amount.toFixed(decimals);
+  const [intPart, fracPartRaw = ''] = fixed.split('.');
+  const fracPart = fracPartRaw.padEnd(decimals, '0').slice(0, decimals);
+  return BigInt((intPart ?? '0') + fracPart);
+}
 import type { Logger } from '../shared/logger.js';
 import type { TenantConfig } from '../shared/types.js';
 import type { SphereDmSender, SphereDmReceiver } from '../tenant/types.js';
@@ -337,19 +353,23 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         }
 
         // Compute midpoint of the overlap range (spec Section 5)
-        const overlapMin = ownIntent.intent.rate_min > parsed.rate_min
-          ? ownIntent.intent.rate_min : parsed.rate_min;
-        const overlapMax = ownIntent.intent.rate_max < parsed.rate_max
-          ? ownIntent.intent.rate_max : parsed.rate_max;
-        const midRate = (overlapMin + overlapMax) / 2n;
+        // Decimal-string rates compared via Number — dimensionless ratios
+        // well within 2^53 precision. Midpoint serialized back to string.
+        const ownRateMin = Number(ownIntent.intent.rate_min);
+        const ownRateMax = Number(ownIntent.intent.rate_max);
+        const cpRateMin = Number(parsed.rate_min);
+        const cpRateMax = Number(parsed.rate_max);
+        const overlapMin = ownRateMin > cpRateMin ? ownRateMin : cpRateMin;
+        const overlapMax = ownRateMax < cpRateMax ? ownRateMax : cpRateMax;
+        const midRate = String((overlapMin + overlapMax) / 2);
 
         // Fan-out safety (W): when the intent-engine fans out to N candidates,
         // each receives remainingVolume/N instead of the full remainingVolume
         // so that two concurrent accepts cannot exceed volume_max. The per-
         // candidate volume is attached to the MarketSearchResult by the
         // intent engine as `__perCandidateVolume` (internal field).
-        const withPerCandidate = counterparty as MarketSearchResult & { __perCandidateVolume?: bigint };
-        const remainingVolume = ownIntent.intent.volume_max - ownIntent.intent.volume_filled;
+        const withPerCandidate = counterparty as MarketSearchResult & { __perCandidateVolume?: number };
+        const remainingVolume = Number(ownIntent.intent.volume_max) - Number(ownIntent.intent.volume_filled);
         const myShare = withPerCandidate.__perCandidateVolume ?? remainingVolume;
 
         // Cap to counterparty's [volume_min, volume_max] from the parsed
@@ -357,21 +377,23 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         // capacity, so it can exceed the counterparty's max — which the
         // receiver rejects as VOLUME_OUT_OF_RANGE. Take the intersection of
         // both [vol_min, vol_max] ranges; if it's empty, abort the proposal.
-        const overlapMaxVol = myShare < parsed.volume_max ? myShare : parsed.volume_max;
-        const overlapMinVol = ownIntent.intent.volume_min > parsed.volume_min
-          ? ownIntent.intent.volume_min : parsed.volume_min;
-        if (overlapMaxVol < overlapMinVol || overlapMaxVol <= 0n) {
+        const cpVolMax = Number(parsed.volume_max);
+        const cpVolMin = Number(parsed.volume_min);
+        const ownVolMin = Number(ownIntent.intent.volume_min);
+        const overlapMaxVol = myShare < cpVolMax ? myShare : cpVolMax;
+        const overlapMinVol = ownVolMin > cpVolMin ? ownVolMin : cpVolMin;
+        if (overlapMaxVol < overlapMinVol || overlapMaxVol <= 0) {
           logger.info('match_found_no_volume_overlap', {
             intent_id: ownIntent.intent.intent_id,
             counterparty: counterparty.agentPublicKey,
-            my_share: myShare.toString(),
+            my_share: String(myShare),
             cp_volume_min: parsed.volume_min.toString(),
             cp_volume_max: parsed.volume_max.toString(),
             own_volume_min: ownIntent.intent.volume_min.toString(),
           });
           return;
         }
-        const proposalVolume = overlapMaxVol;
+        const proposalVolume = String(overlapMaxVol);
         // Resolve a CONCRETE escrow address before proposing. Intents with
         // escrow_address='any' (the default) advertise flexibility, but the
         // np.propose_deal envelope MUST carry a real address: the receiver's
@@ -459,13 +481,16 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           (weAreProposer && proposerSells) || (!weAreProposer && !proposerSells);
         const assetToReserve = weAreSeller ? deal.terms.base_asset : deal.terms.quote_asset;
         // Seller delivers `volume` units of base; buyer delivers `volume*rate`
-        // units of quote. The previous reservation always used `volume` which
-        // under-reserved the quote side whenever rate>1 (e.g. rate=2 deal
-        // would reserve 100 USDU but actually owe 200 USDU on payout, leading
-        // to insufficient-funds failures during settlement).
-        const amountToReserve = weAreSeller
-          ? deal.terms.volume
-          : deal.terms.volume * deal.terms.rate;
+        // units of quote. Both terms now arrive as decimal strings (whole
+        // units / dimensionless ratios); convert to smallest-units bigint
+        // here using the SDK's TokenRegistry decimals. This is the one
+        // place where decimals matter — at the actual wallet-reservation
+        // boundary, NOT at the description/match/search layers.
+        const amountWhole = weAreSeller
+          ? Number(deal.terms.volume)
+          : Number(deal.terms.volume) * Number(deal.terms.rate);
+        const decimals = payments.getDecimals(assetToReserve);
+        const amountToReserve = toSmallestUnitsBigInt(amountWhole, decimals);
 
         let reserved = false;
         try {
@@ -740,7 +765,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         agentPubkey,
         agentAddress,
         swapDirectAddress: deps.swapDirectAddress ?? agentAddress,
-        payments: { receive: () => payments.refresh() },
+        payments: { receive: () => payments.refresh(), getDecimals: payments.getDecimals.bind(payments) },
         logger: logger.child({ component: 'swap-executor' }),
       });
 

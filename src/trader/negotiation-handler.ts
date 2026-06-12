@@ -154,8 +154,8 @@ export interface NegotiationHandler {
   proposeDeal(
     ownIntent: IntentRecord,
     counterparty: MarketSearchResult,
-    agreedRate: bigint,
-    agreedVolume: bigint,
+    agreedRate: string,
+    agreedVolume: string,
     escrowAddress: string,
   ): Promise<DealRecord>;
 
@@ -287,7 +287,7 @@ export interface NegotiationHandlerDeps {
   agentAddress: string;
   logger: Logger;
   /** Look up the acceptor's own intent by ID for proposal validation. */
-  getIntent?: (intentId: string) => { direction: 'buy' | 'sell'; base_asset: string; quote_asset: string; rate_min: bigint; rate_max: bigint; volume_min: bigint; volume_max: bigint } | null;
+  getIntent?: (intentId: string) => { direction: 'buy' | 'sell'; base_asset: string; quote_asset: string; rate_min: string; rate_max: string; volume_min: string; volume_max: string } | null;
   /** Return the strategy's trusted escrow list for proposal validation. */
   getTrustedEscrows?: () => readonly string[];
   /**
@@ -857,17 +857,16 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       return;
     }
 
-    // Convert rate/volume to bigint if they arrive as strings (wire format)
-    let rate: bigint;
-    let volume: bigint;
-    try {
-      rate = BigInt(String(termsRaw['rate'] ?? '0'));
-      volume = BigInt(String(termsRaw['volume'] ?? '0'));
-    } catch {
-      logger.warn('np_propose_deal_invalid_bigint', {
+    // Wire format already carries rate/volume as decimal strings;
+    // validate they're non-negative decimal strings before accepting.
+    const NUM_RE = /^\d+(?:\.\d+)?$/;
+    const rate = String(termsRaw['rate'] ?? '0');
+    const volume = String(termsRaw['volume'] ?? '0');
+    if (!NUM_RE.test(rate) || !NUM_RE.test(volume)) {
+      logger.warn('np_propose_deal_invalid_decimal', {
         deal_id: msg.deal_id,
-        rate: String(termsRaw['rate'] ?? ''),
-        volume: String(termsRaw['volume'] ?? ''),
+        rate,
+        volume,
       });
       return;
     }
@@ -1041,23 +1040,23 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       }
 
       // Verify rate is within acceptor's range
-      if (terms.rate < acceptorIntent.rate_min || terms.rate > acceptorIntent.rate_max) {
+      if (Number(terms.rate) < Number(acceptorIntent.rate_min) || Number(terms.rate) > Number(acceptorIntent.rate_max)) {
         logger.warn('np_propose_deal_rate_out_of_range', {
           deal_id: msg.deal_id,
-          rate: terms.rate.toString(),
-          rate_min: acceptorIntent.rate_min.toString(),
-          rate_max: acceptorIntent.rate_max.toString(),
+          rate: terms.rate,
+          rate_min: acceptorIntent.rate_min,
+          rate_max: acceptorIntent.rate_max,
         });
         return;
       }
 
       // Verify volume is within acceptor's range
-      if (terms.volume < acceptorIntent.volume_min || terms.volume > acceptorIntent.volume_max) {
+      if (Number(terms.volume) < Number(acceptorIntent.volume_min) || Number(terms.volume) > Number(acceptorIntent.volume_max)) {
         logger.warn('np_propose_deal_volume_out_of_range', {
           deal_id: msg.deal_id,
-          volume: terms.volume.toString(),
-          volume_min: acceptorIntent.volume_min.toString(),
-          volume_max: acceptorIntent.volume_max.toString(),
+          volume: terms.volume,
+          volume_min: acceptorIntent.volume_min,
+          volume_max: acceptorIntent.volume_max,
         });
         return;
       }
@@ -1249,8 +1248,8 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     logger.info('np_deal_accepted', {
       deal_id: msg.deal_id,
       proposer: terms.proposer_pubkey,
-      rate: terms.rate.toString(),
-      volume: terms.volume.toString(),
+      rate: terms.rate,
+      volume: terms.volume,
     });
 
     // Only after the counterparty has been notified do we launch swap
@@ -1505,8 +1504,8 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
   async function proposeDeal(
     ownIntent: IntentRecord,
     counterparty: MarketSearchResult,
-    agreedRate: bigint,
-    agreedVolume: bigint,
+    agreedRate: string,
+    agreedVolume: string,
     escrowAddress: string,
   ): Promise<DealRecord> {
     const now = Date.now();
@@ -1592,8 +1591,8 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     logger.info('np_deal_proposed', {
       deal_id: dealId,
       acceptor: counterparty.agentPublicKey,
-      rate: agreedRate.toString(),
-      volume: agreedVolume.toString(),
+      rate: agreedRate,
+      volume: agreedVolume,
     });
 
     return dealRecord;
@@ -2056,8 +2055,8 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
           acceptor_address: String(raw['acceptor_address'] ?? ''),
           base_asset: String(raw['base_asset'] ?? ''),
           quote_asset: String(raw['quote_asset'] ?? ''),
-          rate: BigInt(String(raw['rate'] ?? '0')),
-          volume: BigInt(String(raw['volume'] ?? '0')),
+          rate: String(raw['rate'] ?? '0'),
+          volume: String(raw['volume'] ?? '0'),
           proposer_direction: String(raw['proposer_direction'] ?? 'sell') === 'buy' ? 'buy' : 'sell',
           escrow_address: String(raw['escrow_address'] ?? ''),
           deposit_timeout_sec: Number(raw['deposit_timeout_sec'] ?? 0),

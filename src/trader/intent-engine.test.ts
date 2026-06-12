@@ -99,10 +99,10 @@ function buildSearchResult(overrides?: {
   direction?: 'buy' | 'sell';
   base_asset?: string;
   quote_asset?: string;
-  rate_min?: bigint;
-  rate_max?: bigint;
-  volume_min?: bigint;
-  volume_max?: bigint;
+  rate_min?: string;
+  rate_max?: string;
+  volume_min?: string;
+  volume_max?: string;
   escrow_address?: string;
   deposit_timeout_sec?: number;
   agentPublicKey?: string;
@@ -114,10 +114,10 @@ function buildSearchResult(overrides?: {
   const dir = overrides?.direction ?? 'sell';
   const base = overrides?.base_asset ?? 'ALPHA';
   const quote = overrides?.quote_asset ?? 'USD';
-  const rateMin = overrides?.rate_min ?? 100n;
-  const rateMax = overrides?.rate_max ?? 110n;
-  const volMin = overrides?.volume_min ?? 10n;
-  const volMax = overrides?.volume_max ?? 100n;
+  const rateMin = overrides?.rate_min ?? '100';
+  const rateMax = overrides?.rate_max ?? '110';
+  const volMin = overrides?.volume_min ?? '10';
+  const volMax = overrides?.volume_max ?? '100';
   const escrow = overrides?.escrow_address ?? 'any';
   const timeout = overrides?.deposit_timeout_sec ?? 300;
   const expiryMs = overrides?.expiry_ms ?? Date.now() + 3_600_000;
@@ -135,7 +135,7 @@ function buildSearchResult(overrides?: {
     rate_max: rateMax,
     volume_min: volMin,
     volume_max: volMax,
-    volume_filled: 0n,
+    volume_filled: '0',
     escrow_address: escrow,
     deposit_timeout_sec: timeout,
     expiry_ms: expiryMs,
@@ -188,11 +188,11 @@ describe('IntentEngine', () => {
       expect(record.intent.direction).toBe('buy');
       expect(record.intent.base_asset).toBe('ALPHA');
       expect(record.intent.quote_asset).toBe('USD');
-      expect(record.intent.rate_min).toBe(100n);
-      expect(record.intent.rate_max).toBe(110n);
-      expect(record.intent.volume_min).toBe(10n);
-      expect(record.intent.volume_max).toBe(100n);
-      expect(record.intent.volume_filled).toBe(0n);
+      expect(record.intent.rate_min).toBe('100');
+      expect(record.intent.rate_max).toBe('110');
+      expect(record.intent.volume_min).toBe('10');
+      expect(record.intent.volume_max).toBe('100');
+      expect(record.intent.volume_filled).toBe('0');
       expect(record.intent.escrow_address).toBe('any');
       expect(record.intent.deposit_timeout_sec).toBe(300);
       expect(record.intent.expiry_ms).toBeGreaterThan(Date.now());
@@ -470,8 +470,8 @@ describe('IntentEngine', () => {
       // Counterparty sells at 200-210 (no overlap with 100-110)
       const result = buildSearchResult({
         direction: 'sell',
-        rate_min: 200n,
-        rate_max: 210n,
+        rate_min: '200',
+        rate_max: '210',
         agentPublicKey: 'b'.repeat(64),
       });
       market.setSearchResults([result]);
@@ -499,8 +499,8 @@ describe('IntentEngine', () => {
       // Counterparty sells only volume_max=5 (insufficient)
       const result = buildSearchResult({
         direction: 'sell',
-        volume_min: 1n,
-        volume_max: 5n,
+        volume_min: '1',
+        volume_max: '5',
         agentPublicKey: 'b'.repeat(64),
       });
       market.setSearchResults([result]);

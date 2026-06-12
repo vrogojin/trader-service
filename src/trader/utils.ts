@@ -38,10 +38,10 @@ export function computeIntentId(intent: {
   readonly direction: 'buy' | 'sell';
   readonly base_asset: string;
   readonly quote_asset: string;
-  readonly rate_min: bigint;
-  readonly rate_max: bigint;
-  readonly volume_min: bigint;
-  readonly volume_max: bigint;
+  readonly rate_min: string;
+  readonly rate_max: string;
+  readonly volume_min: string;
+  readonly volume_max: string;
   readonly escrow_address: string;
   readonly deposit_timeout_sec: number;
   readonly expiry_ms: number;
@@ -73,8 +73,8 @@ export function computeIntentId(intent: {
 export function encodeDescription(intent: TradingIntent): string {
   const verb = intent.direction === 'sell' ? 'Selling' : 'Buying';
   return [
-    `${verb} ${intent.volume_min.toString()}-${intent.volume_max.toString()} ${intent.base_asset} for ${intent.quote_asset}.`,
-    `Rate: ${intent.rate_min.toString()}-${intent.rate_max.toString()} ${intent.quote_asset} per ${intent.base_asset}.`,
+    `${verb} ${intent.volume_min}-${intent.volume_max} ${intent.base_asset} for ${intent.quote_asset}.`,
+    `Rate: ${intent.rate_min}-${intent.rate_max} ${intent.quote_asset} per ${intent.base_asset}.`,
     `Escrow: ${intent.escrow_address}.`,
     `Deposit timeout: ${String(intent.deposit_timeout_sec)}s.`,
     `Expires: ${String(intent.expiry_ms)}.`,
@@ -89,18 +89,18 @@ export interface ParsedDescription {
   readonly direction: 'buy' | 'sell';
   readonly base_asset: string;
   readonly quote_asset: string;
-  readonly volume_min: bigint;
-  readonly volume_max: bigint;
-  readonly rate_min: bigint;
-  readonly rate_max: bigint;
+  readonly volume_min: string;
+  readonly volume_max: string;
+  readonly rate_min: string;
+  readonly rate_max: string;
   readonly escrow_address: string;
   readonly deposit_timeout_sec: number;
   /** Epoch ms when the intent expires. 0 if not present (legacy descriptions). */
   readonly expiry_ms: number;
 }
 
-const HEADER_RE = /^(Selling|Buying)\s+(\d+)-(\d+)\s+([A-Z0-9_]+)\s+for\s+([A-Z0-9_]+)\./;
-const RATE_RE = /^Rate:\s+(\d+)-(\d+)\s+[A-Z0-9_]+\s+per\s+[A-Z0-9_]+\./;
+const HEADER_RE = /^(Selling|Buying)\s+(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\s+([A-Z0-9_]+)\s+for\s+([A-Z0-9_]+)\./;
+const RATE_RE = /^Rate:\s+(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\s+[A-Z0-9_]+\s+per\s+[A-Z0-9_]+\./;
 // Escrow address: alphanumeric + common address chars, but no '..' sequences
 const ESCROW_RE = /^Escrow:\s+([A-Za-z0-9_:/@-]+(?:\.[A-Za-z0-9_:/@-]+)*)\./;
 const TIMEOUT_RE = /^Deposit timeout:\s+(\d+)s\./;
@@ -158,10 +158,10 @@ export function parseDescription(desc: string): ParsedDescription | null {
     direction: verb === 'Selling' ? 'sell' : 'buy',
     base_asset: baseAsset,
     quote_asset: quoteAsset,
-    volume_min: BigInt(volMin),
-    volume_max: BigInt(volMax),
-    rate_min: BigInt(rMin),
-    rate_max: BigInt(rMax),
+    volume_min: volMin,
+    volume_max: volMax,
+    rate_min: rMin,
+    rate_max: rMax,
     escrow_address: escrow,
     deposit_timeout_sec: Number(timeout),
     expiry_ms: expiryMs,
@@ -175,24 +175,33 @@ export function parseDescription(desc: string): ParsedDescription | null {
 const MAX_EXPIRY_SEC = 7 * 24 * 60 * 60; // 7 days
 
 export function validateIntentParams(params: CreateIntentParams): string | null {
-  let rateMin: bigint;
-  let rateMax: bigint;
-  let volumeMin: bigint;
-  let volumeMax: bigint;
-  try {
-    rateMin = BigInt(params.rate_min);
-    rateMax = BigInt(params.rate_max);
-    volumeMin = BigInt(params.volume_min);
-    volumeMax = BigInt(params.volume_max);
-  } catch {
-    return 'rate and volume parameters must be valid integer strings';
+  // Rates are dimensionless ratios; volumes are in BASE whole units.
+  // Both are decimal strings (e.g. "0.08", "50"). We compare via Number;
+  // for trading-sized ratios + asset volumes, Number's 2^53 ceiling is
+  // far above any realistic value.
+  const NUM_RE = /^\d+(?:\.\d+)?$/;
+  if (typeof params.rate_min !== 'string' || !NUM_RE.test(params.rate_min)) {
+    return 'rate_min must be a non-negative decimal string';
   }
+  if (typeof params.rate_max !== 'string' || !NUM_RE.test(params.rate_max)) {
+    return 'rate_max must be a non-negative decimal string';
+  }
+  if (typeof params.volume_min !== 'string' || !NUM_RE.test(params.volume_min)) {
+    return 'volume_min must be a non-negative decimal string';
+  }
+  if (typeof params.volume_max !== 'string' || !NUM_RE.test(params.volume_max)) {
+    return 'volume_max must be a non-negative decimal string';
+  }
+  const rateMin = Number(params.rate_min);
+  const rateMax = Number(params.rate_max);
+  const volumeMin = Number(params.volume_min);
+  const volumeMax = Number(params.volume_max);
 
-  if (rateMin <= 0n) return 'rate_min must be positive';
-  if (rateMax <= 0n) return 'rate_max must be positive';
+  if (!(rateMin > 0)) return 'rate_min must be positive';
+  if (!(rateMax > 0)) return 'rate_max must be positive';
   if (rateMin > rateMax) return 'rate_min must be <= rate_max';
-  if (volumeMin <= 0n) return 'volume_min must be positive';
-  if (volumeMax <= 0n) return 'volume_max must be positive';
+  if (!(volumeMin > 0)) return 'volume_min must be positive';
+  if (!(volumeMax > 0)) return 'volume_max must be positive';
   if (volumeMin > volumeMax) return 'volume_min must be <= volume_max';
 
   if (!Number.isFinite(params.expiry_sec)) return 'expiry_sec must be finite';
@@ -232,8 +241,8 @@ export function validateIntentParams(params: CreateIntentParams): string | null 
  * counterparty proposing absurd values that pass the rate-range check on
  * an intent with unbounded rate_max (legacy intent).
  */
-const MAX_RATE = 2n ** 128n;
-const MAX_VOLUME = 2n ** 128n;
+const MAX_RATE = Number.MAX_SAFE_INTEGER;
+const MAX_VOLUME = Number.MAX_SAFE_INTEGER;
 
 export function validateDealTerms(terms: DealTerms): string | null {
   if (!terms.deal_id || typeof terms.deal_id !== 'string') return 'deal_id is required';
@@ -252,14 +261,26 @@ export function validateDealTerms(terms: DealTerms): string | null {
   if (!terms.acceptor_address) return 'acceptor_address is required';
   if (!terms.base_asset) return 'base_asset is required';
   if (!terms.quote_asset) return 'quote_asset is required';
-  if (terms.rate <= 0n) return 'rate must be positive';
-  // SECURITY (M3): upper bound on rate / volume. Hostile proposals with
-  // 2^256 values pass intent-range checks on legacy unbounded intents and
-  // produce 2^512 in downstream `rate * volume` arithmetic, where uint256
-  // truncation may corrupt the actual transferred amount.
-  if (terms.rate > MAX_RATE) return `rate exceeds maximum (${MAX_RATE})`;
-  if (terms.volume <= 0n) return 'volume must be positive';
-  if (terms.volume > MAX_VOLUME) return `volume exceeds maximum (${MAX_VOLUME})`;
+  // rate and volume arrive as decimal strings (e.g. "0.08", "50");
+  // validate format then compare via Number. Dimensionless ratios are
+  // well within 2^53 precision; whole-unit volumes in any realistic
+  // trade are too.
+  const NUM_RE = /^\d+(?:\.\d+)?$/;
+  if (typeof terms.rate !== 'string' || !NUM_RE.test(terms.rate)) {
+    return 'rate must be a non-negative decimal string';
+  }
+  if (typeof terms.volume !== 'string' || !NUM_RE.test(terms.volume)) {
+    return 'volume must be a non-negative decimal string';
+  }
+  const rateNum = Number(terms.rate);
+  const volumeNum = Number(terms.volume);
+  if (!(rateNum > 0)) return 'rate must be positive';
+  // SECURITY (M3 historical): upper bound on rate × volume product.
+  // Decimal-string rates + whole-unit volumes never approach 2^53, so
+  // the bound is mostly belt-and-suspenders against malicious clients.
+  if (rateNum > MAX_RATE) return `rate exceeds maximum (${MAX_RATE})`;
+  if (!(volumeNum > 0)) return 'volume must be positive';
+  if (volumeNum > MAX_VOLUME) return `volume exceeds maximum (${MAX_VOLUME})`;
   if (terms.proposer_direction !== 'buy' && terms.proposer_direction !== 'sell') {
     return 'proposer_direction must be "buy" or "sell"';
   }

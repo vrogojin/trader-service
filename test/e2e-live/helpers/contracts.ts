@@ -283,10 +283,10 @@ export type CreateMatchingIntents = (
   terms: {
     base_asset: string;
     quote_asset: string;
-    rate_min: bigint;
-    rate_max: bigint;
-    volume_min: bigint;
-    volume_max: bigint;
+    rate_min: string;
+    rate_max: string;
+    volume_min: string;
+    volume_max: string;
   },
 ) => Promise<MatchingIntents>;
 

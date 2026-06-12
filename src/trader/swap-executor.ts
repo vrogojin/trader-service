@@ -165,6 +165,8 @@ export interface SwapExecutor {
 export interface SwapPaymentsAdapter {
   /** Trigger receive({ finalize: true }) to pick up payout tokens via DM. */
   receive(): Promise<void>;
+  /** Decimals lookup — backed by sphere-sdk TokenRegistry. */
+  getDecimals(coinId: string): number;
 }
 
 export interface SwapExecutorDeps {
@@ -222,10 +224,36 @@ function transitionDeal(deal: DealRecord, newState: DealState, swapId?: string |
  *
  * Exported so callers (e.g. trader-main.ts onDealAccepted) can use it directly.
  */
+/**
+ * Convert a whole-unit decimal value (volume or volume*rate) to the
+ * smallest-units integer-string required by sphere-sdk's swap module
+ * (\ validator). \ come from the
+ * SDK's TokenRegistry at the call site.
+ */
+function toSwapAmountString(whole: number, decimals: number): string {
+  const fixed = whole.toFixed(decimals);
+  const [intPart, fracPartRaw = ''] = fixed.split('.');
+  const fracPart = fracPartRaw.padEnd(decimals, '0').slice(0, decimals);
+  // Strip a leading 0 from the integer part (the SDK accepts '^[1-9]' only),
+  // then strip leading zeros that the concat introduces.
+  const joined = (intPart ?? '0') + fracPart;
+  const stripped = joined.replace(/^0+/, '');
+  return stripped || '0';
+}
+
 export function buildSwapDealInput(
   deal: DealRecord,
   agentPubkey: string,
   agentAddress: string,
+  /**
+   * Optional decimals lookup. When omitted (e.g. legacy callers, unit
+   * tests using small-number fixtures), the function treats terms.volume
+   * and terms.rate as already in their final units (matching the
+   * pre-decimal-refactor behaviour). When provided, the function
+   * converts terms.volume (whole base units) and terms.volume * rate
+   * (whole quote units) into smallest-units integer strings.
+   */
+  getDecimals?: (coinId: string) => number,
 ): SwapDealInput {
   const { terms } = deal;
   // Use pubkeysEqual to handle format drift between terms.*_pubkey (wire format,
@@ -235,8 +263,15 @@ export function buildSwapDealInput(
   const ourAddress = agentAddress;
   const theirAddress = isProposer ? terms.acceptor_address : terms.proposer_address;
 
-  const baseAmount = terms.volume.toString();
-  const quoteAmount = (terms.rate * terms.volume).toString();
+  const baseAmount = getDecimals
+    ? toSwapAmountString(Number(terms.volume), getDecimals(terms.base_asset))
+    : terms.volume;
+  const quoteAmount = getDecimals
+    ? toSwapAmountString(
+        Number(terms.volume) * Number(terms.rate),
+        getDecimals(terms.quote_asset),
+      )
+    : String(Number(terms.rate) * Number(terms.volume));
 
   const proposerSellsBase = terms.proposer_direction === 'sell';
 
@@ -475,7 +510,7 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
     }
 
     // 4. Build SwapDealInput from DealTerms (proposer only)
-    const swapDealInput = buildSwapDealInput(deal, agentPubkey, swapAddress);
+    const swapDealInput = buildSwapDealInput(deal, agentPubkey, swapAddress, deps.payments?.getDecimals);
 
     // DIAGNOSTIC: log the full SwapDealInput so we can verify direction-to-
     // currency mapping. Bug-suspicion: if proposer is direction='buy' but
@@ -644,7 +679,7 @@ export function createSwapExecutor(deps: SwapExecutorDeps): SwapExecutor {
     let candidates: ActiveDeal[] = nullSwapEntries;
     if (match !== undefined) {
       candidates = nullSwapEntries.filter((entry) => {
-        const input = buildSwapDealInput(entry.deal, agentPubkey, swapAddress);
+        const input = buildSwapDealInput(entry.deal, agentPubkey, swapAddress, deps.payments?.getDecimals);
         if (match.partyACurrency !== undefined && match.partyACurrency !== input.partyACurrency) return false;
         if (match.partyAAmount !== undefined && match.partyAAmount !== input.partyAAmount) return false;
         if (match.partyBCurrency !== undefined && match.partyBCurrency !== input.partyBCurrency) return false;

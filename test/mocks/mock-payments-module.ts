@@ -67,6 +67,19 @@ export function createMockPaymentsModule(): MockPaymentsModule {
       return balances.get(coinId) ?? 0n;
     },
 
+    /**
+     * Mock decimals lookup. Most trader test fixtures use simple coin
+     * symbols with small whole-number rates/volumes (e.g. ALPHA, USDC
+     * at 475 × 100 = 47500 scale), where production decimals do not
+     * matter for the test logic. Return 0 so smallest-unit conversion
+     * is a no-op (toSmallestUnitsBigInt with 0 decimals just BigInt()s
+     * the integer part).
+     */
+    getDecimals(_coinId: string): number {
+      void _coinId;
+      return 0;
+    },
+
     getAllBalances() {
       return Array.from(balances.entries()).map(([coinId, amount]) => ({
         coinId,

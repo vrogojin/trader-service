@@ -26,11 +26,11 @@ const sampleIntent: IntentRecord = {
     direction: 'buy',
     base_asset: 'ALPHA',
     quote_asset: 'USD',
-    rate_min: 100n,
-    rate_max: 200n,
-    volume_min: 10n,
-    volume_max: 50n,
-    volume_filled: 0n,
+    rate_min: '100',
+    rate_max: '200',
+    volume_min: '10',
+    volume_max: '50',
+    volume_filled: '0',
     escrow_address: 'escrow-1',
     deposit_timeout_sec: 300,
     expiry_ms: 9999999999999,
@@ -52,8 +52,8 @@ const sampleDeal: DealRecord = {
     acceptor_address: 'addr-q',
     base_asset: 'ALPHA',
     quote_asset: 'USD',
-    rate: 150n,
-    volume: 25n,
+    rate: '150',
+    volume: '25',
     proposer_direction: 'sell',
     escrow_address: 'escrow-2',
     deposit_timeout_sec: 600,
@@ -132,8 +132,8 @@ describe('createFsTraderStateStore', () => {
     expect(loaded!.intent.intent_id).toBe('int-001');
     expect(loaded!.state).toBe('ACTIVE');
     // Verify bigint round-trip
-    expect(loaded!.intent.rate_min).toBe(100n);
-    expect(loaded!.intent.rate_max).toBe(200n);
+    expect(loaded!.intent.rate_min).toBe('100');
+    expect(loaded!.intent.rate_max).toBe('200');
   });
 
   it('saveIntent + loadIntents with filter', async () => {
@@ -188,8 +188,8 @@ describe('createFsTraderStateStore', () => {
     expect(loaded!.terms.deal_id).toBe('deal-001');
     expect(loaded!.state).toBe('PROPOSED');
     // Verify bigint round-trip
-    expect(loaded!.terms.rate).toBe(150n);
-    expect(loaded!.terms.volume).toBe(25n);
+    expect(loaded!.terms.rate).toBe('150');
+    expect(loaded!.terms.volume).toBe('25');
   });
 
   it('saveDeal + loadDeals with state filter', async () => {

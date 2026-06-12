@@ -55,8 +55,8 @@ function makeDealTerms(overrides: Partial<DealTerms> = {}): DealTerms {
     acceptor_address: ADDR_TRADER_B,
     base_asset: 'ALPHA',
     quote_asset: 'USDC',
-    rate: 475n,
-    volume: 300n,
+    rate: '475',
+    volume: '300',
     // proposer SELLS base (ALPHA) for quote (USDC). Must be set — swap-executor
     // uses strict === 'sell' when mapping to partyA/partyB, so undefined falls
     // through to the buyer branch and inverts the swap direction.
@@ -240,7 +240,7 @@ describe('E2E: Trader Swap Execution', () => {
     });
 
     it('T5.2: volume_filled updated on completion (callback receives deal + payoutVerified=true)', async () => {
-      const deal = makeDealRecord('ACCEPTED', { volume: 500n });
+      const deal = makeDealRecord('ACCEPTED', { volume: '500' });
 
       await ctx.executor.executeDeal(deal);
       ctx.executor.handleSwapCompleted('swap-001', true);
@@ -250,7 +250,7 @@ describe('E2E: Trader Swap Execution', () => {
       });
 
       // The callback receives the deal so the caller can update volume_filled
-      expect(ctx.completedDeals[0]!.deal.terms.volume).toBe(500n);
+      expect(ctx.completedDeals[0]!.deal.terms.volume).toBe('500');
       expect(ctx.completedDeals[0]!.payoutVerified).toBe(true);
     });
 
@@ -336,7 +336,7 @@ describe('E2E: Trader Swap Execution', () => {
       // First deal: 400 out of 1000 total intent volume
       const deal = makeDealRecord('ACCEPTED', {
         deal_id: 'deal-partial-400',
-        volume: 400n,
+        volume: '400',
       });
 
       await ctx.executor.executeDeal(deal);
@@ -348,7 +348,7 @@ describe('E2E: Trader Swap Execution', () => {
 
       const completedDeal = ctx.completedDeals[0]!;
       expect(completedDeal.deal.state).toBe('COMPLETED');
-      expect(completedDeal.deal.terms.volume).toBe(400n);
+      expect(completedDeal.deal.terms.volume).toBe('400');
       expect(completedDeal.payoutVerified).toBe(true);
 
       // Remaining = 1000 - 400 = 600 >= volume_min
@@ -362,7 +362,7 @@ describe('E2E: Trader Swap Execution', () => {
       // Fill 850 => remaining 150 < 200 => caller transitions to FILLED
       const deal = makeDealRecord('ACCEPTED', {
         deal_id: 'deal-fill-850',
-        volume: 850n,
+        volume: '850',
       });
 
       await ctx.executor.executeDeal(deal);
@@ -374,7 +374,7 @@ describe('E2E: Trader Swap Execution', () => {
 
       const completedDeal = ctx.completedDeals[0]!;
       expect(completedDeal.deal.state).toBe('COMPLETED');
-      expect(completedDeal.deal.terms.volume).toBe(850n);
+      expect(completedDeal.deal.terms.volume).toBe('850');
       // Caller checks: remaining (1000 - 850 = 150) < volume_min (200) => FILLED
       // This test verifies the executor correctly completes and hands off to the callback
     });

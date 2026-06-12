@@ -11,7 +11,12 @@
  * Shutdown: SIGTERM → agent.stop() → sphere.destroy()
  */
 
-import { Sphere, verifySignedMessage } from '@unicitylabs/sphere-sdk';
+import {
+  Sphere,
+  verifySignedMessage,
+  getTokenDecimals,
+  getCoinIdBySymbol,
+} from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 import type { DirectMessage, SphereEventType } from '@unicitylabs/sphere-sdk';
 import * as fs from 'node:fs';
@@ -437,6 +442,16 @@ export async function startTrader(): Promise<void> {
       const assets = sphere.payments.getBalance();
       const asset = assets.find(a => a.coinId === coinId || a.symbol === coinId);
       return asset ? BigInt(asset.confirmedAmount) : 0n;
+    },
+    getDecimals(coinId: string): number {
+      // Accept either a hex coinId or a symbol. Resolve via the SDK's
+      // TokenRegistry singleton. Falls back to 18 (the convention for
+      // most 18-decimal testnet coins) when the registry has no entry.
+      const resolvedCoinId = /^[0-9a-fA-F]{64}$/.test(coinId)
+        ? coinId
+        : (getCoinIdBySymbol(coinId) ?? coinId);
+      const decimals = getTokenDecimals(resolvedCoinId);
+      return decimals > 0 ? decimals : 18;
     },
     getAllBalances() {
       const assets = sphere.payments.getBalance();

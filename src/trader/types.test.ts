@@ -111,10 +111,10 @@ const sampleIntentFields = {
   direction: 'buy' as const,
   base_asset: 'ALPHA',
   quote_asset: 'BRAVO',
-  rate_min: 100n,
-  rate_max: 200n,
-  volume_min: 500n,
-  volume_max: 1000n,
+  rate_min: '100',
+  rate_max: '200',
+  volume_min: '500',
+  volume_max: '1000',
   escrow_address: 'escrow_01',
   deposit_timeout_sec: 60,
   expiry_ms: 1700000000000,
@@ -175,11 +175,11 @@ const sampleIntent: TradingIntent = {
   direction: 'sell',
   base_asset: 'ALPHA',
   quote_asset: 'BRAVO',
-  rate_min: 100n,
-  rate_max: 200n,
-  volume_min: 500n,
-  volume_max: 1000n,
-  volume_filled: 0n,
+  rate_min: '100',
+  rate_max: '200',
+  volume_min: '500',
+  volume_max: '1000',
+  volume_filled: '0',
   escrow_address: 'escrow_01',
   deposit_timeout_sec: 60,
   expiry_ms: 1700000000000,
@@ -211,10 +211,10 @@ describe('parseDescription', () => {
     expect(parsed!.direction).toBe('sell');
     expect(parsed!.base_asset).toBe('ALPHA');
     expect(parsed!.quote_asset).toBe('BRAVO');
-    expect(parsed!.volume_min).toBe(500n);
-    expect(parsed!.volume_max).toBe(1000n);
-    expect(parsed!.rate_min).toBe(100n);
-    expect(parsed!.rate_max).toBe(200n);
+    expect(parsed!.volume_min).toBe('500');
+    expect(parsed!.volume_max).toBe('1000');
+    expect(parsed!.rate_min).toBe('100');
+    expect(parsed!.rate_max).toBe('200');
     expect(parsed!.escrow_address).toBe('escrow_01');
     expect(parsed!.deposit_timeout_sec).toBe(60);
     expect(parsed!.expiry_ms).toBe(1700000000000);
@@ -323,8 +323,8 @@ const validTerms: DealTerms = {
   acceptor_address: 'addr_02',
   base_asset: 'ALPHA',
   quote_asset: 'BRAVO',
-  rate: 150n,
-  volume: 500n,
+  rate: '150',
+  volume: '500',
   proposer_direction: 'sell',
   escrow_address: 'escrow_01',
   deposit_timeout_sec: 60,
@@ -342,12 +342,12 @@ describe('validateDealTerms', () => {
   });
 
   it('rejects zero rate', () => {
-    const err = validateDealTerms({ ...validTerms, rate: 0n });
+    const err = validateDealTerms({ ...validTerms, rate: '0' });
     expect(err).toContain('rate');
   });
 
   it('rejects zero volume', () => {
-    const err = validateDealTerms({ ...validTerms, volume: 0n });
+    const err = validateDealTerms({ ...validTerms, volume: '0' });
     expect(err).toContain('volume');
   });
 
@@ -373,14 +373,19 @@ describe('validateDealTerms', () => {
   });
 
   // M3 — rate / volume upper bound (2^128)
-  it('rejects rate > 2^128', () => {
-    const err = validateDealTerms({ ...validTerms, rate: 2n ** 128n + 1n });
+  // M3 (post-decimal-refactor): rate / volume bound is Number.MAX_SAFE_INTEGER.
+  // Rates are dimensionless ratios; volumes are in whole base units —
+  // neither approaches 2^53 in any realistic trade.
+  it('rejects rate above Number.MAX_SAFE_INTEGER', () => {
+    const tooBig = String(Number.MAX_SAFE_INTEGER + 1);
+    const err = validateDealTerms({ ...validTerms, rate: tooBig });
     expect(err).toContain('rate');
     expect(err).toContain('maximum');
   });
 
-  it('rejects volume > 2^128', () => {
-    const err = validateDealTerms({ ...validTerms, volume: 2n ** 128n + 1n });
+  it('rejects volume above Number.MAX_SAFE_INTEGER', () => {
+    const tooBig = String(Number.MAX_SAFE_INTEGER + 1);
+    const err = validateDealTerms({ ...validTerms, volume: tooBig });
     expect(err).toContain('volume');
     expect(err).toContain('maximum');
   });
