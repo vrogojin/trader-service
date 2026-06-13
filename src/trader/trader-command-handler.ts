@@ -366,16 +366,18 @@ export function createTraderCommandHandler(
     params: Record<string, unknown>,
     commandId: string,
   ): Promise<AcpResultPayload | AcpErrorPayload> {
-    // Parse and validate string amounts to bigint
-    const rateMin = safeParseBigint(params['rate_min']);
-    const rateMax = safeParseBigint(params['rate_max']);
-    const volumeMin = safeParseBigint(params['volume_min']);
-    const volumeMax = safeParseBigint(params['volume_max']);
-
-    if (rateMin === null) return errorPayload(commandId, 'INVALID_PARAM', 'rate_min must be a non-negative integer string');
-    if (rateMax === null) return errorPayload(commandId, 'INVALID_PARAM', 'rate_max must be a non-negative integer string');
-    if (volumeMin === null) return errorPayload(commandId, 'INVALID_PARAM', 'volume_min must be a non-negative integer string');
-    if (volumeMax === null) return errorPayload(commandId, 'INVALID_PARAM', 'volume_max must be a non-negative integer string');
+    // Validate decimal-string rate/volume params. Detailed format/range
+    // validation lives in validateIntentParams (called below); here we
+    // only assert each param is a string so the strict CreateIntentParams
+    // type is satisfied before the validator runs.
+    const rateMin = params['rate_min'];
+    const rateMax = params['rate_max'];
+    const volumeMin = params['volume_min'];
+    const volumeMax = params['volume_max'];
+    if (typeof rateMin !== 'string') return errorPayload(commandId, 'INVALID_PARAM', 'rate_min must be a decimal string');
+    if (typeof rateMax !== 'string') return errorPayload(commandId, 'INVALID_PARAM', 'rate_max must be a decimal string');
+    if (typeof volumeMin !== 'string') return errorPayload(commandId, 'INVALID_PARAM', 'volume_min must be a decimal string');
+    if (typeof volumeMax !== 'string') return errorPayload(commandId, 'INVALID_PARAM', 'volume_max must be a decimal string');
 
     const direction = params['direction'];
     if (direction !== 'buy' && direction !== 'sell') {
@@ -410,10 +412,10 @@ export function createTraderCommandHandler(
       direction,
       base_asset: baseAsset,
       quote_asset: quoteAsset,
-      rate_min: rateMin.toString(),
-      rate_max: rateMax.toString(),
-      volume_min: volumeMin.toString(),
-      volume_max: volumeMax.toString(),
+      rate_min: rateMin,
+      rate_max: rateMax,
+      volume_min: volumeMin,
+      volume_max: volumeMax,
       escrow_address: typeof params['escrow_address'] === 'string' ? params['escrow_address'] : undefined,
       deposit_timeout_sec: typeof params['deposit_timeout_sec'] === 'number' ? params['deposit_timeout_sec'] : undefined,
       expiry_sec: expirySec,
