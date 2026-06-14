@@ -63,17 +63,36 @@ interface TestHarness {
   logger: Logger;
 }
 
-function createTestEngine(opts?: {
+interface CreateTestEngineOpts {
   strategy?: Partial<TraderStrategy>;
   agentPubkey?: string;
-}): TestHarness {
+  /** Per-coin confirmed balance in smallest units. Default: 1_000_000_000 for every coin. */
+  getBalance?: (coinId: string) => bigint;
+  /** Per-coin decimals. Default: 0 (whole-unit semantics in tests). */
+  getDecimals?: (coinId: string) => number;
+}
+
+interface TestHarnessExtended extends TestHarness {
+  ledger: ReturnType<typeof createVolumeReservationLedger>;
+}
+
+function createTestEngine(opts?: CreateTestEngineOpts): TestHarnessExtended {
   const market = createMockMarketModule();
-  const ledger = createVolumeReservationLedger(() => 10_000n);
+  // Default balance is far above the default-params worst-case exposure
+  // (rate_max=110 × volume_max=100 = 11_000 whole units at decimals=0)
+  // so existing tests that don't care about portfolio sizing keep passing.
+  const getBalance = opts?.getBalance ?? ((_coin: string) => 1_000_000_000n);
+  const ledger = createVolumeReservationLedger(getBalance);
   const onMatchFound = vi.fn<OnMatchFound>().mockResolvedValue(undefined);
   const logger = createMockLogger();
 
   const strategy = defaultStrategy(opts?.strategy);
   const pubkey = opts?.agentPubkey ?? AGENT_PUBKEY;
+  // Default decimals=0 so the existing tests' integer rate/volume strings
+  // (e.g. "100" × "110" = 11_000 whole units for default-params buy intent)
+  // map 1:1 to smallest units and stay well below the default 1B balance
+  // ceiling without rewriting fixtures.
+  const getDecimals = opts?.getDecimals ?? ((_coin: string) => 0);
 
   const deps: IntentEngineDeps = {
     market,
@@ -83,11 +102,12 @@ function createTestEngine(opts?: {
     agentAddress: AGENT_ADDRESS,
     signMessage: (msg: string) => `sig:${msg.slice(0, 8)}`,
     onMatchFound,
+    getDecimals,
     logger,
   };
 
   const engine = createIntentEngine(deps);
-  return { engine, market, onMatchFound, logger };
+  return { engine, market, onMatchFound, logger, ledger };
 }
 
 /**
@@ -295,6 +315,204 @@ describe('IntentEngine', () => {
       // Intent should not be stored
       const list = await engine.listIntents();
       expect(list).toHaveLength(0);
+    });
+
+    // -------------------------------------------------------------------
+    // Pre-flight portfolio balance check (issue #29)
+    // -------------------------------------------------------------------
+    //
+    // Without this gate the failure surfaces only at deal-acceptance time
+    // as a terminal VOLUME_RESERVATION_FAILED — visible to the counterparty
+    // as an aborted swap, with no actionable signal to the operator. The
+    // pre-flight rejects at create time so misconfigured intents never
+    // hit the wire.
+
+    describe('pre-flight balance check (issue #29)', () => {
+      it('rejects buy intent when rate_max × volume_max exceeds available quote balance', async () => {
+        // bob: 4.5 ETH deposited, buy 50 UCT at [0.08, 0.12] → needs 6 ETH worst-case.
+        // decimals = 18 → 4.5 ETH = 4_500_000_000_000_000_000 wei.
+        const { engine } = createTestEngine({
+          getBalance: (coin: string) =>
+            coin === 'ETH' ? 4_500_000_000_000_000_000n : 0n,
+          getDecimals: (coin: string) => (coin === 'ETH' ? 18 : 0),
+        });
+
+        await expect(
+          engine.createIntent(
+            defaultParams({
+              direction: 'buy',
+              base_asset: 'UCT',
+              quote_asset: 'ETH',
+              rate_min: '0.08',
+              rate_max: '0.12',
+              volume_min: '10',
+              volume_max: '50',
+            }),
+            AGENT_PUBKEY,
+            AGENT_ADDRESS,
+          ),
+        ).rejects.toThrow('INSUFFICIENT_PORTFOLIO_FOR_RATE_BAND');
+      });
+
+      it('accepts buy intent when available quote balance covers worst-case exposure', async () => {
+        // 6 ETH exactly covers rate_max=0.12 × volume_max=50 = 6 ETH.
+        const { engine } = createTestEngine({
+          getBalance: (coin: string) =>
+            coin === 'ETH' ? 6_000_000_000_000_000_000n : 0n,
+          getDecimals: (coin: string) => (coin === 'ETH' ? 18 : 0),
+        });
+
+        const record = await engine.createIntent(
+          defaultParams({
+            direction: 'buy',
+            base_asset: 'UCT',
+            quote_asset: 'ETH',
+            rate_min: '0.08',
+            rate_max: '0.12',
+            volume_min: '10',
+            volume_max: '50',
+          }),
+          AGENT_PUBKEY,
+          AGENT_ADDRESS,
+        );
+        expect(record.state).toBe('ACTIVE');
+      });
+
+      it('rejects sell intent when volume_max exceeds available base balance', async () => {
+        // Sell 100 UCT but only 50 UCT available.
+        const { engine } = createTestEngine({
+          getBalance: (coin: string) => (coin === 'UCT' ? 50n : 0n),
+          getDecimals: () => 0,
+        });
+
+        await expect(
+          engine.createIntent(
+            defaultParams({
+              direction: 'sell',
+              base_asset: 'UCT',
+              quote_asset: 'ETH',
+              rate_min: '0.08',
+              rate_max: '0.12',
+              volume_min: '10',
+              volume_max: '100',
+            }),
+            AGENT_PUBKEY,
+            AGENT_ADDRESS,
+          ),
+        ).rejects.toThrow('INSUFFICIENT_PORTFOLIO_FOR_RATE_BAND');
+      });
+
+      it('accepts sell intent when base balance covers volume_max', async () => {
+        const { engine } = createTestEngine({
+          getBalance: (coin: string) => (coin === 'UCT' ? 100n : 0n),
+          getDecimals: () => 0,
+        });
+
+        const record = await engine.createIntent(
+          defaultParams({
+            direction: 'sell',
+            base_asset: 'UCT',
+            quote_asset: 'ETH',
+            rate_min: '0.08',
+            rate_max: '0.12',
+            volume_min: '10',
+            volume_max: '100',
+          }),
+          AGENT_PUBKEY,
+          AGENT_ADDRESS,
+        );
+        expect(record.state).toBe('ACTIVE');
+      });
+
+      it('honours active reservations — same intent that passed before now fails', async () => {
+        // Bob has 6 ETH free, posts a fully-cover buy intent, then reserves
+        // 1 ETH for an in-flight deal. A second identical buy intent at the
+        // same band now exceeds the *available* (post-reservation) balance.
+        const { engine, ledger } = createTestEngine({
+          getBalance: (coin: string) =>
+            coin === 'ETH' ? 6_000_000_000_000_000_000n : 0n,
+          getDecimals: (coin: string) => (coin === 'ETH' ? 18 : 0),
+        });
+
+        await engine.createIntent(
+          defaultParams({
+            direction: 'buy',
+            base_asset: 'UCT',
+            quote_asset: 'ETH',
+            rate_min: '0.08',
+            rate_max: '0.12',
+            volume_min: '10',
+            volume_max: '50',
+          }),
+          AGENT_PUBKEY,
+          AGENT_ADDRESS,
+        );
+
+        // Simulate an in-flight deal reserving 1 ETH.
+        const reserved = await ledger.reserve(
+          'ETH',
+          1_000_000_000_000_000_000n,
+          'deal-1',
+        );
+        expect(reserved).toBe(true);
+
+        // Second buy at the same band now needs 6 ETH but only 5 ETH free.
+        await expect(
+          engine.createIntent(
+            defaultParams({
+              direction: 'buy',
+              base_asset: 'UCT',
+              quote_asset: 'ETH',
+              rate_min: '0.08',
+              rate_max: '0.12',
+              volume_min: '10',
+              volume_max: '50',
+            }),
+            AGENT_PUBKEY,
+            AGENT_ADDRESS,
+          ),
+        ).rejects.toThrow('INSUFFICIENT_PORTFOLIO_FOR_RATE_BAND');
+      });
+
+      it('error message includes the asset and the smallest-unit values', async () => {
+        const { engine } = createTestEngine({
+          getBalance: () => 0n,
+          getDecimals: () => 0,
+        });
+
+        await expect(
+          engine.createIntent(
+            defaultParams({
+              direction: 'sell',
+              base_asset: 'UCT',
+              quote_asset: 'ETH',
+              rate_min: '1',
+              rate_max: '1',
+              volume_min: '1',
+              volume_max: '5',
+            }),
+            AGENT_PUBKEY,
+            AGENT_ADDRESS,
+          ),
+        ).rejects.toThrow(/UCT.*5.*0|0.*5.*UCT/);
+      });
+
+      it('does not post to the market when the pre-flight rejects', async () => {
+        const { engine, market } = createTestEngine({
+          getBalance: () => 0n,
+          getDecimals: () => 0,
+        });
+
+        await expect(
+          engine.createIntent(
+            defaultParams({ direction: 'sell' }),
+            AGENT_PUBKEY,
+            AGENT_ADDRESS,
+          ),
+        ).rejects.toThrow('INSUFFICIENT_PORTFOLIO_FOR_RATE_BAND');
+
+        expect(market.postIntentCalls).toHaveLength(0);
+      });
     });
   });
 

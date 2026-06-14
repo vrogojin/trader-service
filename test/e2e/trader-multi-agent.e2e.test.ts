@@ -189,8 +189,11 @@ function createMultiAgentSetup(
 
     const market = createMockMarketModule();
     const payments = createMockPaymentsModule();
-    payments.setBalance('ALPHA', 10_000n);
-    payments.setBalance('USDC', 50_000n);
+    // Generous balances so the createIntent pre-flight (issue #29) passes for
+    // every direction these tests post. Default fixtures use rate_max=500 ×
+    // volume_max=1000 = 500_000 USDC for buy and volume_max=1000 for sell.
+    payments.setBalance('ALPHA', 10_000_000n);
+    payments.setBalance('USDC', 10_000_000n);
 
     const swap = createMockSwapAdapter();
 
@@ -253,6 +256,7 @@ function createMultiAgentSetup(
       agentAddress: keys.address,
       signMessage: makeSign(keys.pubkey),
       onMatchFound,
+      getDecimals: payments.getDecimals.bind(payments),
       logger,
     });
 
@@ -405,7 +409,7 @@ describe('T13 — Multi-Agent Swap Flows', () => {
     // 2. Reserve volume on A's ledger for this deal
     const reserved = await agentA.ledger.reserve('ALPHA', 300n, 'pre-deal-a');
     expect(reserved).toBe(true);
-    expect(agentA.ledger.getAvailable('ALPHA')).toBe(9700n);
+    expect(agentA.ledger.getAvailable('ALPHA')).toBe(10_000_000n - 300n);
 
     // 3. Verify proposer selection: PK_A < PK_B so A should propose
     expect(PK_A < PK_B).toBe(true);
@@ -491,7 +495,7 @@ describe('T13 — Multi-Agent Swap Flows', () => {
 
     // 8. Release reservation now that deal is completed
     agentA.ledger.release('pre-deal-a');
-    expect(agentA.ledger.getAvailable('ALPHA')).toBe(10_000n);
+    expect(agentA.ledger.getAvailable('ALPHA')).toBe(10_000_000n);
     expect(agentA.ledger.getReservations()).toHaveLength(0);
 
     // Cleanup — stop ALL components on ALL agents
@@ -838,7 +842,7 @@ describe('T13 — Multi-Agent Swap Flows', () => {
 
     // Volume reservations don't interfere — release X, check Y unaffected
     agentA.ledger.release('deal-x-reserve');
-    expect(agentA.ledger.getAvailable('ALPHA')).toBe(10_000n);
+    expect(agentA.ledger.getAvailable('ALPHA')).toBe(10_000_000n);
 
     // A had two accepted deals total
     expect(agentA.acceptedDeals).toHaveLength(2);

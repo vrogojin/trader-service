@@ -14,22 +14,7 @@ import { join } from 'node:path';
 
 import { pubkeysEqual } from '../shared/crypto.js';
 import { withTimeout } from '../shared/with-timeout.js';
-
-/**
- * Convert a whole-unit number to a smallest-units bigint at the given
- * decimal precision. Used at the wallet-reservation boundary where the
- * SDK's bigint balances must be compared against the trader's
- * human-units terms. Decimals are the only thing we ever look up;
- * everywhere ELSE the trader works in plain decimal strings.
- */
-function toSmallestUnitsBigInt(amount: number, decimals: number): bigint {
-  // `amount.toFixed(decimals)` rounds to the target precision; we then
-  // strip the decimal point and BigInt the resulting integer-string.
-  const fixed = amount.toFixed(decimals);
-  const [intPart, fracPartRaw = ''] = fixed.split('.');
-  const fracPart = fracPartRaw.padEnd(decimals, '0').slice(0, decimals);
-  return BigInt((intPart ?? '0') + fracPart);
-}
+import { toSmallestUnitsBigInt } from './utils.js';
 import type { Logger } from '../shared/logger.js';
 import type { TenantConfig } from '../shared/types.js';
 import type { SphereDmSender, SphereDmReceiver } from '../tenant/types.js';
@@ -670,6 +655,7 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
         agentNametag: deps.agentNametag,
         signMessage,
         onMatchFound,
+        getDecimals: payments.getDecimals.bind(payments),
         logger: logger.child({ component: 'intent-engine' }),
       });
 

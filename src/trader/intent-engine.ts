@@ -26,6 +26,7 @@ import {
   computeIntentId,
   encodeDescription,
   parseDescription,
+  toSmallestUnitsBigInt,
   validateIntentParams,
 } from './utils.js';
 import { pubkeysEqual, canonicalPubkeyKey } from '../shared/crypto.js';
@@ -68,6 +69,13 @@ export interface IntentEngineDeps {
   readonly agentNametag?: string | null;
   readonly signMessage: (message: string) => string;
   readonly onMatchFound: OnMatchFound;
+  /**
+   * Decimals for a given coin. Used by the pre-flight balance check in
+   * createIntent() to convert (rate_max × volume_max) and volume_max from
+   * whole-unit decimals to smallest-unit bigints for comparison against
+   * `ledger.getAvailable()`.
+   */
+  readonly getDecimals: (coinId: string) => number;
   readonly logger: Logger;
 }
 
@@ -140,10 +148,12 @@ function weAreProposer(ownPubkey: string, counterpartyPubkey: string): boolean {
 export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   const {
     market,
+    ledger,
     strategy: initialStrategy,
     agentPubkey,
     signMessage,
     onMatchFound,
+    getDecimals,
     logger,
   } = deps;
   let strategy: TraderStrategy = { ...initialStrategy };
@@ -815,6 +825,53 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       const validationError = validateIntentParams(params);
       if (validationError !== null) {
         throw new Error(`Invalid intent params: ${validationError}`);
+      }
+
+      // Pre-flight portfolio balance check (issue #29).
+      //
+      // An intent represents an unconditional promise to honor any rate
+      // inside [rate_min, rate_max] for any volume inside [volume_min,
+      // volume_max]. Negotiation picks the midpoint of the rate overlap
+      // and the smaller of the two volume maxes — a counterparty with a
+      // narrow band pinning the rate at OUR rate_max forces us to settle
+      // at our upper-bound exposure. So the portfolio must cover the
+      // WORST case for us, not the midpoint:
+      //   buy:  needs rate_max × volume_max units of quote_asset
+      //   sell: needs volume_max units of base_asset
+      //
+      // Without this gate the only failure mode is VOLUME_RESERVATION_FAILED
+      // at deal-acceptance time — a terminal deal state visible only to the
+      // counterparty as an aborted swap, with no actionable signal to the
+      // operator. Catching it at create time turns runtime drift into a
+      // configuration error: Fail-Closed-Early.
+      const assetToCover =
+        params.direction === 'buy' ? params.quote_asset : params.base_asset;
+      const requiredWhole =
+        params.direction === 'buy'
+          ? Number(params.rate_max) * Number(params.volume_max)
+          : Number(params.volume_max);
+      const decimals = getDecimals(assetToCover);
+      const requiredSmallest = toSmallestUnitsBigInt(requiredWhole, decimals);
+      const availableSmallest = ledger.getAvailable(assetToCover);
+      if (availableSmallest < requiredSmallest) {
+        logger.warn('create_intent_insufficient_portfolio_for_rate_band', {
+          direction: params.direction,
+          base_asset: params.base_asset,
+          quote_asset: params.quote_asset,
+          rate_max: params.rate_max,
+          volume_max: params.volume_max,
+          asset_to_cover: assetToCover,
+          required_smallest: requiredSmallest.toString(),
+          available_smallest: availableSmallest.toString(),
+          decimals,
+        });
+        throw new Error(
+          `INSUFFICIENT_PORTFOLIO_FOR_RATE_BAND: ${params.direction} intent ` +
+            `needs ${requiredSmallest.toString()} smallest units of ` +
+            `${assetToCover} (rate_max=${params.rate_max} × ` +
+            `volume_max=${params.volume_max}) but available is ` +
+            `${availableSmallest.toString()}`,
+        );
       }
 
       // Check max_active_intents

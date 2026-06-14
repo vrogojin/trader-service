@@ -12,6 +12,27 @@ import type { DealTerms, TradingIntent } from './types.js';
 export { hasDangerousKeys } from '../protocols/envelope.js';
 
 // ---------------------------------------------------------------------------
+// Unit conversion helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a whole-unit number to a smallest-units bigint at the given
+ * decimal precision. Used at boundaries where the SDK's bigint balances
+ * must be compared against the trader's human-units terms (rate × volume).
+ *
+ * `amount.toFixed(decimals)` rounds to the target precision (banker's
+ * rounding); we then strip the decimal point and BigInt the resulting
+ * integer-string. The round-trip absorbs float ε noise for any rate/volume
+ * combination that lands within typical trading precision.
+ */
+export function toSmallestUnitsBigInt(amount: number, decimals: number): bigint {
+  const fixed = amount.toFixed(decimals);
+  const [intPart, fracPartRaw = ''] = fixed.split('.');
+  const fracPart = fracPartRaw.padEnd(decimals, '0').slice(0, decimals);
+  return BigInt((intPart ?? '0') + fracPart);
+}
+
+// ---------------------------------------------------------------------------
 // Canonical JSON (JCS-compatible: sorted keys, no whitespace)
 // ---------------------------------------------------------------------------
 
