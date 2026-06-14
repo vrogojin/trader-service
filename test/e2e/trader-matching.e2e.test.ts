@@ -61,8 +61,13 @@ function setupMatchingTest(opts?: {
   const agentPubkey = opts?.agentPubkey ?? PK_TRADER_A;
   const market = createMockMarketModule();
   const payments = createMockPaymentsModule();
-  payments.setBalance('ALPHA', 10_000n);
-  payments.setBalance('USDC', 50_000n);
+  // Generous balances so the createIntent pre-flight (issue #29) passes for
+  // every direction these tests post. Default fixtures use rate_max=500 ×
+  // volume_max=1000 = 500_000 USDC for buy and volume_max=1000 for sell,
+  // and one T14 case uses BTC_L2 with rate_max=26000 × volume_max=1000.
+  payments.setBalance('ALPHA', 10_000_000n);
+  payments.setBalance('USDC', 10_000_000n);
+  payments.setBalance('BTC_L2', 10_000_000n);
 
   const strategy: TraderStrategy = {
     ...DEFAULT_STRATEGY,
@@ -90,6 +95,7 @@ function setupMatchingTest(opts?: {
     agentAddress: ADDR_TRADER_A,
     signMessage: (msg: string) => `sig_${msg.slice(0, 8)}`,
     onMatchFound,
+    getDecimals: payments.getDecimals.bind(payments),
     logger,
   });
 

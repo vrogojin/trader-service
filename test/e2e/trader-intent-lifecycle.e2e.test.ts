@@ -96,6 +96,7 @@ function setupTraderE2E(opts?: {
     agentAddress: AGENT_ADDRESS,
     signMessage,
     onMatchFound: async () => { /* no-op for intent lifecycle tests */ },
+    getDecimals: payments.getDecimals.bind(payments),
     logger: logger.child({ component: 'intent-engine' }),
   });
 
