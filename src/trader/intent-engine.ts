@@ -46,8 +46,29 @@ export interface IntentEngine {
   getIntent(intentId: string): IntentRecord | null;
   /** Restore an intent to ACTIVE after a failed deal (e.g., negotiation timeout). */
   restoreToActive(intentId: string): void;
-  /** Mark a counterparty as failed for a given intent so it won't be matched again. */
+  /**
+   * Mark a counterparty as failed for a given intent with an *immediate*
+   * tarpit. Used by strong-signal paths (W2 yield-timeout fall-through) where
+   * one observation is enough to suspect a dead peer. The entry expires after
+   * `TARPIT_TTL_MS` so a counterparty returning to life resumes matching.
+   */
   markCounterpartyFailed(intentId: string, counterpartyPubkey: string): void;
+  /**
+   * Record a *transient* counterparty failure (proposal timeout / send
+   * failure) for the given intent. The counterparty is only tarpitted after
+   * `TARPIT_FAILURE_THRESHOLD` consecutive failures, so a single dropped DM
+   * does not penalise an otherwise live peer. See issue #30 for the soak
+   * failure mode this fixes.
+   */
+  recordCounterpartyFailure(intentId: string, counterpartyPubkey: string): void;
+  /**
+   * Clear the recorded failure history for a counterparty on this intent.
+   * Called when the counterparty proves responsive (e.g. on receiving their
+   * `np.accept_deal`) so that "K consecutive failures" really means
+   * consecutive — not "K within the decay window regardless of successes
+   * in between."
+   */
+  clearCounterpartyFailures(intentId: string, counterpartyPubkey: string): void;
   /** Record a partial or full fill after a successful swap. */
   recordFill(intentId: string, filledVolume: string): void;
   /** Look up an intent by its MarketModule ID (UUID). */
@@ -158,9 +179,51 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   // In-memory intent store, keyed by intent_id
   const intents = new Map<string, IntentRecord>();
 
-  // Per-intent set of counterparty pubkeys that failed (timed out / rejected).
-  // Prevents repeatedly matching against the same dead counterparty.
-  const failedCounterparties = new Map<string, Set<string>>();
+  // Per-intent map of counterparty pubkeys that failed (timed out / rejected).
+  // Prevents the matcher from re-picking the same dead counterparty on every
+  // 30s scan tick (issue #30).
+  //
+  // Each entry tracks:
+  //   - failureCount: consecutive transient-failure observations (proposal
+  //     timeout / send failure). The counterparty is only excluded once
+  //     this reaches TARPIT_FAILURE_THRESHOLD, so a single dropped DM
+  //     does not penalise an otherwise live peer.
+  //   - tarpitUntil: ms timestamp until which matchesCriteria() filters
+  //     this counterparty out. Set to `nowMs() + TARPIT_TTL_MS` once the
+  //     threshold trips, OR immediately on strong-signal paths (W2 yield
+  //     fall-through via markCounterpartyFailed). 0 means "counter only,
+  //     no active tarpit yet".
+  //   - lastFailureAt: ms timestamp of last failure observation. Used to
+  //     decay failureCount after TARPIT_COUNTER_DECAY_MS of quiet so a
+  //     counterparty that recovers does not carry old strikes forever.
+  //
+  // Capacity is bounded per-intent by MAX_FAILED_PER_INTENT; eviction is
+  // LRU-by-lastFailureAt (insertion order of the Map under the existing
+  // delete+re-add idiom).
+  interface TarpitEntry {
+    failureCount: number;
+    tarpitUntil: number;
+    lastFailureAt: number;
+  }
+  const failedCounterparties = new Map<string, Map<string, TarpitEntry>>();
+
+  // Tarpit policy constants (see issue #30).
+  // - THRESHOLD = 2: tolerate one transient miss (lost Nostr DM, jittered
+  //   relay) without penalising the peer; two consecutive misses are strong
+  //   evidence they are unresponsive.
+  // - TTL_MS = 5 min: long enough to skip ~10 scan cycles (default
+  //   scan_interval_ms = 30s), short enough that a recovered peer re-enters
+  //   the candidate pool quickly.
+  // - COUNTER_DECAY_MS = 10 min: if no failure was observed in this window,
+  //   the counter resets to 0 on the next observation. Prevents a peer
+  //   that flapped 2 hours ago from being insta-tarpitted on a single
+  //   modern miss.
+  // - MAX_FAILED_PER_INTENT = 1000: capacity bound. Issue #30 explicitly
+  //   asks the new TTL semantics to live alongside the existing LRU bound.
+  const TARPIT_FAILURE_THRESHOLD = 2;
+  const TARPIT_TTL_MS = 5 * 60 * 1000;
+  const TARPIT_COUNTER_DECAY_MS = 10 * 60 * 1000;
+  const MAX_FAILED_PER_INTENT = 1000;
 
   // Per-intent timestamp of the FIRST scan-cycle yield under spec 5.7. When
   // every match candidate is a lower-pubkey-priority peer (so we should
@@ -330,11 +393,17 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
       return false;
     }
 
-    // 7b. Not a recently-failed counterparty for this intent.
+    // 7b. Not a tarpitted counterparty for this intent.
     // Normalize to a format-independent key so the same peer can't bypass the
-    // failed-list by reconnecting with a different pubkey encoding.
+    // tarpit list by reconnecting with a different pubkey encoding.
+    //
+    // A counterparty is excluded only while `tarpitUntil > now`. Once the
+    // window elapses the entry is treated as absent (and is cleared on the
+    // next failure observation so the counter starts fresh). This matches
+    // the issue #30 contract: short-TTL tarpit, not a permanent blacklist.
     const failed = failedCounterparties.get(own.intent_id);
-    if (failed?.has(canonicalPubkeyKey(result.agentPublicKey))) {
+    const entry = failed?.get(canonicalPubkeyKey(result.agentPublicKey));
+    if (entry !== undefined && entry.tarpitUntil > nowMs()) {
       return false;
     }
 
@@ -802,6 +871,92 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
   }
 
   // ---------------------------------------------------------------------------
+  // Tarpit bookkeeping (issue #30)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Shared insert/update path for `failedCounterparties`.
+   *
+   * @param immediateTarpit  - true: set tarpitUntil to now+TTL regardless of
+   *                            failureCount (strong-signal path).
+   *                          - false: increment failureCount; only set
+   *                            tarpitUntil once it reaches the threshold
+   *                            (soft-threshold path).
+   *
+   * Behaviour:
+   *  - LRU eviction by `lastFailureAt` (delete+re-set keeps Map iteration
+   *    insertion-order; eviction drops the front).
+   *  - Counter decay: if the previous failure was >= TARPIT_COUNTER_DECAY_MS
+   *    ago, treat this observation as the first of a new cycle (reset to 1).
+   *  - Resolves either local intent_id or market_intent_id (DealTerms carry
+   *    market IDs) so callers don't have to translate.
+   */
+  function writeTarpitEntry(
+    intentId: string,
+    counterpartyPubkey: string,
+    immediateTarpit: boolean,
+  ): void {
+    const record = resolveIntentByEitherId(intentId);
+    const localId = record?.intent.intent_id ?? intentId;
+
+    let perIntent = failedCounterparties.get(localId);
+    if (!perIntent) {
+      perIntent = new Map();
+      failedCounterparties.set(localId, perIntent);
+    }
+
+    const key = canonicalPubkeyKey(counterpartyPubkey);
+    const now = nowMs();
+    const existing = perIntent.get(key);
+
+    // Decay rule: a counterparty that hasn't failed recently starts fresh.
+    // Without this, a peer that flapped, recovered, ran cleanly for an
+    // hour, then dropped a single DM would be insta-tarpitted because the
+    // old failureCount is still at THRESHOLD.
+    const counterShouldDecay =
+      existing !== undefined &&
+      now - existing.lastFailureAt >= TARPIT_COUNTER_DECAY_MS;
+
+    let nextCount: number;
+    if (existing === undefined || counterShouldDecay) {
+      nextCount = 1;
+    } else {
+      nextCount = existing.failureCount + 1;
+    }
+
+    const nextTarpit = immediateTarpit || nextCount >= TARPIT_FAILURE_THRESHOLD
+      ? now + TARPIT_TTL_MS
+      : 0;
+
+    const nextEntry: TarpitEntry = {
+      failureCount: nextCount,
+      tarpitUntil: nextTarpit,
+      lastFailureAt: now,
+    };
+
+    // LRU semantics: delete+re-add moves a refreshed peer to the most-
+    // recently-failed position so they survive eviction longer than peers
+    // that have gone quiet.
+    if (existing !== undefined) {
+      perIntent.delete(key);
+    } else if (perIntent.size >= MAX_FAILED_PER_INTENT) {
+      // Capacity eviction: drop the least-recently-failed entry. Map
+      // iteration order is insertion order; the front is the oldest.
+      const oldestKey = perIntent.keys().next().value;
+      if (oldestKey !== undefined) perIntent.delete(oldestKey);
+    }
+    perIntent.set(key, nextEntry);
+
+    logger.info('counterparty_failure_recorded', {
+      intent_id: localId,
+      counterparty: counterpartyPubkey,
+      failure_count: nextCount,
+      tarpitted: nextTarpit > 0,
+      immediate: immediateTarpit,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
 
@@ -1042,35 +1197,34 @@ export function createIntentEngine(deps: IntentEngineDeps): IntentEngine {
     },
 
     markCounterpartyFailed(intentId: string, counterpartyPubkey: string): void {
-      // Resolve to the LOCAL intent_id so the failed-counterparty Set is
-      // keyed consistently regardless of whether the caller passed a local
-      // or a market intent_id (DealTerms carry market IDs).
+      // Strong-signal path: immediately tarpit. Used by the W2 yield-timeout
+      // fall-through where 45s of silence is sufficient evidence the
+      // counterparty is dead. See `recordCounterpartyFailure` for the
+      // soft-threshold path used by single-deal proposal failures.
+      writeTarpitEntry(intentId, counterpartyPubkey, /* immediateTarpit */ true);
+    },
+
+    recordCounterpartyFailure(intentId: string, counterpartyPubkey: string): void {
+      // Soft-threshold path: increment the failure counter; only tarpit
+      // once we cross TARPIT_FAILURE_THRESHOLD. One dropped DM is not
+      // enough to penalise an otherwise live peer (issue #30).
+      writeTarpitEntry(intentId, counterpartyPubkey, /* immediateTarpit */ false);
+    },
+
+    clearCounterpartyFailures(intentId: string, counterpartyPubkey: string): void {
+      // Resolve to the LOCAL intent_id so the lookup matches what the
+      // failure-recording path stored (it also resolves to local).
       const record = resolveIntentByEitherId(intentId);
       const localId = record?.intent.intent_id ?? intentId;
-
-      const MAX_FAILED_PER_INTENT = 1000;
-      let set = failedCounterparties.get(localId);
-      if (!set) {
-        set = new Set();
-        failedCounterparties.set(localId, set);
-      }
-      // Use canonical form so a peer can't re-engage by presenting a different
-      // pubkey encoding of the same identity.
+      const perIntent = failedCounterparties.get(localId);
+      if (!perIntent) return;
       const key = canonicalPubkeyKey(counterpartyPubkey);
-      // LRU semantics: if this peer is already on the list, delete+re-add
-      // refreshes their position (most-recently-failed). This ensures actively
-      // failing peers stay blocked even as new failures push the oldest out.
-      if (set.has(key)) {
-        set.delete(key);
-      } else if (set.size >= MAX_FAILED_PER_INTENT) {
-        // Capacity eviction: drop the LEAST-recently-failed (first-inserted under
-        // LRU ordering) to make room. Set iteration order is insertion order, and
-        // the delete+re-add pattern above moves refreshed peers to the end.
-        const oldest = set.values().next().value;
-        if (oldest !== undefined) set.delete(oldest);
-      }
-      set.add(key);
-      logger.info('counterparty_marked_failed', { intent_id: localId, counterparty: counterpartyPubkey });
+      if (!perIntent.has(key)) return;
+      perIntent.delete(key);
+      logger.info('counterparty_failures_cleared', {
+        intent_id: localId,
+        counterparty: counterpartyPubkey,
+      });
     },
 
     recordFill(intentId: string, filledVolume: string): void {

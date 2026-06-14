@@ -15,6 +15,7 @@ import { MAX_MESSAGE_SIZE } from '../protocols/envelope.js';
 import { hasDangerousKeys, canonicalJson } from './utils.js';
 import { validateDealTerms } from './utils.js';
 import type {
+  CancellationReason,
   DealTerms,
   DealRecord,
   DealState,
@@ -593,7 +594,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
   async function transitionDeal(
     dealId: string,
     newState: DealState,
-    options?: { errorCode?: string },
+    options?: { errorCode?: string; reason?: CancellationReason },
   ): Promise<DealRecord | null> {
     const deal = deals.get(dealId);
     if (!deal) return null;
@@ -639,8 +640,13 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
                (d.state === 'ACCEPTED' || d.state === 'EXECUTING'),
       );
       if (!hasSiblingAccepted) {
+        // Forward the cancellation reason. Callers without a specific signal
+        // (legacy paths, defensive fall-throughs) get 'unknown', which the
+        // trader-level handler treats as "restore intent, do not tarpit" —
+        // matching the historical behaviour from before reasons were threaded.
+        const reason: CancellationReason = options?.reason ?? 'unknown';
         try {
-          onDealCancelled(updated);
+          onDealCancelled(updated, reason);
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
           logger.error('on_deal_cancelled_callback_failed', { deal_id: dealId, error: message });
@@ -672,7 +678,13 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       // is now async. Errors are handled inside persistDeal; any uncaught
       // rejection here is logged so the process doesn't die from an
       // unhandled rejection during background deal expiry.
-      transitionDeal(dealId, 'CANCELLED').catch((err: unknown) => {
+      //
+      // Reason: 'proposal_timeout' — startTimer is only invoked from
+      // proposeDeal() (see PROPOSE_TIMEOUT_MS callsite), so the only state
+      // a still-live timer can fire against is PROPOSED. The trader-level
+      // onDealCancelled handler uses this signal to tarpit the unresponsive
+      // counterparty (issue #30).
+      transitionDeal(dealId, 'CANCELLED', { reason: 'proposal_timeout' }).catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);
         logger.warn('deal_timeout_transition_failed', { deal_id: dealId, error: message });
       });
@@ -1231,7 +1243,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
       // only reachable from ACCEPTED/EXECUTING per the state machine.
       // The auto-accept gate treats anything not-in-ACCEPTED-or-EXECUTING
       // as "blocked", so CANCELLED is sufficient protection.
-      await transitionDeal(msg.deal_id, 'CANCELLED');
+      await transitionDeal(msg.deal_id, 'CANCELLED', { reason: 'accept_send_failed' });
       return;
     }
 
@@ -1341,7 +1353,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
           deal_id: msg.deal_id,
           winning_deal_id: otherId,
         });
-        await transitionDeal(msg.deal_id, 'CANCELLED');
+        await transitionDeal(msg.deal_id, 'CANCELLED', { reason: 'sibling_cancelled' });
         return;
       }
     }
@@ -1392,7 +1404,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
         otherDeal.terms.proposer_intent_id === intentId
       ) {
         clearTimer(otherId);
-        await transitionDeal(otherId, 'CANCELLED');
+        await transitionDeal(otherId, 'CANCELLED', { reason: 'sibling_cancelled' });
         logger.info('sibling_proposal_cancelled', {
           cancelled_deal_id: otherId,
           winning_deal_id: msg.deal_id,
@@ -1486,7 +1498,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     }
 
     clearTimer(msg.deal_id);
-    await transitionDeal(msg.deal_id, 'CANCELLED');
+    await transitionDeal(msg.deal_id, 'CANCELLED', { reason: 'counterparty_rejected' });
 
     const payload = msg.payload as Record<string, unknown>;
     logger.info('np_deal_rejected', {
@@ -1581,7 +1593,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
         error: message,
       });
       clearTimer(dealId);
-      await transitionDeal(dealId, 'CANCELLED');
+      await transitionDeal(dealId, 'CANCELLED', { reason: 'proposal_send_failed' });
       throw err;
     } finally {
       // Always clear the send timeout to prevent timer leak (steelman #3)
@@ -1750,7 +1762,7 @@ export function createNegotiationHandler(deps: NegotiationHandlerDeps): Negotiat
     for (const [dealId, deal] of deals) {
       if (!(TERMINAL_DEAL_STATES as readonly string[]).includes(deal.state)) {
         clearTimer(dealId);
-        transitionDeal(dealId, 'CANCELLED').catch((err: unknown) => {
+        transitionDeal(dealId, 'CANCELLED', { reason: 'shutdown' }).catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
           logger.warn('cancel_pending_transition_failed', { deal_id: dealId, error: message });
         });

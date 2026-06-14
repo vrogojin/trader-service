@@ -469,6 +469,23 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
       const onDealAccepted: OnDealAccepted = async (deal: DealRecord) => {
         if (!swapExecutor || !ledger || !stateStore) return;
 
+        // Issue #30 success-reset: if we are the proposer and the acceptor's
+        // np.accept_deal just arrived, they have proved responsive at the
+        // NP-0 layer — so the tarpit failure counter for this counterparty
+        // on our intent must be cleared. Without this reset, intermittent
+        // network jitter could accumulate stale strikes across long-running
+        // intents and produce spurious 5-min exclusions even after a
+        // successful handshake. Acceptor side has nothing to clear here
+        // (it never records failures against the proposer in this callback
+        // path).
+        const proposerHere = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
+        if (proposerHere && intentEngine) {
+          const ourId = ourIntentId(deal);
+          if (ourId !== null) {
+            intentEngine.clearCounterpartyFailures(ourId, deal.terms.acceptor_pubkey);
+          }
+        }
+
         // Warning fix — volume reservation failure must ABORT the deal rather
         // than proceed. Previously a failed reserve logged a warning and fell
         // through to proposeSwap, potentially over-committing volume across
@@ -717,23 +734,33 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           return null;
         },
         getTrustedEscrows: () => strategy.trusted_escrows,
-        onDealCancelled: (deal) => {
+        onDealCancelled: (deal, reason) => {
           // Restore the intent to ACTIVE so the next scan cycle can re-match.
           //
-          // We deliberately DO NOT call markCounterpartyFailed() on a plain
-          // CANCELLED deal. Cancellation reasons include:
-          //   - proposal timeout (counterparty unreachable — could be transient)
-          //   - AGENT_BUSY rejection (proposer-election race, fully recoverable)
-          //   - sibling-cancellation when another deal won proposer-election
-          // None of these justify permanently blacklisting the counterparty —
-          // and doing so caused a real deadlock when both sides happened to
-          // race fan-outs (carol's outgoing proposal got AGENT_BUSY-rejected
-          // because dave's incoming arrived first; carol then permanently
-          // blacklisted dave; carol's intent could never re-match dave). The
-          // 30s NP-0 PROPOSED-state timeout + spec 5.7 proposer-election are
-          // sufficient to break the race within one scan cycle. Permanent
-          // blacklisting belongs to higher-level signals (e.g. repeated
-          // verification failures) that aren't surfaced through this callback.
+          // We deliberately DO NOT permanently blacklist a counterparty on
+          // CANCELLED. The original reasoning (preserved from the no-blacklist
+          // era): some cancellations are race-only and fully recoverable —
+          // AGENT_BUSY rejection from a proposer-election race, sibling-
+          // cancellation when another deal won proposer-election — and
+          // permanently blacklisting on those caused real deadlocks (carol's
+          // outgoing proposal got AGENT_BUSY-rejected because dave's incoming
+          // arrived first; carol then permanently blacklisted dave; carol's
+          // intent could never re-match dave). Permanent blacklisting belongs
+          // to higher-level signals (e.g. repeated verification failures) that
+          // aren't surfaced through this callback.
+          //
+          // But for the proposal-timeout and propose-send-failed cases, a
+          // *short-TTL tarpit* is justified: the counterparty silently failed
+          // to respond to our NP-0 proposal. Without the tarpit, the next
+          // scan tick will deterministically re-pick them (sort order is
+          // stable, the dead candidate is still in the market feed), waste
+          // another 30s timeout cycle on the same corpse, and starve the
+          // other live candidates. Issue #30 documents this exact failure
+          // mode from a trader-roundtrip soak. The tarpit:
+          //   - is per-intent (matches the existing failedCounterparties shape)
+          //   - requires K=2 consecutive transient failures before tripping
+          //     (so one lost Nostr DM doesn't penalise the peer)
+          //   - expires after ~5 min so a recovered peer rejoins the pool.
           if (!intentEngine) return;
           const weAreProposer = pubkeysEqual(deal.terms.proposer_pubkey, agentPubkey);
           const weAreAcceptor = pubkeysEqual(deal.terms.acceptor_pubkey, agentPubkey);
@@ -749,6 +776,17 @@ export function createTraderAgent(deps: TraderMainDeps): TraderAgent {
           const ourIntentId = weAreProposer
             ? deal.terms.proposer_intent_id
             : deal.terms.acceptor_intent_id;
+
+          // Only the *proposer* side tarpits, and only on cancellation
+          // reasons that indicate counterparty unresponsiveness. The
+          // acceptor side has no recovery to do here — they were on the
+          // receiving end of a DM that didn't lead anywhere; the next
+          // scan tick will re-evaluate their own match candidate set
+          // afresh.
+          if (weAreProposer && (reason === 'proposal_timeout' || reason === 'proposal_send_failed')) {
+            const counterpartyPubkey = deal.terms.acceptor_pubkey;
+            intentEngine.recordCounterpartyFailure(ourIntentId, counterpartyPubkey);
+          }
           intentEngine.restoreToActive(ourIntentId);
         },
         agentPubkey,

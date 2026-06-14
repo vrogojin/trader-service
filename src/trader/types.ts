@@ -377,7 +377,30 @@ export type OnMatchFound = (
 
 export type OnDealAccepted = (deal: DealRecord) => Promise<void>;
 
-export type OnDealCancelled = (deal: DealRecord) => void;
+/**
+ * Why a deal moved to CANCELLED. Threaded through `transitionDeal` and into
+ * the `OnDealCancelled` callback so the trader-level reaction can be reason-
+ * specific (e.g. tarpit a counterparty that proposal-timed-out vs. let an
+ * AGENT_BUSY proposer-election race recover on the next scan).
+ *
+ * The reason is transient — it is NOT persisted onto DealRecord. CANCELLED
+ * records on disk carry the counterparty-signed `np.reject_deal` envelope
+ * (when one was received) as the canonical source of truth; this transient
+ * reason exists purely to drive the local recovery policy.
+ */
+export type CancellationReason =
+  | 'proposal_timeout' // PROPOSED-state timer fired without np.accept_deal arriving
+  | 'proposal_send_failed' // sendDm failed/timed out — np.propose_deal never reached counterparty
+  | 'accept_send_failed' // our np.accept_deal sendDm failed — we cannot proceed as acceptor
+  | 'counterparty_rejected' // np.reject_deal received from counterparty (reason inside payload)
+  | 'sibling_cancelled' // a sibling deal on the same intent already won proposer-election
+  | 'shutdown' // engine stopping — cancelPending sweep
+  | 'unknown'; // legacy / unspecified path
+
+export type OnDealCancelled = (
+  deal: DealRecord,
+  reason: CancellationReason,
+) => void;
 
 export type OnSwapCompleted = (
   deal: DealRecord,
