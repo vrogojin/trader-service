@@ -66,7 +66,7 @@ interface TestHarness {
 interface CreateTestEngineOpts {
   strategy?: Partial<TraderStrategy>;
   agentPubkey?: string;
-  /** Per-coin confirmed balance in smallest units. Default: 10_000 for every coin. */
+  /** Per-coin confirmed balance in smallest units. Default: 1_000_000_000 for every coin. */
   getBalance?: (coinId: string) => bigint;
   /** Per-coin decimals. Default: 0 (whole-unit semantics in tests). */
   getDecimals?: (coinId: string) => number;
