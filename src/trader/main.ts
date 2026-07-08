@@ -127,8 +127,20 @@ function onUnhandled(reason: unknown): void {
 }
 process.on('unhandledRejection', onUnhandled);
 
-const TRUSTBASE_URL =
-  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
+// Phase-6 UXF v2 fork — network-aware trustbase URL. `testnet2` maps to
+// the v2 trust base that drives SphereTokenEngine construction.
+function trustbaseUrlFor(network: string): string {
+  switch (network) {
+    case 'testnet2':
+      return 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet2.json';
+    case 'mainnet':
+      return 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.mainnet.json';
+    case 'testnet':
+    case 'dev':
+    default:
+      return 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
+  }
+}
 
 // Round-19 F1 / Round-21 F3: per-step timeout for bootstrap shutdown is
 // provided by `../shared/with-timeout.js`. See that file for the full
@@ -243,9 +255,11 @@ export async function startTrader(): Promise<void> {
   mkdirSync(config.data_dir, { recursive: true });
   mkdirSync(config.tokens_dir, { recursive: true });
 
-  // Download trustbase
-  logger.info('downloading_trustbase', { url: TRUSTBASE_URL });
-  const tbResponse = await fetch(TRUSTBASE_URL, { signal: AbortSignal.timeout(30_000) });
+  // Download trustbase — Phase-6 UXF v2 fork: URL is now per-network so
+  // testnet2 wallets fetch the v2 trust base.
+  const trustbaseUrl = trustbaseUrlFor(config.network);
+  logger.info('downloading_trustbase', { url: trustbaseUrl, network: config.network });
+  const tbResponse = await fetch(trustbaseUrl, { signal: AbortSignal.timeout(30_000) });
   if (!tbResponse.ok) {
     throw new Error(`Failed to download trustbase: HTTP ${tbResponse.status}`);
   }
@@ -255,7 +269,7 @@ export async function startTrader(): Promise<void> {
   // Initialize Sphere wallet with market, swap, and accounting modules
   logger.info('initializing_sphere', { network: config.network, data_dir: config.data_dir });
   const providers = createNodeProviders({
-    network: config.network as 'testnet' | 'mainnet' | 'dev',
+    network: config.network as 'testnet' | 'testnet2' | 'mainnet' | 'dev',
     dataDir: config.data_dir,
     tokensDir: config.tokens_dir,
     oracle: {
@@ -292,6 +306,10 @@ export async function startTrader(): Promise<void> {
 
   const { sphere } = await Sphere.init({
     ...providers,
+    // Phase-6 UXF v2 fork: pass network so ensureTokenEngine picks up
+    // NETWORKS[network].trustBaseUrl + aggregatorApiKey and constructs
+    // the v2 SphereTokenEngine.
+    network: config.network as 'testnet' | 'testnet2' | 'mainnet' | 'dev',
     autoGenerate: true,
     nametag,
     market: true,

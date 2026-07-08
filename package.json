@@ -21,7 +21,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
-    "@unicitylabs/sphere-sdk": "file:../sphere-sdk",
+    "@unicitylabs/sphere-sdk": "file:../uxf",
     "commander": "^12.1.0",
     "uuid": "^11.1.0"
   },
