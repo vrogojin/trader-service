@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { createNegotiationHandler } from './negotiation-handler.js';
 import type { NegotiationHandler, NegotiationHandlerDeps } from './negotiation-handler.js';
 import type {
+  CancellationReason,
   DealRecord,
   DealTerms,
   IntentRecord,
@@ -45,7 +46,7 @@ function createDeps(overrides: Partial<NegotiationHandlerDeps> = {}): Negotiatio
     signMessage: vi.fn<(msg: string) => string>().mockReturnValue(FIXED_SIGNATURE),
     verifySignature: vi.fn<(sig: string, msg: string, pubkey: string) => boolean>().mockReturnValue(true),
     onDealAccepted: vi.fn<(deal: DealRecord) => Promise<void>>().mockResolvedValue(undefined),
-    onDealCancelled: vi.fn<(deal: DealRecord) => void>(),
+    onDealCancelled: vi.fn<(deal: DealRecord, reason: CancellationReason) => void>(),
     agentPubkey: AGENT_PUBKEY,
     agentAddress: AGENT_ADDRESS,
     logger: createMockLogger(),
@@ -682,6 +683,74 @@ describe('NegotiationHandler', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it('forwards reason="proposal_timeout" to onDealCancelled (issue #30)', async () => {
+      // Issue #30: trader-main needs the cancellation reason to decide
+      // whether to tarpit the counterparty. Proposal-timeout means the
+      // counterparty went silent — exactly the signal that justifies
+      // tarpit.
+      vi.useFakeTimers();
+      try {
+        const localDeps = createDeps();
+        const localHandler = createNegotiationHandler(localDeps);
+        const deal = await localHandler.proposeDeal(
+          makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
+        );
+
+        // Async variant flushes microtasks between timer iterations so the
+        // fire-and-forget transitionDeal()→persistDeal()→onDealCancelled
+        // chain resolves before we assert.
+        await vi.advanceTimersByTimeAsync(30_000);
+        await localHandler.drainPersistChains();
+
+        expect(localDeps.onDealCancelled).toHaveBeenCalledTimes(1);
+        const [cancelledDeal, reason] = (localDeps.onDealCancelled as ReturnType<typeof vi.fn>).mock.calls[0]!;
+        expect(cancelledDeal.terms.deal_id).toBe(deal.terms.deal_id);
+        expect(reason).toBe('proposal_timeout');
+
+        localHandler.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('forwards reason="counterparty_rejected" on incoming np.reject_deal', async () => {
+      // Rejection from the peer is recoverable (AGENT_BUSY race, etc.) —
+      // trader-main uses this distinct reason to skip the tarpit branch
+      // even though the deal is also CANCELLED.
+      const deal = await handler.proposeDeal(
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
+      );
+
+      const rejectMsg = buildNpMessage(
+        deal.terms.deal_id,
+        'np.reject_deal',
+        COUNTERPARTY_PUBKEY,
+        { reason_code: 'AGENT_BUSY', message: '' },
+      );
+      await handler.handleIncomingDm(COUNTERPARTY_PUBKEY, COUNTERPARTY_ADDRESS, JSON.stringify(rejectMsg));
+
+      expect(deps.onDealCancelled).toHaveBeenCalledTimes(1);
+      const [, reason] = (deps.onDealCancelled as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      expect(reason).toBe('counterparty_rejected');
+    });
+
+    it('forwards reason="shutdown" on cancelPending()', async () => {
+      // Shutdown sweeps must NOT propagate into the tarpit — these are
+      // local-state cancellations, not counterparty signals.
+      await handler.proposeDeal(
+        makeOwnIntent(), makeCounterparty(), '150', '50', 'escrow-1',
+      );
+
+      handler.cancelPending();
+      // Drain pending state-change persistence triggered by cancelPending().
+      await handler.drainPersistChains();
+
+      expect(deps.onDealCancelled).toHaveBeenCalled();
+      const calls = (deps.onDealCancelled as ReturnType<typeof vi.fn>).mock.calls;
+      const reasons = calls.map((c: unknown[]) => c[1]);
+      expect(reasons.every((r) => r === 'shutdown')).toBe(true);
     });
 
     it('ACCEPTED deal stays ACCEPTED (SwapExecutor owns execution timeouts)', async () => {

@@ -958,8 +958,19 @@ describe('IntentEngine', () => {
       // This is the regression test for the basic-roundtrip flake.
       // Pre-fix observation: 80 proposals fired against ONE peer in 11.5
       // min because firstYieldAt never reset. Post-fix: at most 1 per
-      // yield session (the blacklist also kicks in to filter the same
+      // yield session (the tarpit also kicks in to filter the same
       // peer out of subsequent scan results).
+      //
+      // Note (issue #30 update): the tarpit now uses a 5-min TTL instead
+      // of a permanent LRU-bounded blacklist, but this test still sees
+      // ≤ 1 proposal because:
+      //   - The first fall-through transitions the intent to MATCHING.
+      //   - The default mock onMatchFound resolves (no rejection), so
+      //     `succeeded > 0` and the intent stays in MATCHING.
+      //   - Subsequent scans skip MATCHING intents entirely (only ACTIVE/
+      //     PARTIALLY_FILLED are matchable). So TTL expiry has no effect
+      //     here — the intent is never re-evaluated regardless of tarpit
+      //     state.
       const { engine, market, onMatchFound } = createTestEngine({
         strategy: { scan_interval_ms: 1000, auto_match: true },
         agentPubkey: 'z'.repeat(64),
@@ -971,7 +982,7 @@ describe('IntentEngine', () => {
       })]);
       engine.start();
       // Run for 10 minutes of simulated time — pre-fix this would emit
-      // ~70 proposals; post-fix at most 1 (blacklisted after fall-through).
+      // ~70 proposals; post-fix at most 1 (intent stuck in MATCHING).
       await vi.advanceTimersByTimeAsync(10 * 60_000);
       engine.stop();
       expect(onMatchFound.mock.calls.length).toBeLessThanOrEqual(1);
@@ -992,6 +1003,331 @@ describe('IntentEngine', () => {
       engine.stop();
       // Lower-pubkey side proposes immediately, no yield.
       expect(onMatchFound).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // =========================================================================
+  // Counterparty tarpit (issue #30)
+  //
+  // After a proposal timeout (np.propose_deal sent, np.accept_deal never
+  // arrived) the matcher must avoid re-picking the same dead counterparty on
+  // the next scan tick. The tarpit is:
+  //   - per-intent (matches existing failedCounterparties shape)
+  //   - threshold-based (K=2 consecutive transient failures before tripping)
+  //   - TTL-bounded (~5 min, so recovered peers rejoin the candidate pool)
+  //
+  // The strong-signal path (markCounterpartyFailed) tarpits immediately on
+  // the first call; the soft-threshold path (recordCounterpartyFailure)
+  // increments a counter and only tarpits at the threshold.
+  // =========================================================================
+
+  describe('Counterparty tarpit (issue #30)', () => {
+    const TARPIT_TTL_MS = 5 * 60 * 1000;
+    const TARPIT_COUNTER_DECAY_MS = 10 * 60 * 1000;
+
+    // 'a' lex-sorts before 'd' — we are the proposer in every test below.
+    const OWN_PUBKEY = 'a'.repeat(64);
+    const DEAD_COUNTERPARTY = 'd'.repeat(64);
+    const LIVE_COUNTERPARTY_1 = 'e'.repeat(64);
+    const LIVE_COUNTERPARTY_2 = 'f'.repeat(64);
+
+    async function createIntentReturningId(engine: IntentEngine): Promise<string> {
+      const record = await engine.createIntent(defaultParams(), OWN_PUBKEY, AGENT_ADDRESS);
+      return record.intent.intent_id;
+    }
+
+    it('does NOT tarpit after a single transient failure (threshold = 2)', async () => {
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      // One isolated proposal-timeout shouldn't burn the counterparty —
+      // a lost Nostr DM should be tolerable without 5 minutes of exclusion.
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      // The dead counterparty is still selectable — count was incremented to 1,
+      // below the K=2 threshold, so no tarpit applied.
+      expect(onMatchFound).toHaveBeenCalledTimes(1);
+      const [, counterparty] = onMatchFound.mock.calls[0]!;
+      expect(counterparty.agentPublicKey).toBe(DEAD_COUNTERPARTY);
+    });
+
+    it('DOES tarpit after K consecutive transient failures (threshold met)', async () => {
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      // Two consecutive proposal-timeouts on the same peer → tarpit trips.
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY);
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      // Counterparty is filtered out — no proposal attempt this scan.
+      expect(onMatchFound).not.toHaveBeenCalled();
+    });
+
+    it('lets the matcher pick OTHER live candidates when one is tarpitted', async () => {
+      // Soak-failure regression: the issue described alice re-picking the
+      // same dead counterparty every scan tick despite a live one being
+      // available. With the tarpit, the live candidate must take their turn.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      // Tarpit the dead one (immediate path — equivalent to 2 transient).
+      engine.markCounterpartyFailed(intentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+        buildSearchResult({
+          direction: 'sell',
+          agentPublicKey: LIVE_COUNTERPARTY_1,
+          id: 'sr-live-1',
+        }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      // Only the live candidate gets a proposal.
+      const proposedTo = onMatchFound.mock.calls.map((c) => c[1].agentPublicKey);
+      expect(proposedTo).toEqual([LIVE_COUNTERPARTY_1]);
+    });
+
+    it('tarpit EXPIRES after TTL — counterparty rejoins the candidate pool', async () => {
+      // Recovery contract: a peer that gets a fresh address / restarts /
+      // unblocks should resume matching within the TTL window, not require
+      // operator intervention. Without this, a transient outage would
+      // permanently sever otherwise-compatible trading pairs.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 60_000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      engine.markCounterpartyFailed(intentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+      ]);
+
+      engine.start();
+      // Advance well past TARPIT_TTL_MS but stay under the counter-decay
+      // window so the entry is still in the map (just expired tarpit).
+      await vi.advanceTimersByTimeAsync(TARPIT_TTL_MS + 60_000);
+      engine.stop();
+
+      // Counterparty rejoins. At least one proposal fires.
+      expect(onMatchFound.mock.calls.length).toBeGreaterThanOrEqual(1);
+      const [, counterparty] = onMatchFound.mock.calls[0]!;
+      expect(counterparty.agentPublicKey).toBe(DEAD_COUNTERPARTY);
+    });
+
+    it('tarpit is PER-INTENT: a tarpit on intent A does not affect intent B', async () => {
+      // Two intents with overlapping candidate sets each maintain independent
+      // tarpit state. Otherwise, a counterparty unreachable on one trading
+      // pair would be silently excluded from an unrelated one.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const recordA = await engine.createIntent(
+        defaultParams({ base_asset: 'ALPHA', quote_asset: 'USD' }),
+        OWN_PUBKEY,
+        AGENT_ADDRESS,
+      );
+      const recordB = await engine.createIntent(
+        defaultParams({ base_asset: 'BETA', quote_asset: 'USD' }),
+        OWN_PUBKEY,
+        AGENT_ADDRESS,
+      );
+
+      // Tarpit the counterparty only for intent A.
+      engine.markCounterpartyFailed(recordA.intent.intent_id, DEAD_COUNTERPARTY);
+      void recordB;
+
+      // The market returns the same counterparty for both queries (different
+      // base assets, so it's two separate matches against the same pubkey).
+      market.setSearchResults([
+        buildSearchResult({
+          direction: 'sell',
+          agentPublicKey: DEAD_COUNTERPARTY,
+          base_asset: 'ALPHA',
+          id: 'sr-a',
+        }),
+        buildSearchResult({
+          direction: 'sell',
+          agentPublicKey: DEAD_COUNTERPARTY,
+          base_asset: 'BETA',
+          id: 'sr-b',
+        }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      // Only intent B should reach the counterparty — A's tarpit excludes them.
+      const targetedIntents = onMatchFound.mock.calls.map(
+        (c) => c[0].intent.base_asset,
+      );
+      expect(targetedIntents).toEqual(['BETA']);
+    });
+
+    it('counter DECAYS after a long quiet period — single failure does not insta-tarpit', async () => {
+      // A peer that flapped hours ago and ran cleanly since shouldn't be
+      // insta-tarpitted on a single fresh miss. The decay window prevents
+      // accumulating failureCount from a stale era.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 60_000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      // One old failure (count=1, no tarpit).
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY);
+
+      // Quiet period exceeds the decay window.
+      await vi.advanceTimersByTimeAsync(TARPIT_COUNTER_DECAY_MS + 1000);
+
+      // A single fresh failure must NOT be enough to tarpit — counter
+      // should have decayed and reset to 1 again.
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(60_100);
+      engine.stop();
+
+      // Counterparty is still selectable — counter is at 1 (post-decay).
+      expect(onMatchFound).toHaveBeenCalledTimes(1);
+    });
+
+    it('accepts EITHER local intent_id OR market_intent_id (DealTerms compatibility)', async () => {
+      // DealTerms carry market IDs by necessity (peers exchange their
+      // market-visible IDs in np.propose_deal). Trader-main passes whichever
+      // ID came in on the deal record. The tarpit map must resolve both.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const record = await engine.createIntent(defaultParams(), OWN_PUBKEY, AGENT_ADDRESS);
+      const marketIntentId = record.intent.market_intent_id;
+      expect(marketIntentId).not.toBe('');
+      expect(marketIntentId).not.toBe(record.intent.intent_id);
+
+      // Tarpit via the market ID — should resolve to the same local entry.
+      engine.markCounterpartyFailed(marketIntentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+        buildSearchResult({
+          direction: 'sell',
+          agentPublicKey: LIVE_COUNTERPARTY_2,
+          id: 'sr-live-2',
+        }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      const proposedTo = onMatchFound.mock.calls.map((c) => c[1].agentPublicKey);
+      expect(proposedTo).toEqual([LIVE_COUNTERPARTY_2]);
+    });
+
+    it('clearCounterpartyFailures resets the counter (success-reset contract)', async () => {
+      // Adversarial review (issue #30 follow-up): "K consecutive" must
+      // really mean *consecutive* across the deal lifecycle, not "K within
+      // the 10-min decay window regardless of intermediate successes."
+      // trader-main calls this when the acceptor's np.accept_deal arrives,
+      // proving the counterparty is responsive. Without the reset, a peer
+      // that fails 1 + succeeds 1 + fails 1 + succeeds 1 + ... would
+      // eventually trip the tarpit on a single fresh failure because the
+      // counter never decays under the noise floor.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY); // count=1
+      engine.clearCounterpartyFailures(intentId, DEAD_COUNTERPARTY); // reset
+      engine.recordCounterpartyFailure(intentId, DEAD_COUNTERPARTY); // count=1 (fresh)
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      // Counter is at 1 — below threshold — so candidate is still selectable.
+      expect(onMatchFound).toHaveBeenCalledTimes(1);
+    });
+
+    it('clearCounterpartyFailures on absent entry is a no-op (defensive)', async () => {
+      // Called from onDealAccepted, which runs after any deal handshake.
+      // There may not be a prior failure record (clean first interaction).
+      // Must not throw.
+      const { engine } = createTestEngine({
+        strategy: { scan_interval_ms: 60_000, auto_match: false },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+      expect(() =>
+        engine.clearCounterpartyFailures(intentId, DEAD_COUNTERPARTY),
+      ).not.toThrow();
+    });
+
+    it('immediate markCounterpartyFailed tarpits on the FIRST call (strong signal)', async () => {
+      // The W2 yield-timeout fall-through path uses this — 45s of silence
+      // after election-yielding is strong enough evidence to tarpit
+      // without waiting for two confirmations.
+      const { engine, market, onMatchFound } = createTestEngine({
+        strategy: { scan_interval_ms: 1000, auto_match: true },
+        agentPubkey: OWN_PUBKEY,
+      });
+      const intentId = await createIntentReturningId(engine);
+
+      engine.markCounterpartyFailed(intentId, DEAD_COUNTERPARTY);
+
+      market.setSearchResults([
+        buildSearchResult({ direction: 'sell', agentPublicKey: DEAD_COUNTERPARTY }),
+      ]);
+
+      engine.start();
+      await vi.advanceTimersByTimeAsync(1100);
+      engine.stop();
+
+      // Tarpitted on first call — no proposal attempt.
+      expect(onMatchFound).not.toHaveBeenCalled();
     });
   });
 
