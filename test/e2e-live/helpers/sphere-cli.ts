@@ -171,6 +171,16 @@ function buildEnv(opts?: { extraEnv?: Record<string, string> }, cwd?: string): R
     PATH: process.env['PATH'] ?? '',
     HOME: process.env['HOME'] ?? cwd ?? '/',
     ...(process.env['UNICITY_API_KEY'] ? { UNICITY_API_KEY: process.env['UNICITY_API_KEY'] } : {}),
+    // Forward optional Nostr-relay override so sphere-cli subprocesses
+    // (wallet init, sphere host spawn, sphere trader create-intent, …)
+    // hit the same relay as the rest of the stack when the local-infra
+    // harness is active. Falls through silently when unset.
+    ...(process.env['UNICITY_NOSTR_RELAYS']
+      ? { UNICITY_NOSTR_RELAYS: process.env['UNICITY_NOSTR_RELAYS'] }
+      : {}),
+    ...(process.env['SPHERE_NOSTR_RELAYS']
+      ? { SPHERE_NOSTR_RELAYS: process.env['SPHERE_NOSTR_RELAYS'] }
+      : {}),
     CI: '1',
     FORCE_COLOR: '0',
     ...(opts?.extraEnv ?? {}),

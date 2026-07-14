@@ -157,6 +157,18 @@ async function provisionManagerWallet(dataDir: string, hostId: string): Promise<
   // Forward UNICITY_API_KEY when set; the SDK falls back to its public
   // placeholder otherwise.
   const apiKey = process.env['UNICITY_API_KEY']?.trim() || undefined;
+  // Forward Nostr-relay override — this pre-creation step publishes the
+  // manager's nametag binding. Without the override here it would land
+  // on testnet, then the HMA binary (which DOES read the override) loads
+  // the existing wallet and skips re-publish. The local relay would
+  // never see the binding event and sphere-cli's queryPubkeyByNametag
+  // returns "Unicity ID not found".
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
   const providers = createNodeProviders({
     network: 'testnet',
     dataDir,
@@ -165,6 +177,7 @@ async function provisionManagerWallet(dataDir: string, hostId: string): Promise<
       trustBasePath: trustbasePath,
       ...(apiKey ? { apiKey } : {}),
     },
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
   const nametag = `m-${hostId.replace(/[^a-z0-9]/gi, '').slice(0, 12).toLowerCase()}`;
   const { sphere } = await Sphere.init({
@@ -257,12 +270,25 @@ export async function spawnHostManager(opts: SpawnHostManagerOptions): Promise<H
     TENANTS_DIR: tenantsDir,
     SPHERE_MANAGER_DATA_DIR: dataDir,
     PERSISTENCE_PATH: persistencePath,
-    UNICITY_HEALTH_PORT: String(opts.healthPort ?? 19401),
+    // Health port: default 0 (OS-assigned ephemeral). Tests don't probe
+    // this port, and a fixed default would EADDRINUSE if a prior run
+    // leaked an HMA process. Override only when a specific test needs
+    // the diagnostic endpoint at a known port.
+    UNICITY_HEALTH_PORT: String(opts.healthPort ?? 0),
     UNICITY_NETWORK: 'testnet',
     HELLO_TIMEOUT_MS: String(opts.helloTimeoutMs ?? 60_000),
     LOG_LEVEL: 'info',
   };
   if (process.env['UNICITY_API_KEY']) env['UNICITY_API_KEY'] = process.env['UNICITY_API_KEY'];
+  // Forward optional relay override — set by global-setup when the local-infra
+  // harness boots a Docker-hosted relay. Goes to the HMA's own Sphere wallet.
+  // The bridge-gateway URL (typically 172.17.0.1:7777) works from both host
+  // and container side.
+  if (process.env['UNICITY_NOSTR_RELAYS']) {
+    env['UNICITY_NOSTR_RELAYS'] = process.env['UNICITY_NOSTR_RELAYS'];
+  } else if (process.env['SPHERE_NOSTR_RELAYS']) {
+    env['SPHERE_NOSTR_RELAYS'] = process.env['SPHERE_NOSTR_RELAYS'];
+  }
 
   const child = spawn('node', [binPath], { env, cwd: sessionDir, stdio: ['ignore', 'pipe', 'pipe'] });
 
